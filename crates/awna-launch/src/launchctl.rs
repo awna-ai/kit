@@ -1,17 +1,13 @@
-use crate::{Manager, ManagerError, State, parse_disabled, parse_print, valid_label};
+use crate::command::{self, Output};
+use crate::manager::resolve_program;
+use crate::{
+    Manager, ManagerError, Platform, ResolveError, State, parse_disabled, parse_print, valid_label,
+};
 use std::ffi::OsStr;
-use std::fmt;
-use std::fs;
-use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const SYSTEM_LAUNCHCTL: &str = "/bin/launchctl";
-const POLL_INTERVAL: Duration = Duration::from_millis(20);
-const OUTPUT_LIMIT: usize = 1024 * 1024;
 
 /// A manager backed by launchctl or a caller-supplied executable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,29 +17,6 @@ pub struct Launchctl {
     timeout: Duration,
     unload_timeout: Duration,
 }
-
-/// An error choosing the manager executable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResolveError {
-    /// A home other than the account's own requires a stand-in.
-    ForeignHome,
-    /// A supplied stand-in is relative.
-    StandInNotAbsolute,
-    /// A supplied stand-in resolves to system launchctl.
-    StandInIsSystem,
-}
-
-impl fmt::Display for ResolveError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::ForeignHome => "Pass a stand-in because this home is outside the account's own home and the real launchctl is skipped",
-            Self::StandInNotAbsolute => "The stand-in path must be absolute",
-            Self::StandInIsSystem => "The stand-in must differ from system launchctl",
-        })
-    }
-}
-
-impl std::error::Error for ResolveError {}
 
 impl Launchctl {
     /// Uses the given executable with 15 seconds per command and 60 seconds for unloading.
@@ -71,25 +44,8 @@ impl Launchctl {
         account_home: &Path,
         uid: u32,
     ) -> Result<Self, ResolveError> {
-        if let Some(program) = stand_in.filter(|program| !program.is_empty()) {
-            let program = Path::new(program);
-            if !program.is_absolute() {
-                return Err(ResolveError::StandInNotAbsolute);
-            }
-            if program == Path::new(SYSTEM_LAUNCHCTL)
-                || matches!(
-                    (fs::canonicalize(program), fs::canonicalize(SYSTEM_LAUNCHCTL)),
-                    (Ok(candidate), Ok(system)) if candidate == system
-                )
-            {
-                return Err(ResolveError::StandInIsSystem);
-            }
-            Ok(Self::new(program, uid))
-        } else if home == account_home {
-            Ok(Self::system(uid))
-        } else {
-            Err(ResolveError::ForeignHome)
-        }
+        let program = resolve_program(stand_in, home, account_home, Path::new(SYSTEM_LAUNCHCTL))?;
+        Ok(Self::new(program, uid))
     }
 
     /// Sets the general command timeout and the separate timeout for unloading.
@@ -127,27 +83,20 @@ impl Launchctl {
         } else {
             self.timeout
         };
-        let mut child = Command::new(&self.program)
-            .arg(verb)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(spawn_error)?;
-        let start = Instant::now();
-        let result = collect(&mut child, verb, start, timeout);
-        if result.is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        result
+        let mut argv = Vec::with_capacity(args.len() + 1);
+        argv.push(verb);
+        argv.extend_from_slice(args);
+        command::run(&self.program, &argv, verb, timeout)
     }
 }
 
 impl Manager for Launchctl {
     fn uid(&self) -> u32 {
         self.uid
+    }
+
+    fn platform(&self) -> Platform {
+        Platform::MacOs
     }
 
     fn session_ok(&self) -> Result<bool, ManagerError> {
@@ -173,19 +122,7 @@ impl Manager for Launchctl {
         let verb = "print-disabled";
         let output = self.run(verb, &[&self.domain()])?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr)
-                .lines()
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .chars()
-                .take(200)
-                .collect();
-            return Err(ManagerError::Failed {
-                verb,
-                code: output.status.code(),
-                stderr,
-            });
+            return Err(command::failed(verb, &output));
         }
         Ok(parse_disabled(
             &String::from_utf8_lossy(&output.stdout),
@@ -213,62 +150,4 @@ impl Manager for Launchctl {
         let target = self.checked_target(label)?;
         Ok(self.run("kickstart", &["-k", &target])?.status.success())
     }
-}
-
-struct Output {
-    status: ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
-
-fn spawn_error(error: io::Error) -> ManagerError {
-    ManagerError::Spawn(error.kind())
-}
-
-fn collect(
-    child: &mut Child,
-    verb: &'static str,
-    start: Instant,
-    timeout: Duration,
-) -> Result<Output, ManagerError> {
-    let stdout = drain(child.stdout.take()).map_err(spawn_error)?;
-    let stderr = drain(child.stderr.take()).map_err(spawn_error)?;
-
-    let status = loop {
-        if let Some(status) = child.try_wait().map_err(spawn_error)? {
-            break status;
-        }
-        let remaining = timeout.saturating_sub(start.elapsed());
-        if remaining.is_zero() {
-            return Err(ManagerError::TimedOut { verb });
-        }
-        thread::sleep(POLL_INTERVAL.min(remaining));
-    };
-    // A descendant can retain either pipe after launchctl exits.
-    let stdout = stdout
-        .recv_timeout(timeout.saturating_sub(start.elapsed()))
-        .unwrap_or_default();
-    let stderr = stderr
-        .recv_timeout(timeout.saturating_sub(start.elapsed()))
-        .unwrap_or_default();
-    Ok(Output {
-        status,
-        stdout,
-        stderr,
-    })
-}
-
-fn drain(pipe: Option<impl Read + Send + 'static>) -> io::Result<Receiver<Vec<u8>>> {
-    let (send, receive) = mpsc::channel();
-    if let Some(mut pipe) = pipe {
-        thread::Builder::new().spawn(move || {
-            let mut output = Vec::new();
-            let mut prefix = (&mut pipe).take(OUTPUT_LIMIT as u64);
-            if prefix.read_to_end(&mut output).is_ok() {
-                let _ = io::copy(&mut pipe, &mut io::sink());
-            }
-            let _ = send.send(output);
-        })?;
-    }
-    Ok(receive)
 }

@@ -254,3 +254,15 @@ fn resolve_requires_an_absolute_stand_in_other_than_system_launchctl() {
         Ok(manager)
     );
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn resolve_refuses_a_symlink_to_system_launchctl() {
+    let fixture = Fixture::new();
+    let link = fixture.0.join("control");
+    std::os::unix::fs::symlink("/bin/launchctl", &link).unwrap();
+    assert_eq!(
+        Launchctl::resolve(Some(link.as_os_str()), &fixture.0, &fixture.0, 501),
+        Err(ResolveError::StandInIsSystem)
+    );
+}

@@ -674,6 +674,7 @@ fn disabled_install_prepares_logs() {
         apply(&manager, &scratch.agents(), &unit, &policy(), &mut || true),
         Ok(Applied::LeftDisabled)
     );
+    assert_eq!(mode(&scratch.agents()), 0o700);
     assert_eq!(mode(&parent), 0o700);
     assert_eq!(mode(&log), 0o600);
 }
@@ -711,7 +712,7 @@ fn failed_health_check_reloads_the_previous_service() {
 }
 
 #[test]
-fn apply_rejects_an_existing_plist_for_a_different_user() {
+fn apply_rejects_an_agents_dir_owned_by_another_user() {
     let scratch = Scratch::new();
     scratch.seed(b"old");
     let manager = scratch.manager().with_uid(scratch.uid() ^ 1);
@@ -763,6 +764,59 @@ fn failed_load_preserves_the_plist_if_the_partial_load_cannot_be_unloaded() {
 }
 
 #[test]
+fn load_error_unloads_a_partially_loaded_service() {
+    let scratch = Scratch::new();
+    let manager = scratch.manager().erroring_loads(1).loads_despite_failure();
+    let mut policy = policy();
+    policy.bootstrap_tries.tries = 1;
+
+    assert_eq!(
+        apply(&manager, &scratch.agents(), &unit(), &policy, &mut || true),
+        Err(ApplyError::LoadErrored {
+            error: ManagerError::Failed {
+                verb: "bootstrap",
+                code: Some(5),
+                stderr: String::new(),
+            },
+            rollback: Rollback::Removed,
+        })
+    );
+    assert!(manager.calls().contains(&Call::Unload(LABEL.into())));
+    assert_eq!(manager.state_of(LABEL), State::NotLoaded);
+    assert!(!scratch.plist().exists());
+}
+
+#[test]
+fn load_error_keeps_the_unit_if_the_partial_load_cannot_be_unloaded() {
+    let scratch = Scratch::new();
+    let manager = scratch
+        .manager()
+        .erroring_loads(1)
+        .loads_despite_failure()
+        .stuck_unloads();
+    let mut policy = policy();
+    policy.bootstrap_tries.tries = 1;
+
+    assert_eq!(
+        apply(&manager, &scratch.agents(), &unit(), &policy, &mut || true),
+        Err(ApplyError::LoadErrored {
+            error: ManagerError::Failed {
+                verb: "bootstrap",
+                code: Some(5),
+                stderr: String::new(),
+            },
+            rollback: Rollback::Failed,
+        })
+    );
+    assert!(manager.calls().contains(&Call::Unload(LABEL.into())));
+    assert_eq!(manager.state_of(LABEL), State::Idle);
+    assert_eq!(
+        fs::read(scratch.plist()).unwrap(),
+        render(&unit(), Platform::MacOs).unwrap().as_bytes()
+    );
+}
+
+#[test]
 fn load_error_reports_rollback_and_reloads_the_previous_service() {
     let scratch = Scratch::new();
     scratch.seed(b"old");
@@ -790,4 +844,77 @@ fn load_error_reports_rollback_and_reloads_the_previous_service() {
     assert!(error.to_string().contains("rollback: Restored"));
     assert_eq!(fs::read(scratch.plist()).unwrap(), b"old");
     assert_eq!(manager.state_of(LABEL), State::Idle);
+}
+
+#[test]
+fn linux_install_writes_a_service_unit() {
+    let scratch = Scratch::new();
+    let manager = scratch.manager().with_platform(Platform::Linux);
+    let units = scratch.0.join("units");
+    let service = units.join("com.example.alpha.service");
+
+    assert_eq!(
+        apply(&manager, &units, &unit(), &policy(), &mut || true),
+        Ok(Applied::Loaded)
+    );
+    assert_eq!(
+        fs::read_to_string(&service).expect("service unit was written"),
+        render(&unit(), Platform::Linux).unwrap()
+    );
+    assert_eq!(mode(&service), 0o600);
+    assert!(!units.join("com.example.alpha.plist").exists());
+    assert!(manager.calls().contains(&Call::Load(service)));
+}
+
+#[test]
+fn linux_unchanged_unit_is_skipped() {
+    let scratch = Scratch::new();
+    let manager = scratch
+        .manager()
+        .with_platform(Platform::Linux)
+        .with_loaded(LABEL, State::Idle);
+    let units = scratch.0.join("units");
+    fs::create_dir(&units).unwrap();
+    fs::write(
+        units.join("com.example.alpha.service"),
+        render(&unit(), Platform::Linux).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        apply(&manager, &units, &unit(), &policy(), &mut || true),
+        Ok(Applied::Unchanged)
+    );
+}
+
+#[test]
+fn linux_remove_deletes_the_service_unit() {
+    let scratch = Scratch::new();
+    let manager = scratch.manager().with_platform(Platform::Linux);
+    let units = scratch.0.join("units");
+    let service = units.join("com.example.alpha.service");
+    fs::create_dir(&units).unwrap();
+    fs::write(&service, render(&unit(), Platform::Linux).unwrap()).unwrap();
+
+    assert_eq!(
+        remove(&manager, &units, LABEL, &policy()),
+        Ok(Removed::Removed)
+    );
+    assert!(!service.exists());
+}
+
+#[test]
+fn linux_timer_unit_writes_nothing() {
+    let scratch = Scratch::new();
+    let manager = scratch.manager().with_platform(Platform::Linux);
+    let units = scratch.0.join("units");
+    let mut unit = unit();
+    unit.run = Run::Interval(60);
+
+    assert_eq!(
+        apply(&manager, &units, &unit, &policy(), &mut || true),
+        Err(ApplyError::Unit(UnitError::Unsupported))
+    );
+    assert!(!units.exists());
+    assert!(manager.calls().is_empty());
 }

@@ -1,6 +1,6 @@
 [package]
 name = "awna-launch"
-version = "0.1.0"
+version = "0.2.0"
 description = "Service install and control: render launchd and systemd user units, load, unload and restart them."
 edition.workspace = true
 rust-version.workspace = true

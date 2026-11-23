@@ -118,6 +118,9 @@ impl Unit {
 }
 
 /// Determines when and how often the manager starts the service.
+///
+/// Linux supports `KeepAlive` and `Once`. Interval and calendar schedules require
+/// separate systemd timer units.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Run {
     /// Start at load and keep the service running.
@@ -175,7 +178,7 @@ impl Logs {
     }
 }
 
-/// The process type supplied to the service manager.
+/// The process type supplied to launchd. This setting is ignored on Linux.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     /// A background process.
@@ -219,6 +222,7 @@ fn valid_env_key(key: &str) -> bool {
 }
 
 /// The first validation rule a unit failed.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnitError {
     /// The service label is invalid.
@@ -243,6 +247,8 @@ pub enum UnitError {
     Umask,
     /// The exit timeout is zero.
     ExitTimeout,
+    /// The platform cannot run this schedule.
+    Unsupported,
 }
 
 impl fmt::Display for UnitError {
@@ -259,6 +265,7 @@ impl fmt::Display for UnitError {
             Self::Nice => "The scheduling priority adjustment must be from -20 through 20",
             Self::Umask => "The file creation mask must be at most 0o777",
             Self::ExitTimeout => "The exit timeout must be greater than zero",
+            Self::Unsupported => "The platform does not support this run mode",
         })
     }
 }

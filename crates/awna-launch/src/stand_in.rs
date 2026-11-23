@@ -1,4 +1,4 @@
-use crate::{Manager, ManagerError, State};
+use crate::{Manager, ManagerError, Platform, State};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -12,7 +12,7 @@ pub enum Call {
     State(String),
     /// A service's disabled flag was queried.
     Disabled(String),
-    /// A plist was passed for loading.
+    /// A unit file was passed for loading.
     Load(PathBuf),
     /// A service was passed for unloading.
     Unload(String),
@@ -20,10 +20,11 @@ pub enum Call {
     Restart(String),
 }
 
-/// A recording service manager for tests that never invokes launchctl.
+/// A recording service manager for tests that never invokes a service manager.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StandIn {
     uid: u32,
+    platform: Platform,
     session_ok: bool,
     disabled_unreadable: bool,
     stuck_unloads: bool,
@@ -47,10 +48,11 @@ impl Default for StandIn {
 }
 
 impl StandIn {
-    /// Creates a manager for uid 0 with an available session and no loaded or disabled services.
+    /// Creates a macOS manager for uid 0 with an available session and no loaded or disabled services.
     pub fn new() -> Self {
         Self {
             uid: 0,
+            platform: Platform::MacOs,
             session_ok: true,
             disabled_unreadable: false,
             stuck_unloads: false,
@@ -63,6 +65,12 @@ impl StandIn {
     /// Sets the user whose service domain this manager drives.
     pub fn with_uid(mut self, uid: u32) -> Self {
         self.uid = uid;
+        self
+    }
+
+    /// Sets the platform whose unit files this manager loads.
+    pub fn with_platform(mut self, platform: Platform) -> Self {
+        self.platform = platform;
         self
     }
 
@@ -140,6 +148,10 @@ impl Manager for StandIn {
         self.uid
     }
 
+    fn platform(&self) -> Platform {
+        self.platform
+    }
+
     fn session_ok(&self) -> Result<bool, ManagerError> {
         self.state.borrow_mut().calls.push(Call::SessionOk);
         Ok(self.session_ok)
@@ -168,11 +180,17 @@ impl Manager for StandIn {
         Ok(self.disabled.contains(label))
     }
 
-    fn load(&self, plist: &Path) -> Result<bool, ManagerError> {
+    fn load(&self, path: &Path) -> Result<bool, ManagerError> {
         let mut state = self.state.borrow_mut();
-        state.calls.push(Call::Load(plist.into()));
-        let label = plist.file_name().and_then(|name| name.to_str());
-        let label = label.map(|name| name.strip_suffix(".plist").unwrap_or(name));
+        state.calls.push(Call::Load(path.into()));
+        let suffix = match self.platform {
+            Platform::MacOs => ".plist",
+            Platform::Linux => ".service",
+        };
+        let label = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.strip_suffix(suffix).unwrap_or(name));
         let failure = if state.erroring_loads > 0 {
             state.erroring_loads -= 1;
             Some(Err(ManagerError::Failed {

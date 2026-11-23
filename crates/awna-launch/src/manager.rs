@@ -1,6 +1,9 @@
+use crate::Platform;
+use std::ffi::OsStr;
 use std::fmt;
+use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The state of a service in the current session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,7 +24,7 @@ pub enum State {
 pub enum ManagerError {
     /// The service label is invalid.
     BadLabel,
-    /// The plist path is relative or cannot be represented as UTF-8.
+    /// The unit file path is relative, is not valid UTF-8, or has an invalid file name.
     BadPath,
     /// Starting or supervising the process failed.
     Spawn(io::ErrorKind),
@@ -50,7 +53,7 @@ impl fmt::Display for ManagerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BadLabel => f.write_str("The service label is invalid"),
-            Self::BadPath => f.write_str("The plist path must be absolute and valid UTF-8"),
+            Self::BadPath => f.write_str("The unit file path must be absolute and valid UTF-8"),
             Self::Spawn(kind) => write!(f, "The service manager process could not be run ({kind})"),
             Self::TimedOut { verb } => write!(f, "The {verb} command timed out"),
             Self::Unparsed { verb } => write!(f, "The {verb} output could not be read"),
@@ -64,11 +67,64 @@ impl fmt::Display for ManagerError {
 
 impl std::error::Error for ManagerError {}
 
+/// An error choosing the manager executable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveError {
+    /// A home other than the account's own requires a stand-in.
+    ForeignHome,
+    /// A supplied stand-in is relative.
+    StandInNotAbsolute,
+    /// A supplied stand-in resolves to the system service manager.
+    StandInIsSystem,
+}
+
+impl fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ForeignHome => "Pass a stand-in because this home is outside the account's own home and the real service manager is skipped",
+            Self::StandInNotAbsolute => "The stand-in path must be absolute",
+            Self::StandInIsSystem => "The stand-in must differ from the system service manager",
+        })
+    }
+}
+
+impl std::error::Error for ResolveError {}
+
+pub(crate) fn resolve_program(
+    stand_in: Option<&OsStr>,
+    home: &Path,
+    account_home: &Path,
+    system: &Path,
+) -> Result<PathBuf, ResolveError> {
+    if let Some(program) = stand_in.filter(|program| !program.is_empty()) {
+        let program = Path::new(program);
+        if !program.is_absolute() {
+            return Err(ResolveError::StandInNotAbsolute);
+        }
+        if program == system
+            || matches!(
+                (fs::canonicalize(program), fs::canonicalize(system)),
+                (Ok(candidate), Ok(system)) if candidate == system
+            )
+        {
+            return Err(ResolveError::StandInIsSystem);
+        }
+        Ok(program.to_owned())
+    } else if home == account_home {
+        Ok(system.to_owned())
+    } else {
+        Err(ResolveError::ForeignHome)
+    }
+}
+
 /// Checks and controls services in a user session.
 pub trait Manager {
     /// Returns the user whose service domain this manager drives.
     /// Applying a unit requires the files it trusts to belong to this user.
     fn uid(&self) -> u32;
+
+    /// Returns the platform whose unit files this manager loads.
+    fn platform(&self) -> Platform;
 
     /// Checks whether the session is available.
     fn session_ok(&self) -> Result<bool, ManagerError>;
@@ -79,8 +135,8 @@ pub trait Manager {
     /// Queries whether a service is disabled.
     fn disabled(&self, label: &str) -> Result<bool, ManagerError>;
 
-    /// Loads a service from its plist and reports whether the command succeeded.
-    fn load(&self, plist: &Path) -> Result<bool, ManagerError>;
+    /// Loads a service from its unit file and reports whether the command succeeded.
+    fn load(&self, path: &Path) -> Result<bool, ManagerError>;
 
     /// Unloads a service and reports whether the command succeeded.
     fn unload(&self, label: &str) -> Result<bool, ManagerError>;

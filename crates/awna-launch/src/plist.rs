@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::systemd;
 use crate::unit::{CalendarTime, Kind, Run, Unit, UnitError};
 
 /// The platform whose service file format to render.
@@ -8,13 +9,19 @@ use crate::unit::{CalendarTime, Kind, Run, Unit, UnitError};
 pub enum Platform {
     /// A macOS launchd property list.
     MacOs,
+    /// A systemd user service unit.
+    Linux,
 }
 
 /// Validates a service unit and renders it in the platform's service file format.
+///
+/// Linux supports `Run::KeepAlive` and `Run::Once`. Interval and calendar schedules
+/// return `UnitError::Unsupported` because systemd requires a separate timer unit.
 pub fn render(unit: &Unit, platform: Platform) -> Result<String, UnitError> {
     unit.validate()?;
     match platform {
         Platform::MacOs => Ok(render_plist(unit)),
+        Platform::Linux => systemd::render(unit),
     }
 }
 
