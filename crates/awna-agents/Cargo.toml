@@ -1,0 +1,9 @@
+[package]
+name = "awna-agents"
+version = "0.1.0"
+description = "Command-line argument builders and stream parsers for coding-agent CLIs. Parsing only: no process code."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false

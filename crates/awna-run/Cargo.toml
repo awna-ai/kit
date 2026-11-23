@@ -1,0 +1,9 @@
+[package]
+name = "awna-run"
+version = "0.1.0"
+description = "A process supervisor for agent child processes: own process group, a rebuilt environment, bounded output, timeouts and group kill."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
