@@ -320,6 +320,19 @@ fn lines_arrive_in_order_and_overlong_lines_are_skipped() {
         [b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]
     );
     assert_eq!(skipped, 1);
+    let (output, seen) = lines(5);
+    let (_, _, _, _, skipped) = finished(call(
+        &shell("printf '12345\\n123456\\n12345'"),
+        Stdin::Null,
+        output,
+        Stderr::Null,
+        policy(),
+    ));
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [b"12345".to_vec(), b"12345".to_vec()]
+    );
+    assert_eq!(skipped, 1);
 }
 #[test]
 fn stderr_can_share_stdout() {
@@ -338,6 +351,7 @@ fn append_logs_preserve_content_and_new_files_are_private() {
     let f = Fixture::new("fennel");
     let p = f.0.join("log");
     fs::write(&p, b"before\n").unwrap();
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
     let (status, _, _, _, _) = finished(call(
         &shell("echo out; echo err >&2"),
         Stdin::Null,
@@ -475,7 +489,7 @@ fn a_normal_exit_kills_a_background_pipe_holder() {
 #[test]
 fn disabling_exit_kill_leaves_descendants_running() {
     let f = Fixture::new("juniper");
-    let (status, _, _, _, _) = finished(call(
+    let result = call(
         &f.script("sleep 300 & echo $! > \"$DIR/pid\""),
         Stdin::Null,
         Stdout::Null,
@@ -484,8 +498,9 @@ fn disabling_exit_kill_leaves_descendants_running() {
             kill_group_on_exit: false,
             ..policy()
         },
-    ));
+    );
     let guard = Cleanup(f.pid());
+    let (status, _, _, _, _) = finished(result);
     assert!(status.success());
     assert!(alive(guard.0));
 }
@@ -493,7 +508,7 @@ fn disabling_exit_kill_leaves_descendants_running() {
 fn exit_grace_allows_late_output_then_gives_up() {
     let (output, seen) = lines(50);
     let (status, _, _, _, _) = finished(call(
-        &shell("(sleep 0.3; echo late) & echo early"),
+        &shell("(sleep 0.5; echo late) & echo early"),
         Stdin::Null,
         output,
         Stderr::Null,
@@ -507,12 +522,12 @@ fn exit_grace_allows_late_output_then_gives_up() {
     let (output, seen) = lines(50);
     let start = Instant::now();
     finished(call(
-        &shell("sleep 300 & echo early"),
+        &shell("(sleep 0.5; echo late) & echo early"),
         Stdin::Null,
         output,
         Stderr::Null,
         Kill {
-            exit_grace: Duration::from_millis(300),
+            exit_grace: Duration::ZERO,
             ..policy()
         },
     ));
@@ -539,4 +554,241 @@ fn the_tick_sees_the_child_pid_while_it_runs() {
     assert!(status.success());
     assert!(seen.len() >= 2);
     assert!(seen.iter().all(|pid| *pid == f.pid() as u32));
+}
+
+#[test]
+fn a_leader_that_changes_group_does_not_hold_the_timeout() {
+    let f = Fixture::new("larch");
+    let path = f.0.join("pid");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let start = Instant::now();
+    thread::spawn(move || {
+        let result = call(
+            &Launch::new("/usr/bin/perl").args([
+                "-e",
+                "$| = 1; print \"$$\\n\"; setpgrp(0, getpgrp(getppid())) or die $!; sleep 300",
+            ]),
+            Stdin::Null,
+            Stdout::AppendLog(path),
+            Stderr::Null,
+            Kill::after(Duration::from_millis(500)),
+        );
+        let _ = tx.send(result);
+    });
+    let end = Instant::now() + Duration::from_secs(5);
+    while !fs::read_to_string(f.0.join("pid")).is_ok_and(|s| !s.trim().is_empty())
+        && Instant::now() < end
+    {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let guard = Cleanup(f.pid());
+    let result = rx.recv_timeout(Duration::from_secs(5));
+    assert!(result.is_ok(), "timeout cleanup did not return: {result:?}");
+    assert!(matches!(result.unwrap(), Ran::TimedOut | Ran::Unfinished));
+    assert!(start.elapsed() < Duration::from_secs(10));
+    dead(guard.0);
+}
+
+fn fifo_is_refused(destination: usize) {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    let f = Fixture::new(&format!("maple-{destination}"));
+    let path = f.0.join("pipe");
+    let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: name is a valid NUL-terminated path in our disposable directory.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let (input, output, error) = match destination {
+            0 => (Stdin::File(path), Stdout::Null, Stderr::Null),
+            1 => (Stdin::Null, Stdout::AppendLog(path), Stderr::Null),
+            2 => (Stdin::Null, Stdout::File(path), Stderr::Null),
+            3 => (Stdin::Null, Stdout::Null, Stderr::AppendLog(path)),
+            _ => unreachable!(),
+        };
+        let _ = tx.send(call(&shell("exit 0"), input, output, error, policy()));
+    });
+    let result = rx.recv_timeout(Duration::from_secs(5));
+    assert!(matches!(result, Ok(Ran::NotStarted(_))), "{result:?}");
+}
+#[test]
+fn stdin_fifo_is_refused_without_blocking() {
+    fifo_is_refused(0);
+}
+#[test]
+fn stdout_log_fifo_is_refused_without_blocking() {
+    fifo_is_refused(1);
+}
+#[test]
+fn stdout_file_fifo_is_refused_without_blocking() {
+    fifo_is_refused(2);
+}
+#[test]
+fn stderr_log_fifo_is_refused_without_blocking() {
+    fifo_is_refused(3);
+}
+
+#[test]
+fn stdout_devices_are_refused() {
+    let result = call(
+        &shell("exit 0"),
+        Stdin::Null,
+        Stdout::File("/dev/null".into()),
+        Stderr::Null,
+        policy(),
+    );
+    assert!(
+        matches!(result, Ran::NotStarted(ref e) if e.kind() == io::ErrorKind::InvalidInput),
+        "{result:?}"
+    );
+}
+#[test]
+fn stdin_devices_are_refused() {
+    let result = call(
+        &shell("exit 0"),
+        Stdin::File("/dev/null".into()),
+        Stdout::Null,
+        Stderr::Null,
+        policy(),
+    );
+    assert!(
+        matches!(result, Ran::NotStarted(ref e) if e.kind() == io::ErrorKind::InvalidInput),
+        "{result:?}"
+    );
+}
+#[test]
+fn public_logs_are_refused_without_changes() {
+    let f = Fixture::new("nettle");
+    let path = f.0.join("log");
+    fs::write(&path, b"precious").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    let result = call(
+        &shell("echo altered"),
+        Stdin::Null,
+        Stdout::AppendLog(path.clone()),
+        Stderr::Null,
+        policy(),
+    );
+    assert!(
+        matches!(result, Ran::NotStarted(ref e) if e.kind() == io::ErrorKind::PermissionDenied),
+        "{result:?}"
+    );
+    assert_eq!(fs::read(path).unwrap(), b"precious");
+}
+#[test]
+fn hard_linked_logs_are_refused() {
+    let f = Fixture::new("olive");
+    let path = f.0.join("log");
+    fs::write(&path, b"precious").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::hard_link(&path, f.0.join("alias")).unwrap();
+    let result = call(
+        &shell("echo altered"),
+        Stdin::Null,
+        Stdout::AppendLog(path.clone()),
+        Stderr::Null,
+        policy(),
+    );
+    assert!(
+        matches!(result, Ran::NotStarted(ref e) if e.kind() == io::ErrorKind::PermissionDenied),
+        "{result:?}"
+    );
+    assert_eq!(fs::read(path).unwrap(), b"precious");
+}
+fn precious_output(name: &str, launch: Launch, missing_error: bool) {
+    let f = Fixture::new(name);
+    let path = f.0.join("out");
+    fs::write(&path, b"precious").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let error = if missing_error {
+        Stderr::AppendLog(f.0.join("missing/log"))
+    } else {
+        Stderr::Null
+    };
+    let result = call(
+        &launch,
+        Stdin::Null,
+        Stdout::File(path.clone()),
+        error,
+        policy(),
+    );
+    assert!(matches!(result, Ran::NotStarted(_)), "{result:?}");
+    assert_eq!(fs::read(path).unwrap(), b"precious");
+}
+#[test]
+fn a_later_file_error_preserves_output() {
+    precious_output("pine", shell("exit 0"), true);
+}
+#[test]
+fn a_nul_argument_preserves_output() {
+    precious_output("quince", shell("exit 0").arg("a\0b"), false);
+}
+#[test]
+fn a_nul_directory_preserves_output() {
+    precious_output("reed", shell("exit 0").cwd("a\0b"), false);
+}
+
+#[test]
+fn stdin_debug_hides_bytes() {
+    let text = format!("{:?}", Stdin::Bytes(b"tok".to_vec()));
+    assert!(!text.contains("116") && !text.contains("tok"), "{text}");
+    assert_eq!(text, "Bytes { len: 3 }");
+}
+#[test]
+fn finished_debug_hides_bytes() {
+    use std::os::unix::process::ExitStatusExt;
+    let result = Ran::Finished {
+        status: std::process::ExitStatus::from_raw(0),
+        stdout: b"tok".to_vec(),
+        stdout_truncated: true,
+        stderr: b"tok".to_vec(),
+        skipped_lines: 2,
+    };
+    let text = format!("{result:?}");
+    assert!(!text.contains("116") && !text.contains("tok"), "{text}");
+    for field in [
+        "status",
+        "stdout_len: 3",
+        "stdout_truncated: true",
+        "stderr_len: 3",
+        "skipped_lines: 2",
+    ] {
+        assert!(text.contains(field), "{text}");
+    }
+}
+
+#[test]
+fn the_working_directory_is_used() {
+    let f = Fixture::new("spruce");
+    let (_, out, _, _, _) = finished(call(
+        &Launch::new("/bin/pwd").arg("-P").cwd(&f.0),
+        Stdin::Null,
+        Stdout::Capture { cap: 4096 },
+        Stderr::Null,
+        policy(),
+    ));
+    use std::os::unix::ffi::OsStrExt;
+    let mut expected = f.0.canonicalize().unwrap().as_os_str().as_bytes().to_vec();
+    expected.push(b'\n');
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn an_open_descendant_pipe_returns_unfinished() {
+    let f = Fixture::new("thyme");
+    let start = Instant::now();
+    let result = call(
+        &f.script("sleep 300 & echo $! > \"$DIR/pid\"; echo early"),
+        Stdin::Null,
+        Stdout::Capture { cap: 1024 },
+        Stderr::Null,
+        Kill {
+            kill_group_on_exit: false,
+            exit_grace: Duration::ZERO,
+            ..policy()
+        },
+    );
+    let guard = Cleanup(f.pid());
+    assert!(matches!(result, Ran::Unfinished), "{result:?}");
+    assert!(start.elapsed() < Duration::from_secs(5));
+    assert!(alive(guard.0));
 }

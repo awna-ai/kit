@@ -91,13 +91,38 @@ pub(super) fn run_with_signal(
     if let Some(bytes) = bytes {
         let mut pipe = child.stdin.take().expect("piped stdin");
         thread::spawn(move || {
+            // SAFETY: A zeroed sigset_t is valid storage for sigemptyset to initialize.
+            let mut blocked: libc::sigset_t = unsafe { std::mem::zeroed() };
+            // SAFETY: blocked is valid storage; SIGPIPE is a valid signal. The mask applies
+            // only to this writer thread.
+            let masked = unsafe {
+                libc::sigemptyset(&mut blocked) == 0
+                    && libc::sigaddset(&mut blocked, libc::SIGPIPE) == 0
+                    && libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, std::ptr::null_mut()) == 0
+            };
+            if !masked {
+                return;
+            }
+            #[cfg(target_vendor = "apple")]
+            {
+                use std::os::fd::AsRawFd;
+                // Apple sends pipe signals to the process, so the thread mask alone is
+                // insufficient. Suppress SIGPIPE on this owned writer descriptor as well.
+                // SAFETY: pipe owns a valid descriptor; F_SETNOSIGPIPE takes an integer.
+                if unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_SETNOSIGPIPE, 1) } == -1 {
+                    return;
+                }
+            }
             let _ = pipe.write_all(&bytes);
         });
     }
     loop {
         if stopped(stop) {
-            group::end_group(&mut child, kill.term_grace, &signal);
-            return Ran::Stopped;
+            return if group::end_group(&mut child, kill.term_grace, &signal) {
+                Ran::Stopped
+            } else {
+                Ran::Unfinished
+            };
         }
         match group::has_exited(pid) {
             Some(true) => return exited(&mut child, readers, kill, stop, signal),
@@ -109,8 +134,11 @@ pub(super) fn run_with_signal(
             Some(false) => {}
         }
         if start.elapsed() >= kill.timeout {
-            group::end_group(&mut child, kill.term_grace, &signal);
-            return Ran::TimedOut;
+            return if group::end_group(&mut child, kill.term_grace, &signal) {
+                Ran::TimedOut
+            } else {
+                Ran::Unfinished
+            };
         }
         if let Some(tick) = &mut tick
             && last_tick.elapsed() >= tick.every.max(POLL)

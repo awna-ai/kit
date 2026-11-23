@@ -20,9 +20,27 @@
 //! # Limits
 //!
 //! A descendant that leaves the group with `setsid` or `setpgid` is not signalled.
-//! `Zeroizing` wipes the secret copy held here when dropped, but does not wipe the operating
-//! system's environment copy. A [`Stdout::Lines`] callback runs on a reader thread; a slow or
-//! blocked callback can delay output collection, and should return promptly.
+//! A [`Stdout::Lines`] callback runs on a reader thread and can still run after [`run`]
+//! returns, until whoever holds the pipe closes it. Callbacks should return promptly.
+//!
+//! The host must not ignore SIGCHLD or reap children elsewhere (for example with
+//! `waitpid(-1)`). If it does, runs end [`Ran::Unfinished`] and descendants may keep running.
+//!
+//! Only file descriptors opened close-on-exec stay out of the child. Rust opens its own
+//! descriptors that way, but a descriptor other host code opens without `O_CLOEXEC` is inherited.
+//! The child stays in the caller's session, so it can open the caller's controlling terminal
+//! if there is one.
+//!
+//! `O_NOFOLLOW` guards only the last path component; a link in a parent directory is followed.
+//! Input files must be regular files. Output files must also belong to the effective user,
+//! have exactly one hard link, and grant no permissions to the group or others. Existing
+//! files that fail these checks are refused without changing their contents or permissions.
+//!
+//! `Zeroizing` wipes [`Launch`]'s copies of a secret. The standard library's command builder
+//! and the operating system's environment copy are not wiped.
+//!
+//! A program without a `/` is searched for using the operating system's default search path,
+//! not the child's `PATH`. Use [`find_program`] and pass an absolute path.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
@@ -121,6 +139,11 @@ impl Launch {
                 && !value.as_bytes().contains(&0)
         };
         if self.program.as_os_str().as_bytes().contains(&0)
+            || self.args.iter().any(|arg| arg.as_bytes().contains(&0))
+            || self
+                .cwd
+                .as_ref()
+                .is_some_and(|cwd| cwd.as_os_str().as_bytes().contains(&0))
             || self.env.iter().any(|(k, v)| !valid_pair(k, v))
             || self
                 .secret_env
@@ -129,7 +152,7 @@ impl Launch {
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "invalid program or environment",
+                "invalid program, argument, directory or environment",
             ));
         }
         Ok(())
@@ -154,7 +177,6 @@ impl fmt::Debug for Launch {
 }
 
 /// The child's stdin.
-#[derive(Debug)]
 pub enum Stdin {
     /// Closed through `/dev/null`.
     Null,
@@ -162,6 +184,16 @@ pub enum Stdin {
     Bytes(Vec<u8>),
     /// A regular file opened read-only without following a final symlink.
     File(PathBuf),
+}
+
+impl fmt::Debug for Stdin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Null => f.write_str("Null"),
+            Self::Bytes(bytes) => f.debug_struct("Bytes").field("len", &bytes.len()).finish(),
+            Self::File(path) => f.debug_tuple("File").field(path).finish(),
+        }
+    }
 }
 
 /// The child's stdout.
@@ -181,9 +213,12 @@ pub enum Stdout {
         #[allow(clippy::type_complexity)]
         on_line: Box<dyn FnMut(&[u8]) + Send + 'static>,
     },
-    /// Appends without following a final symlink; new files have mode 0600.
+    /// Appends to a private, caller-owned regular file with one link; new files have mode 0600.
+    /// Refuses a final symlink.
     AppendLog(PathBuf),
-    /// Truncates without following a final symlink; new files have mode 0600.
+    /// Truncates after all files pass validation; a later spawn failure still leaves it empty.
+    /// Requires a private, caller-owned regular file with one link and refuses a final symlink.
+    /// New files have mode 0600.
     File(PathBuf),
 }
 
@@ -217,7 +252,8 @@ pub enum Stderr {
     Tail(usize),
     /// Shares stdout's pipe, file or `/dev/null` so writes interleave.
     SameAsStdout,
-    /// Appends without following a final symlink; new files have mode 0600.
+    /// Appends to a private, caller-owned regular file with one link; new files have mode 0600.
+    /// Refuses a final symlink.
     AppendLog(PathBuf),
 }
 
@@ -226,7 +262,8 @@ pub enum Stderr {
 pub struct Kill {
     /// Time from the start until the group is ended as [`Ran::TimedOut`].
     pub timeout: Duration,
-    /// Sends SIGTERM, waits up to this grace for the leader, then always sends SIGKILL.
+    /// Sends SIGTERM, waits up to this grace for the leader, then sends SIGKILL
+    /// unless the child has already been reaped.
     /// `None` sends SIGKILL immediately.
     pub term_grace: Option<Duration>,
     /// How long piped readers may finish after the leader exits, before group cleanup.
@@ -262,7 +299,6 @@ impl fmt::Debug for Tick<'_> {
 }
 
 /// How a run ended.
-#[derive(Debug)]
 pub enum Ran {
     /// The child exited and every output reader reported successfully.
     Finished {
@@ -282,10 +318,36 @@ pub enum Ran {
     /// The stop flag was set. An already-set flag starts nothing.
     Stopped,
     /// The child started, but waiting or collecting output failed. No output is returned.
-    /// Output collection allows at most one second after the leader is reaped.
+    /// Also returned when timeout or stop cleanup cannot reap the leader within one second
+    /// after SIGKILL. Output collection allows at most one second after the leader is reaped.
     Unfinished,
     /// Nothing started because validation, file opening or spawning failed.
     NotStarted(io::Error),
+}
+
+impl fmt::Debug for Ran {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Finished {
+                status,
+                stdout,
+                stdout_truncated,
+                stderr,
+                skipped_lines,
+            } => f
+                .debug_struct("Finished")
+                .field("status", status)
+                .field("stdout_len", &stdout.len())
+                .field("stdout_truncated", stdout_truncated)
+                .field("stderr_len", &stderr.len())
+                .field("skipped_lines", skipped_lines)
+                .finish(),
+            Self::TimedOut => f.write_str("TimedOut"),
+            Self::Stopped => f.write_str("Stopped"),
+            Self::Unfinished => f.write_str("Unfinished"),
+            Self::NotStarted(error) => f.debug_tuple("NotStarted").field(error).finish(),
+        }
+    }
 }
 
 /// Runs one child until it exits, is stopped, or reaches its timeout.
@@ -343,25 +405,30 @@ mod tests {
         Gone,
     }
     fn reap_state(pid: u32) -> Reap {
-        // SAFETY: An all-zero siginfo_t is valid storage for waitid to fill.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // SAFETY: The pointer is valid and WNOWAIT never reaps the child.
-        let rc = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                pid as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
-            )
-        };
-        if rc != 0 {
-            return Reap::Gone;
-        }
-        // SAFETY: A successful waitid initialized the signal information.
-        if unsafe { info.si_pid() } == 0 {
-            Reap::Running
-        } else {
-            Reap::Unreaped
+        loop {
+            // SAFETY: An all-zero siginfo_t is valid storage for waitid to fill.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: The pointer is valid and WNOWAIT never reaps the child.
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+                )
+            };
+            if rc != 0 {
+                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Reap::Gone;
+            }
+            // SAFETY: A successful waitid initialized the signal information.
+            if unsafe { info.si_pid() } == 0 {
+                return Reap::Running;
+            } else {
+                return Reap::Unreaped;
+            }
         }
     }
     #[test]
@@ -374,16 +441,18 @@ mod tests {
     }
     #[test]
     fn the_group_is_signalled_before_the_leader_is_reaped() {
-        for (script, kill, expected) in [
+        for (script, kill, expected, timed_out) in [
             (
                 "exit 0",
                 Kill::after(Duration::from_secs(5)),
                 vec![libc::SIGKILL],
+                false,
             ),
             (
                 "sleep 300",
                 Kill::after(Duration::from_millis(300)),
                 vec![libc::SIGKILL],
+                true,
             ),
             (
                 "trap 'exit 0' TERM; sleep 300 & wait",
@@ -393,6 +462,7 @@ mod tests {
                     ..Kill::after(Duration::from_secs(5))
                 },
                 vec![libc::SIGTERM, libc::SIGKILL],
+                true,
             ),
         ] {
             let records = RefCell::new(Vec::new());
@@ -411,11 +481,103 @@ mod tests {
             );
             let records = records.into_inner();
             assert_eq!(records.iter().map(|r| r.1).collect::<Vec<_>>(), expected);
-            assert!(matches!(result, Ran::Finished { .. } | Ran::TimedOut));
+            if timed_out {
+                assert!(matches!(result, Ran::TimedOut), "{result:?}");
+            } else {
+                assert!(
+                    matches!(result, Ran::Finished { status, .. } if status.success()),
+                    "{result:?}"
+                );
+            }
             for (pid, _, state) in records {
                 assert_ne!(state, Reap::Gone);
                 assert_eq!(reap_state(pid), Reap::Gone);
             }
         }
+    }
+    fn isolated_test(name: &str, variable: &str) {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(variable, "1")
+            .spawn()
+            .unwrap();
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "isolated test failed: {status}");
+                return;
+            }
+            if start.elapsed() > Duration::from_secs(10) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("isolated test did not return");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_failed_wait_never_leads_to_a_group_signal() {
+        isolated_test("tests::sigchld_ignored_child", "AWNA_RUN_TEST_SIGCHLD");
+    }
+
+    #[test]
+    fn sigchld_ignored_child() {
+        if std::env::var("AWNA_RUN_TEST_SIGCHLD").as_deref() != Ok("1") {
+            return;
+        }
+        // SAFETY: This isolated process runs no other tests and exits after this test.
+        unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
+        let records = RefCell::new(Vec::new());
+        let start = std::time::Instant::now();
+        let result = supervisor::run_with_signal(
+            &Launch::new("/bin/sh").args(["-c", "trap 'exit 0' TERM; sleep 300 & wait"]),
+            Stdin::Null,
+            Stdout::Null,
+            Stderr::Null,
+            Kill {
+                term_grace: Some(Duration::from_secs(2)),
+                ..Kill::after(Duration::from_millis(300))
+            },
+            None,
+            None,
+            |pid, signal| {
+                records.borrow_mut().push(reap_state(pid));
+                signal_group(pid, signal)
+            },
+        );
+        assert!(!records.borrow().is_empty());
+        assert!(
+            records.borrow().iter().all(|state| *state != Reap::Gone),
+            "{:?}",
+            records.borrow()
+        );
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(matches!(result, Ran::TimedOut | Ran::Unfinished));
+    }
+
+    #[test]
+    fn a_closed_stdin_pipe_does_not_kill_the_host() {
+        isolated_test("tests::sigpipe_default_child", "AWNA_RUN_TEST_SIGPIPE");
+    }
+
+    #[test]
+    fn sigpipe_default_child() {
+        if std::env::var("AWNA_RUN_TEST_SIGPIPE").as_deref() != Ok("1") {
+            return;
+        }
+        // SAFETY: Only this isolated test process changes its signal disposition.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+        let result = run(
+            &Launch::new("/bin/sh").args(["-c", "exit 0"]),
+            Stdin::Bytes(vec![b'x'; 4 * 1024 * 1024]),
+            Stdout::Null,
+            Stderr::Null,
+            Kill::after(Duration::from_secs(5)),
+            None,
+            None,
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(matches!(result, Ran::Finished { status, .. } if status.success()));
     }
 }

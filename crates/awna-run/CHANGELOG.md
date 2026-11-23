@@ -6,3 +6,4 @@ This package is versioned on its own. Its releases are tagged `awna-run-vX.Y.Z` 
 
 - Added the supervisor `run` with stdin, stdout, stderr and kill policies, a stop flag and a tick callback.
 - Added `find_program`.
+- Bounded cleanup after failed group signals, checked file destinations before truncation, protected stdin writers from broken-pipe signals, and hid input and output bytes in debug output.

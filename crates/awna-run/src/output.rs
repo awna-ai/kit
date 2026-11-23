@@ -3,7 +3,10 @@ use std::{
     collections::VecDeque,
     fs::{File, OpenOptions},
     io::{self, BufRead, BufReader, Read},
-    os::unix::fs::OpenOptionsExt,
+    os::{
+        fd::AsRawFd,
+        unix::fs::{MetadataExt, OpenOptionsExt},
+    },
     path::Path,
     process::Stdio,
     sync::mpsc::{self, Receiver, TryRecvError},
@@ -34,15 +37,50 @@ pub(super) struct Prepared {
     pub shared: Option<io::PipeReader>,
 }
 
+const FILE_FLAGS: libc::c_int = libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY;
+
+fn checked(file: File, output: bool) -> io::Result<File> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected a regular file",
+        ));
+    }
+    // SAFETY: geteuid has no arguments or preconditions.
+    if output
+        && (metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o077 != 0)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "output must be private, owned by the caller, and have one link",
+        ));
+    }
+    // SAFETY: file owns a valid descriptor; F_GETFL takes no further argument.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: The descriptor is valid and these are its existing flags minus O_NONBLOCK.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
 fn log(path: &Path, append: bool) -> io::Result<File> {
-    OpenOptions::new()
-        .write(true)
-        .create(true)
-        .append(append)
-        .truncate(!append)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
+    checked(
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .append(append)
+            .mode(0o600)
+            .custom_flags(FILE_FLAGS)
+            .open(path)?,
+        true,
+    )
 }
 
 impl Prepared {
@@ -51,19 +89,17 @@ impl Prepared {
             Stdin::Null => (Stdio::null(), None),
             Stdin::Bytes(bytes) => (Stdio::piped(), Some(bytes)),
             Stdin::File(path) => {
-                let file = OpenOptions::new()
-                    .read(true)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(path)?;
-                if !file.metadata()?.is_file() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "stdin must be a regular file",
-                    ));
-                }
+                let file = checked(
+                    OpenOptions::new()
+                        .read(true)
+                        .custom_flags(FILE_FLAGS)
+                        .open(path)?,
+                    false,
+                )?;
                 (file.into(), None)
             }
         };
+        let truncate = matches!(output, Stdout::File(_));
         let (out_mode, file) = match output {
             Stdout::Null => (None, None),
             Stdout::Capture { cap } => (Some(Mode::Capture(cap)), None),
@@ -94,6 +130,9 @@ impl Prepared {
             }
         };
         let stdout = if let Some(file) = file {
+            if truncate {
+                file.set_len(0)?;
+            }
             file.into()
         } else if let Some(writer) = shared_writer {
             writer.into()

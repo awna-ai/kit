@@ -5,6 +5,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+const KILL_WAIT: Duration = Duration::from_secs(1);
+
 pub(super) const POLL: Duration = Duration::from_millis(20);
 
 pub(super) fn signal_group(pid: u32, signal: libc::c_int) -> bool {
@@ -46,15 +48,44 @@ pub(super) fn end_group(
     child: &mut Child,
     grace: Option<Duration>,
     signal: impl Fn(u32, libc::c_int) -> bool,
-) {
+) -> bool {
     let pid = child.id();
     if let Some(grace) = grace {
         signal(pid, libc::SIGTERM);
         let start = Instant::now();
-        while has_exited(pid) != Some(true) && start.elapsed() < grace {
+        loop {
+            match has_exited(pid) {
+                Some(true) => break,
+                None => match child.try_wait() {
+                    Ok(Some(_)) => return true,
+                    Ok(None) => {}
+                    Err(_) => return false,
+                },
+                Some(false) => {}
+            }
+            if start.elapsed() >= grace {
+                break;
+            }
             thread::sleep(POLL.min(grace.saturating_sub(start.elapsed())));
         }
     }
-    signal(pid, libc::SIGKILL);
-    let _ = child.wait();
+    if !signal(pid, libc::SIGKILL) {
+        let _ = child.kill();
+    }
+    let start = Instant::now();
+    loop {
+        match has_exited(pid) {
+            Some(true) => return child.wait().is_ok(),
+            None => match child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) => {}
+                Err(_) => return false,
+            },
+            Some(false) => {}
+        }
+        if start.elapsed() >= KILL_WAIT {
+            return false;
+        }
+        thread::sleep(POLL.min(KILL_WAIT.saturating_sub(start.elapsed())));
+    }
 }
