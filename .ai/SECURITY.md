@@ -1,6 +1,6 @@
 # Security: kit
 
-**Last reviewed:** 2026-11-23, when `awna-run` 0.1.0 was added.
+**Last reviewed:** 2026-11-23, when `awna-keystore` 0.1.0 was added.
 
 ## What this system is
 
@@ -17,7 +17,7 @@ repository itself, a private term or a secret published in public history.
 | Contributor → public `main` | code, messages, tags, ref names | the gate: term check over every object, message and ref name; `scripts/secret-scan.sh` runs gitleaks over every ref's history, every reachable object whole (merges, tags, messages included) and the working tree, and refuses a repo-level gitleaks config | `tests/term_check_test.sh`, `tests/secret_scan_test.sh`; the gate before every land |
 | Crate ecosystem → the four core packages | dependencies | `scripts/deps-check.sh`: no network client, no `tauri-plugin-*`, no `iroh*` (optional dependencies of dependencies included, through `Cargo.lock`), nothing from outside crates.io and this workspace, no repo-level cargo config; `Cargo.lock` committed, `--locked` everywhere | `tests/deps_check_test.sh` |
 | Consumer → `awna-run` | program, arguments, environment, stdin, output paths | the child leads its own process group and its environment is cleared and rebuilt from the caller's pairs; secret values are held zeroized and never shown by `Debug`, and no `Debug` prints input or output bytes; every group signal is sent while the leader is still unreaped, never to the caller's own group or to pid 0 or 1; a failed signal falls back to the leader and a bounded wait; files are opened without following a final link and without blocking, must be regular, and outputs must be the user's own, single-linked and private (0600) | `crates/awna-run/tests/`, the unit tests in its `lib.rs`, a security review and an independent verification before release |
-| Consumer → `awna-keystore` (from its first release) | secret values | to be set by its design: a secret type with no `Clone`, `Display` or `Serialize`, read back after every store | the same |
+| Consumer → `awna-keystore` | items (service, account, label) and secret values | `Secret` is zeroized on drop, has no `Clone`, `Display`, `PartialEq` or `Serialize`, and its `Debug` is redacted; items are checked against fixed character sets and every store refuses a value outside the token characters (at most 8192 bytes), so the macOS command line can never be broken out of; the macOS value goes to `security -i` on stdin only, never argv, with the environment cleared to `HOME` and stderr discarded; every store is read back; errors carry the item and a fixed phrase, never a value or a store's own error text, and stored bytes in a keyring error are wiped; never a file fallback | `crates/awna-keystore/tests/` (a stand-in `security` records argv, stdin and environment), the unit tests in `src/keyring.rs` over keyring-core's mock store, a live keychain round trip run by hand, a security review and an independent verification before release |
 | Consumer → `awna-launch` (from its first release) | unit definitions written to disk and loaded | to be set by its design: rendered from typed fields, never from raw text | the same |
 | Agent output → `awna-agents` | untrusted model and tool text | parsed as data only, never evaluated or passed to a shell | its tests |
 
@@ -40,7 +40,9 @@ The repository holds no secret and its gate needs none. Tests use invented value
 
 ## External integrations
 
-None. The four core packages make no network calls; cargo fetches dependencies from crates.io at build time.
+None over a network. The four core packages make no network calls; cargo fetches dependencies from crates.io at build
+time. `awna-keystore` talks to the operating system's password store: `/usr/bin/security` on macOS, the Credential
+Manager API on Windows, and the Secret Service over the local D-Bus session on Linux.
 
 ## Supply chain
 
@@ -54,7 +56,8 @@ None. The four core packages make no network calls; cargo fetches dependencies f
 | Gap | Why accepted | Accepted by | Revisit |
 | --- | --- | --- | --- |
 | The forbidden-crate list matches exact names and two prefixes, not every networking crate | it mirrors what consumers forbid today; widening it is a design change | the maintainers, 2026-11-23 | when a package first takes a dependency |
-| No advisory scan (`cargo audit` or `cargo deny`) yet | the only dependencies are `libc` and `zeroize` (default features), both widely used and small; the gate hosts have no advisory tool | the maintainers, 2026-11-23 | before a third dependency, or before the first release that ships to outside users |
+| No advisory scan (`cargo audit` or `cargo deny`) yet | macOS builds resolve only `libc`, `zeroize`, `keyring-core` and `log`; `awna-keystore`'s Windows and Linux stores bring the platform API crates and a pure-Rust D-Bus and crypto stack (about 140 crates, none a network client, checked by `scripts/deps-check.sh`); the gate hosts have no advisory tool | the maintainers, 2026-11-23 | before the first release that ships to outside users, or when a gate host gains an advisory tool |
+| `awna-keystore`: the macOS `security` call has no timeout (a locked keychain can wait on a prompt); the standard library's output buffer and the keyring stores may leave unwiped copies of a value; `find` returns any non-empty text, so a consumer that needs the token rule checks `storable` itself; the Windows store has no label; Linux needs a running Secret Service, else `NoStore` | the same behaviour as the stores it replaces; each is documented in the crate | the maintainers, 2026-11-23 | when a consumer needs any of them closed |
 | `awna-run`: a descendant that leaves the child's group, a file descriptor the host opened without close-on-exec, the caller's controlling terminal, a link in a parent directory of an output path, and copies of a secret inside the standard library's command builder are outside its control | each is documented in the crate's Limits; closing them needs a different spawn path or directory-relative opens, which the first release keeps out | the maintainers, 2026-11-23 | when a consumer needs any of them closed |
 | `awna-run`: a host that ignores SIGCHLD or reaps children itself loses the reap-before-signal guarantee | documented; the run then ends `Unfinished` rather than signalling a group it cannot vouch for | the maintainers, 2026-11-23 | at the next review |
 | The gate runs the candidate commit's own code (its scripts, tests, build scripts and Rust tests) with the gate host's user and network | only maintainers' commits are gated; an outside contribution is read before it is run | the maintainers, 2026-11-23 | before the gate runs anything not authored here |
@@ -74,3 +77,5 @@ None. The four core packages make no network calls; cargo fetches dependencies f
 - 2026-11-23: created with the workspace and its gate.
 - 2026-11-23: `awna-run` 0.1.0: its boundary row, the advisory-scan gap revisited for its two dependencies, and its
   accepted limits.
+- 2026-11-23: `awna-keystore` 0.1.0: its boundary row, the operating-system stores under external integrations, the
+  advisory-scan gap revisited for its dependencies, and its accepted limits.
