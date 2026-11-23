@@ -34,10 +34,13 @@ impl fmt::Debug for Secret {
         f.write_str("Secret(<redacted>)")
     }
 }
-/// The longest accepted value, in bytes.
-pub const MAX_SECRET: usize = 8192;
+/// The longest value any store accepts, in bytes; the Windows store takes fewer, see [`storable`].
+pub const MAX_SECRET: usize = 3072;
 /// Whether a value has 1 to `min(max, MAX_SECRET)` bytes, all ASCII letters,
 /// digits, or `. _ ~ : + / = -`. Other bytes, including whitespace, are refused.
+/// Every store refuses values rejected here. The Windows store also refuses values
+/// over 1,280 characters (its 2,560-byte UTF-16 blob limit), returning
+/// [`crate::Error::Failed`] with `why: "too long"` without writing anything.
 pub fn storable(value: &Secret, max: usize) -> bool {
     let bytes = value.expose().as_bytes();
     !bytes.is_empty()

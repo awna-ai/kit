@@ -11,6 +11,11 @@
 //!   Linux stores may keep copies this crate cannot reach.
 //! - `find` returns any non-empty text; a caller that needs the token rule checks [`storable`] itself.
 //! - The Windows store has no label; the Linux store needs a running Secret Service, else [`Error::NoStore`].
+//! - The Linux store sets an item's label when first creating it; later stores keep the old label.
+//! - Items written through `/usr/bin/security` trust that program: any process of the same user can read them
+//!   with `security find-generic-password -w` without a prompt, as with any item that program writes.
+//! - Writing to `security` can raise SIGPIPE if it exits early. Rust programs ignore SIGPIPE; a host whose
+//!   `main` is not Rust should ignore it too.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 

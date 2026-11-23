@@ -8,7 +8,9 @@ pub struct Item {
     label: String,
 }
 impl Item {
-    /// Validates service and account as 1–64 bytes of `a-z`, `0-9`, `.` or `-`.
+    /// Validates service as 1–64 bytes of `a-z`, `0-9`, `.` or `-`,
+    /// and account as 1–64 bytes of `a-z`, `0-9` or `-`.
+    /// Dot-free accounts keep Windows credential names (`account.service`) unique.
     /// Labels are 1–64 bytes of ASCII letters, digits, spaces or `. , : ( ) _ -`,
     /// without a leading or trailing space. Returns [`Error::InvalidItem`] otherwise.
     pub fn new(service: &str, account: &str, label: &str) -> Result<Item, Error> {
@@ -23,7 +25,7 @@ impl Item {
             && label
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b" .,:()_-".contains(&b));
-        if !identifier(service) || !identifier(account) || !valid_label {
+        if !identifier(service) || !identifier(account) || account.contains('.') || !valid_label {
             return Err(Error::InvalidItem);
         }
         Ok(Item {

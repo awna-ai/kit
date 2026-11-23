@@ -7,6 +7,8 @@ use std::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
+const MAX_LINE: usize = 4000;
+
 /// The macOS keychain through a program, available on every Unix for testing.
 #[derive(Debug, Clone)]
 pub struct SecurityCli {
@@ -132,6 +134,10 @@ impl CredentialStore for SecurityCli {
             return Err(Error::NotStorable);
         }
         let line = store_line(item, value);
+        // `security -i` has a 4096-byte line buffer; longer input can run as separate commands.
+        if line.len() > MAX_LINE {
+            return Err(Error::NotStorable);
+        }
         let mut child = self
             .command()
             .arg("-i")
@@ -146,7 +152,7 @@ impl CredentialStore for SecurityCli {
         if written.is_err() {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(Self::failed(item, "store", "could not run"));
+            return Err(Self::failed(item, "store", "could not write"));
         }
         let status = child
             .wait()
@@ -165,5 +171,25 @@ impl CredentialStore for SecurityCli {
             Some(0 | 44) => Ok(()),
             _ => Err(Self::status(item, "delete", status)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn longest_store_line_fits_the_program_buffer() {
+        let field = "a".repeat(64);
+        let item = Item::new(&field, &field, &field).unwrap();
+        let line = store_line(&item, &Secret::new("a".repeat(MAX_SECRET)));
+        assert!(line.len() <= MAX_LINE, "line has {} bytes", line.len());
+    }
+
+    #[test]
+    fn default_program_and_home_match_the_system() {
+        let cli = SecurityCli::new();
+        assert_eq!(cli.program, PathBuf::from("/usr/bin/security"));
+        assert!(cli.home == std::env::var_os("HOME"));
     }
 }

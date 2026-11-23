@@ -17,7 +17,7 @@ fn unsupported_unix_reports_no_store() {
 #[test]
 #[ignore = "writes to this computer's keychain; run by hand"]
 fn live_system_round_trip() {
-    use awna_keystore::{Item, Secret, system};
+    use awna_keystore::{Item, MAX_SECRET, Secret, system};
     let store = system().unwrap();
     let item = Item::new(
         "awna-keystore.live-test",
@@ -42,6 +42,14 @@ fn live_system_round_trip() {
         "invented-live-value"
     );
     assert!(store.exists(&item).unwrap());
+    store.delete(&item).unwrap();
+    assert!(!store.exists(&item).unwrap());
+    let maximum = Secret::new("a".repeat(MAX_SECRET));
+    store.store(&item, &maximum).unwrap();
+    assert_eq!(
+        store.find(&item).unwrap().unwrap().expose(),
+        maximum.expose()
+    );
     store.delete(&item).unwrap();
     assert!(!store.exists(&item).unwrap());
 }

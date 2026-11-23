@@ -1,5 +1,5 @@
 #![cfg(unix)]
-use awna_keystore::{CredentialStore, Error, Item, Secret, SecurityCli};
+use awna_keystore::{CredentialStore, Error, Item, MAX_SECRET, Secret, SecurityCli};
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
@@ -30,7 +30,27 @@ for arg in "$@"; do
     first=0
 done
 printf '\n' >> "$HOME/argv.log"
-/usr/bin/env > "$HOME/env.log"
+printf 'call=%s\n' "$1" >> "$HOME/env.log"
+/usr/bin/env >> "$HOME/env.log"
+# Preserve the original descriptors before command substitution redirects stdout.
+exec 3<&0 4>&1 5>&2
+if [ -x /usr/bin/sw_vers ]; then
+    null=$(/usr/bin/stat -L -f %d:%i:%r /dev/null)
+    input=$(/usr/bin/stat -L -f %d:%i:%r /dev/fd/3)
+    output=$(/usr/bin/stat -L -f %d:%i:%r /dev/fd/4)
+    error=$(/usr/bin/stat -L -f %d:%i:%r /dev/fd/5)
+else
+    null=$(/usr/bin/stat -L -c %d:%i:%r /dev/null)
+    input=$(/usr/bin/stat -L -c %d:%i:%r /dev/fd/3)
+    output=$(/usr/bin/stat -L -c %d:%i:%r /dev/fd/4)
+    error=$(/usr/bin/stat -L -c %d:%i:%r /dev/fd/5)
+fi
+in_kind=pipe; out_kind=pipe; err_kind=pipe
+if [ "$input" = "$null" ]; then in_kind=null; fi
+if [ "$output" = "$null" ]; then out_kind=null; fi
+if [ "$error" = "$null" ]; then err_kind=null; fi
+printf '%s in=%s out=%s err=%s\n' "$1" "$in_kind" "$out_kind" "$err_kind" >> "$HOME/stdio.log"
+exec 3<&- 4>&- 5>&-
 case "$1" in
     -i)
         /bin/cat > "$HOME/stdin.log"
@@ -248,4 +268,68 @@ fn a_missing_program_is_a_sanitized_failure_for_every_operation() {
         store.delete(&item()),
         Err(failed("delete", "could not run"))
     );
+}
+
+#[test]
+fn maximum_value_and_fields_reach_stdin_whole() {
+    let f = Fixture::new();
+    let field = "a".repeat(64);
+    let item = Item::new(&field, &field, &field).unwrap();
+    let value = Secret::new("a".repeat(MAX_SECRET));
+    f.set("find.out", value.expose());
+    assert_eq!(f.store.store(&item, &value), Ok(()));
+    assert_eq!(
+        f.read("stdin.log"),
+        format!(
+            "add-generic-password -U -s {field} -a {field} -l \"{field}\" -w \"{}\"\n",
+            value.expose()
+        )
+    );
+    let too_long = Secret::new("a".repeat(MAX_SECRET + 1));
+    fs::remove_file(f.dir.join("argv.log")).unwrap();
+    assert_eq!(f.store.store(&item, &too_long), Err(Error::NotStorable));
+    assert!(!f.dir.join("argv.log").exists());
+}
+
+#[test]
+fn every_call_has_the_required_stdio_and_environment() {
+    let f = Fixture::new();
+    f.set("find.out", "invented-token\n");
+    assert_eq!(f.store.store(&item(), &value()), Ok(()));
+    assert_eq!(
+        f.store.find(&item()).unwrap().unwrap().expose(),
+        value().expose()
+    );
+    assert_eq!(f.store.exists(&item()), Ok(true));
+    assert_eq!(f.store.delete(&item()), Ok(()));
+    assert_eq!(
+        f.read("stdio.log"),
+        concat!(
+            "-i in=pipe out=null err=null\n",
+            "find-generic-password in=null out=pipe err=null\n",
+            "find-generic-password in=null out=pipe err=null\n",
+            "find-generic-password in=null out=null err=null\n",
+            "delete-generic-password in=null out=null err=null\n",
+        )
+    );
+    let env = f.read("env.log");
+    let blocks: Vec<_> = env.split("call=").skip(1).collect();
+    assert_eq!(blocks.len(), 5);
+    for (block, call) in blocks.iter().zip([
+        "-i",
+        "find-generic-password",
+        "find-generic-password",
+        "find-generic-password",
+        "delete-generic-password",
+    ]) {
+        let mut lines = block.lines();
+        assert_eq!(lines.next(), Some(call));
+        let lines: Vec<_> = lines.collect();
+        assert!(
+            lines
+                .iter()
+                .any(|line| *line == format!("HOME={}", f.dir.display()))
+        );
+        assert!(!lines.iter().any(|line| line.starts_with("PATH=")));
+    }
 }

@@ -10,7 +10,7 @@ fn item_accepts_bounded_identifiers_and_label_characters() {
         assert_eq!(item.label(), id);
         assert_eq!(item.clone(), item);
     }
-    assert!(Item::new("a0.-", "a0.-", "aZ09 .,:()_-").is_ok());
+    assert!(Item::new("a0.-", "a0-", "aZ09 .,:()_-").is_ok());
 }
 
 #[test]
@@ -33,4 +33,11 @@ fn item_rejects_invalid_identifiers_and_labels() {
     ] {
         assert_eq!(Item::new("a", "a", label), Err(Error::InvalidItem));
     }
+}
+
+#[test]
+fn accounts_exclude_dots_to_keep_store_names_unique() {
+    assert_eq!(Item::new("svc", "a.b", "L"), Err(Error::InvalidItem));
+    assert!(Item::new("b.c", "a", "L").is_ok());
+    assert!(Item::new("svc", "a-0129", "L").is_ok());
 }

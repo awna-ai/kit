@@ -3,7 +3,7 @@
 Small, separate building blocks for desktop tools that run AI coding agents on your own machine. Each one is a
 package of its own, with its own version, tag and changelog, so a tool takes only the pieces it needs.
 
-MIT licensed. Nothing here is released yet: the packages below are empty until their first tag.
+MIT licensed. Each package is released on its own tag; a package with no tag yet is still empty.
 
 ## The packages
 

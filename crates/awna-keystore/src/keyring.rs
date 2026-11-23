@@ -16,6 +16,20 @@ pub(crate) struct KeyringStore {
     store: Arc<keyring_core::CredentialStore>,
     flavor: Flavor,
 }
+#[cfg(any(target_os = "linux", test))]
+fn local_session_bus(address: Option<&std::ffi::OsStr>) -> bool {
+    let Some(address) = address else {
+        return true;
+    };
+    let Some(address) = address.to_str() else {
+        return false;
+    };
+    let mut entries = address
+        .split(';')
+        .filter(|entry| !entry.is_empty())
+        .peekable();
+    entries.peek().is_some() && entries.all(|entry| entry.starts_with("unix:"))
+}
 fn modifiers(flavor: Flavor, item: &Item) -> Vec<(&'static str, String)> {
     // Windows has no label modifier.
     let _ = item;
@@ -38,6 +52,10 @@ impl KeyringStore {
     }
     #[cfg(target_os = "linux")]
     pub(crate) fn open() -> Result<Self, Error> {
+        let address = std::env::var_os("DBUS_SESSION_BUS_ADDRESS");
+        if !local_session_bus(address.as_deref()) {
+            return Err(Error::NoStore);
+        }
         Ok(Self {
             store: zbus_secret_service_keyring_store::Store::new().map_err(|_| Error::NoStore)?,
             flavor: Flavor::Linux,
@@ -119,6 +137,54 @@ impl CredentialStore for KeyringStore {
 mod tests {
     use super::*;
     use keyring_core::Error as StoreError;
+    use keyring_core::api::{CredentialApi, CredentialStoreApi};
+    use std::collections::HashMap;
+
+    #[derive(Clone, Copy)]
+    struct FixedReadStore(Option<&'static [u8]>);
+
+    impl CredentialStoreApi for FixedReadStore {
+        fn vendor(&self) -> String {
+            "invented".into()
+        }
+        fn id(&self) -> String {
+            "invented".into()
+        }
+        fn build(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&HashMap<&str, &str>>,
+        ) -> keyring_core::Result<keyring_core::Entry> {
+            Ok(keyring_core::Entry::new_with_credential(Arc::new(*self)))
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+    impl CredentialApi for FixedReadStore {
+        fn set_secret(&self, _: &[u8]) -> keyring_core::Result<()> {
+            Ok(())
+        }
+        fn get_secret(&self) -> keyring_core::Result<Vec<u8>> {
+            self.0.map(<[u8]>::to_vec).ok_or(StoreError::NoEntry)
+        }
+        fn delete_credential(&self) -> keyring_core::Result<()> {
+            Ok(())
+        }
+        fn get_credential(
+            &self,
+        ) -> keyring_core::Result<Option<Arc<keyring_core::api::Credential>>> {
+            self.get_secret()?;
+            Ok(None)
+        }
+        fn get_specifiers(&self) -> Option<(String, String)> {
+            None
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
     fn store() -> KeyringStore {
         KeyringStore {
             store: keyring_core::mock::Store::new().unwrap(),
@@ -135,6 +201,86 @@ mod tests {
             .downcast_ref::<keyring_core::mock::Cred>()
             .unwrap()
             .set_error(error);
+    }
+    #[test]
+    fn session_bus_addresses_allow_only_local_unix_entries() {
+        assert!(local_session_bus(None));
+        for address in [
+            "unix:path=/run/user/1/bus",
+            "unix:abstract=x;unix:path=/y",
+            ";unix:path=/x;",
+        ] {
+            assert!(local_session_bus(Some(address.as_ref())), "{address}");
+        }
+        for address in [
+            "tcp:host=example.invalid,port=1",
+            "unix:path=/x;tcp:host=y",
+            "unixexec:path=/bin/true",
+            "nonce-tcp:",
+            "",
+            ";",
+        ] {
+            assert!(!local_session_bus(Some(address.as_ref())), "{address}");
+        }
+    }
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn session_bus_addresses_reject_non_utf8() {
+        #[cfg(unix)]
+        let address = {
+            use std::os::unix::ffi::OsStringExt;
+            std::ffi::OsString::from_vec(b"unix:path=/x\xff".to_vec())
+        };
+        #[cfg(windows)]
+        let address = {
+            use std::os::windows::ffi::OsStringExt;
+            let mut units: Vec<u16> = "unix:path=/x".encode_utf16().collect();
+            units.push(0xd800);
+            std::ffi::OsString::from_wide(&units)
+        };
+        assert!(!local_session_bus(Some(&address)));
+    }
+    #[test]
+    fn linux_modifiers_reach_the_store() {
+        modifiers_reach_the_store(Flavor::Linux);
+    }
+    #[test]
+    fn windows_modifiers_reach_the_store() {
+        modifiers_reach_the_store(Flavor::Windows);
+    }
+    fn modifiers_reach_the_store(flavor: Flavor) {
+        let store = KeyringStore {
+            store: keyring_core::mock::Store::new().unwrap(),
+            flavor,
+        };
+        assert_eq!(
+            store.find(&item()).unwrap_err(),
+            Error::Failed {
+                item: item_name(&item()),
+                op: "find",
+                why: "not supported".into(),
+            }
+        );
+    }
+    #[test]
+    fn writes_must_read_back_a_value() {
+        assert_read_back_failure(None);
+    }
+    #[test]
+    fn writes_must_read_back_the_same_value() {
+        assert_read_back_failure(Some(b"invented-other"));
+    }
+    fn assert_read_back_failure(value: Option<&'static [u8]>) {
+        let store = KeyringStore {
+            store: Arc::new(FixedReadStore(value)),
+            flavor: Flavor::Plain,
+        };
+        assert_eq!(
+            store.store(&item(), &Secret::new("invented-token".into())),
+            Err(Error::ReadBack {
+                item: item_name(&item()),
+            })
+        );
     }
     #[test]
     fn missing_is_absent_and_delete_is_idempotent() {
