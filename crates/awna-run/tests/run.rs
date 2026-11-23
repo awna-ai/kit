@@ -566,7 +566,7 @@ fn a_leader_that_changes_group_does_not_hold_the_timeout() {
         let result = call(
             &Launch::new("/usr/bin/perl").args([
                 "-e",
-                "$| = 1; print \"$$\\n\"; setpgrp(0, getpgrp(getppid())) or die $!; sleep 300",
+                "$| = 1; if (fork() == 0) { sleep 300; exit 0 } print \"$$\\n\"; setpgrp(0, getpgrp(getppid())) or die $!; sleep 300",
             ]),
             Stdin::Null,
             Stdout::AppendLog(path),
@@ -584,7 +584,7 @@ fn a_leader_that_changes_group_does_not_hold_the_timeout() {
     let guard = Cleanup(f.pid());
     let result = rx.recv_timeout(Duration::from_secs(5));
     assert!(result.is_ok(), "timeout cleanup did not return: {result:?}");
-    assert!(matches!(result.unwrap(), Ran::TimedOut | Ran::Unfinished));
+    assert!(matches!(result.unwrap(), Ran::TimedOut));
     assert!(start.elapsed() < Duration::from_secs(10));
     dead(guard.0);
 }

@@ -69,7 +69,7 @@ pub(super) fn end_group(
             thread::sleep(POLL.min(grace.saturating_sub(start.elapsed())));
         }
     }
-    if !signal(pid, libc::SIGKILL) {
+    if !signal(pid, libc::SIGKILL) || has_exited(pid) != Some(true) {
         let _ = child.kill();
     }
     let start = Instant::now();

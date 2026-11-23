@@ -215,10 +215,12 @@ pub enum Stdout {
     },
     /// Appends to a private, caller-owned regular file with one link; new files have mode 0600.
     /// Refuses a final symlink.
+    /// A missing output file is created before later files are checked, so a refused run can leave a new empty file behind.
     AppendLog(PathBuf),
     /// Truncates after all files pass validation; a later spawn failure still leaves it empty.
     /// Requires a private, caller-owned regular file with one link and refuses a final symlink.
     /// New files have mode 0600.
+    /// A missing output file is created before later files are checked, so a refused run can leave a new empty file behind.
     File(PathBuf),
 }
 
@@ -254,6 +256,7 @@ pub enum Stderr {
     SameAsStdout,
     /// Appends to a private, caller-owned regular file with one link; new files have mode 0600.
     /// Refuses a final symlink.
+    /// A missing output file is created before later files are checked, so a refused run can leave a new empty file behind.
     AppendLog(PathBuf),
 }
 
@@ -499,12 +502,17 @@ mod tests {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", name, "--nocapture", "--test-threads=1"])
             .env(variable, "1")
+            .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
         let start = std::time::Instant::now();
         loop {
             if let Some(status) = child.try_wait().unwrap() {
                 assert!(status.success(), "isolated test failed: {status}");
+                let output = child.wait_with_output().unwrap();
+                let stdout = String::from_utf8(output.stdout).unwrap();
+                assert!(stdout.contains("1 passed"), "{stdout}");
+                assert!(stdout.contains("isolated body ran"), "{stdout}");
                 return;
             }
             if start.elapsed() > Duration::from_secs(10) {
@@ -526,6 +534,7 @@ mod tests {
         if std::env::var("AWNA_RUN_TEST_SIGCHLD").as_deref() != Ok("1") {
             return;
         }
+        println!("isolated body ran");
         // SAFETY: This isolated process runs no other tests and exits after this test.
         unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
         let records = RefCell::new(Vec::new());
@@ -553,7 +562,7 @@ mod tests {
             records.borrow()
         );
         assert!(start.elapsed() < Duration::from_secs(5));
-        assert!(matches!(result, Ran::TimedOut | Ran::Unfinished));
+        assert!(matches!(result, Ran::Unfinished), "{result:?}");
     }
 
     #[test]
@@ -566,6 +575,7 @@ mod tests {
         if std::env::var("AWNA_RUN_TEST_SIGPIPE").as_deref() != Ok("1") {
             return;
         }
+        println!("isolated body ran");
         // SAFETY: Only this isolated test process changes its signal disposition.
         unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
         let result = run(
