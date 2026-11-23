@@ -2,6 +2,7 @@
 
 This package is versioned on its own. Its releases are tagged `awna-run-vX.Y.Z` (for example `awna-run-v0.1.0`).
 
-## Unreleased
+## 0.1.0 - 2026-11-23
 
-- The empty package: name, license and toolchain only.
+- Added the supervisor `run` with stdin, stdout, stderr and kill policies, a stop flag and a tick callback.
+- Added `find_program`.
