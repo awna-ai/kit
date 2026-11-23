@@ -11,6 +11,8 @@
 //!   Linux stores may keep copies this crate cannot reach.
 //! - `find` returns any non-empty text; a caller that needs the token rule checks [`storable`] itself.
 //! - The Windows store has no label; the Linux store needs a running Secret Service, else [`Error::NoStore`].
+//! - On Linux, [`system()`] also returns [`Error::NoStore`] when `DBUS_SESSION_BUS_ADDRESS` names anything but
+//!   `unix:` sockets, so the store is never reached over a TCP address or through a program.
 //! - The Linux store sets an item's label when first creating it; later stores keep the old label.
 //! - Items written through `/usr/bin/security` trust that program: any process of the same user can read them
 //!   with `security find-generic-password -w` without a prompt, as with any item that program writes.
