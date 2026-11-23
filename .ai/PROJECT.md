@@ -14,6 +14,7 @@ crates/awna-run        process supervisor
 crates/awna-agents     agent CLI argv builders and stream parsers (no process code)
 crates/awna-keystore   credential store
 crates/awna-launch     launchd and systemd user units
+gate/                  awna-gate: the sourced bash library the gate is built on (VERSION, CHANGELOG.md, README.md)
 scripts/ci-local.sh    the gate
 scripts/term-check.sh  the private-term check (files, paths, objects, messages, ref names)
 scripts/secret-scan.sh gitleaks over every ref, every reachable object and the working tree
@@ -31,6 +32,7 @@ tests/*_test.sh        the scripts' own tests
 | Format | `cargo fmt --all` |
 | A commit message | `bash scripts/term-check.sh --message <file>` |
 | The dependency check alone | `bash scripts/deps-check.sh` |
+| The gate's steps, run none | `bash scripts/ci-local.sh --list` |
 
 ## The gate's exit codes
 

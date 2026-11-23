@@ -11,7 +11,7 @@ failed=0
 number=0
 saved_path=$PATH
 mkdir "$tmp/base-bin"
-for tool in bash git env mktemp rm mkdir tar sed grep sort cat printf dirname cp; do
+for tool in bash git env mktemp rm mkdir tar sed grep sort cat printf dirname cp uname tail; do
     ln -s "$(type -P "$tool")" "$tmp/base-bin/$tool"
 done
 
@@ -26,6 +26,10 @@ new_case() {
     printf '[workspace.package]\nrust-version = "1.99.0"\n' > "$repo/Cargo.toml"
     if [ -f "$root/scripts/ci-local.sh" ]; then
         cp "$root/scripts/ci-local.sh" "$repo/scripts/"
+    fi
+    if [ -f "$root/gate/lib.sh" ]; then
+        mkdir -p "$repo/gate"
+        cp "$root/gate/lib.sh" "$repo/gate/"
     fi
     cat > "$repo/scripts/term-check.sh" <<'STUB'
 echo 'term-check: clean'
@@ -81,7 +85,7 @@ STUB
 expect() {
     local name=$1 expected=$2 wanted=$3 last=${4:-} actual output
     # Run from outside the fixture to prove location independence.
-    output=$(PATH="$repo/bin" bash "$repo/scripts/ci-local.sh" "${gate_args[@]}" 2>&1)
+    output=$(PATH="$repo/bin" bash "$repo/scripts/ci-local.sh" "${gate_args[@]+"${gate_args[@]}"}" 2>&1)
     actual=$?
     if [ "$actual" -ne "$expected" ]; then
         printf 'ci_local_test: FAIL %s: expected exit %s, got %s\n' "$name" "$expected" "$actual"
@@ -226,6 +230,36 @@ for step in term secret deps; do
         deps) export DEPS_STATUS=127 ;;
     esac
     expect "$step-unexpected" 2 'bash scripts/'
+done
+
+new_case
+gate_args=(--list)
+expect list 0 'shellcheck scripts/*.sh tests/*.sh gate/*.sh' 'bash scripts/deps-check.sh'
+if [ -s "$CARGO_LOG" ]; then
+    printf 'ci_local_test: FAIL list: commands ran\n'
+    failed=1
+fi
+
+for tier in full land; do
+    new_case
+    gate_args=(--tier "$tier")
+    expect "tier-$tier" 0 'ci-local: all passed' 'ci-local: all passed'
+done
+for arguments in '--tier bogus' '--list --list'; do
+    new_case
+    read -r -a gate_args <<< "$arguments"
+    expect "usage-$arguments" 2 'usage: ci-local.sh [--tier full|land] [--list]'
+done
+gate_args=()
+
+new_case
+export FAIL_COMMAND=fmt
+expect continue-after-red 1 'cargo fmt --all --check'
+for command in '^fmt ' '^clippy ' '^test ' '^+1.99.0 check '; do
+    if ! grep -q "$command" "$CARGO_LOG"; then
+        printf 'ci_local_test: FAIL continue-after-red: command absent: %s\n' "$command"
+        failed=1
+    fi
 done
 
 export PATH="$saved_path"

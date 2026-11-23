@@ -36,7 +36,10 @@ The repository holds no secret and its gate needs none. Tests use invented value
 
 - `awna-agents`: streamed agent output, line by line (from its first release).
 - `awna-run`, `awna-keystore`, `awna-launch`: their public APIs, called by consumers (from each first release).
-- `scripts/*.sh`: run by contributors on their own checkout; they read the repo, the term list and cargo's output.
+- `scripts/*.sh` and `gate/lib.sh`: run by contributors on their own checkout; they read the repo, the term list and
+  cargo's output. `gate/lib.sh` runs only the step commands its consumer's own script registers, never `eval`, with
+  stdin from `/dev/null`; each step's output goes to a log in a private temporary directory, kept only when the gate
+  is not green, so a step that prints a secret leaves it in that log as it would on a terminal.
 
 ## External integrations
 
