@@ -7,7 +7,7 @@ This package is versioned on its own. Its releases are tagged `awna-launch-vX.Y.
 - Add a typed service unit with validation.
 - Render launchd property lists.
 - Add the Manager trait, a launchctl manager, and a recording stand-in.
-- Apply service changes with policies to skip unchanged services, keep disabled services disabled, and protect running services, plus bounded unload waits and load retries, rollback, and a health check.
+- Apply service changes with policies to skip unchanged services, keep disabled services disabled, and protect running services, plus bounded unload waits and load retries, rollback, a health check, and ownership checks on the files it trusts.
 - Remove a service or retire a list of older service labels.
 
 Linux user units will come later.

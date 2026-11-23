@@ -3,7 +3,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 /// The program and settings for a background service.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Unit {
     /// The service label used by the manager.
     pub label: String,
@@ -27,6 +27,25 @@ pub struct Unit {
     pub umask: Option<u16>,
     /// The time in seconds allowed for the service to exit.
     pub exit_timeout: Option<u32>,
+}
+
+impl fmt::Debug for Unit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let env: BTreeMap<_, _> = self.env.keys().map(|key| (key, "<hidden>")).collect();
+        f.debug_struct("Unit")
+            .field("label", &self.label)
+            .field("argv", &self.argv)
+            .field("run", &self.run)
+            .field("logs", &self.logs)
+            .field("env", &env)
+            .field("workdir", &self.workdir)
+            .field("nice", &self.nice)
+            .field("low_io", &self.low_io)
+            .field("kind", &self.kind)
+            .field("umask", &self.umask)
+            .field("exit_timeout", &self.exit_timeout)
+            .finish()
+    }
 }
 
 impl Unit {
@@ -245,3 +264,18 @@ impl fmt::Display for UnitError {
 }
 
 impl std::error::Error for UnitError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_shows_environment_keys_and_hides_values() {
+        let mut unit = Unit::new("com.example.alpha", vec!["/bin/true".into()], Run::Once);
+        unit.env.insert("EXAMPLE_KEY".into(), "sample-value".into());
+        let debug = format!("{unit:?}");
+        assert!(debug.contains("EXAMPLE_KEY"));
+        assert!(!debug.contains("sample-value"));
+        assert!(debug.contains("<hidden>"));
+    }
+}

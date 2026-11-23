@@ -30,6 +30,11 @@ pub enum ManagerError {
         /// The command verb.
         verb: &'static str,
     },
+    /// The command succeeded but its output could not be interpreted.
+    Unparsed {
+        /// The command verb.
+        verb: &'static str,
+    },
     /// The command exited unsuccessfully.
     Failed {
         /// The command verb.
@@ -48,6 +53,7 @@ impl fmt::Display for ManagerError {
             Self::BadPath => f.write_str("The plist path must be absolute and valid UTF-8"),
             Self::Spawn(kind) => write!(f, "The service manager process could not be run ({kind})"),
             Self::TimedOut { verb } => write!(f, "The {verb} command timed out"),
+            Self::Unparsed { verb } => write!(f, "The {verb} output could not be read"),
             Self::Failed { verb, code, .. } => match code {
                 Some(code) => write!(f, "The {verb} command exited with status {code}"),
                 None => write!(f, "The {verb} command terminated unsuccessfully"),
@@ -60,6 +66,10 @@ impl std::error::Error for ManagerError {}
 
 /// Checks and controls services in a user session.
 pub trait Manager {
+    /// Returns the user whose service domain this manager drives.
+    /// Applying a unit requires the files it trusts to belong to this user.
+    fn uid(&self) -> u32;
+
     /// Checks whether the session is available.
     fn session_ok(&self) -> Result<bool, ManagerError>;
 
@@ -80,15 +90,18 @@ pub trait Manager {
 }
 
 /// Interprets the top-level state and pid fields in a successful service listing.
-pub fn parse_print(output: &str) -> State {
+/// Returns `None` when the listing has no top-level state field.
+pub fn parse_print(output: &str) -> Option<State> {
+    let mut found_state = false;
     let mut running = false;
     let mut pid = None;
     for line in output.lines().filter_map(|line| line.strip_prefix('\t')) {
         if !line.chars().next().is_some_and(|ch| !ch.is_whitespace()) {
             continue;
         }
-        if line.trim_end() == "state = running" {
-            running = true;
+        if let Some(value) = line.strip_prefix("state = ") {
+            found_state = true;
+            running |= value.trim_end() == "running";
         }
         if let Some(value) = line.strip_prefix("pid = ")
             && let Ok(value) = value.trim().parse()
@@ -96,11 +109,11 @@ pub fn parse_print(output: &str) -> State {
             pid = Some(value);
         }
     }
-    if running || pid.is_some() {
+    found_state.then_some(if running || pid.is_some() {
         State::Running { pid }
     } else {
         State::Idle
-    }
+    })
 }
 
 /// Reports whether the exact label is marked disabled in a disabled-service listing.
@@ -118,6 +131,12 @@ pub fn parse_disabled(output: &str, label: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn print_requires_a_top_level_state() {
+        assert_eq!(parse_print(""), None);
+        assert_eq!(parse_print("\t\tstate = running"), None);
+    }
 
     #[test]
     fn print_reads_top_level_fields_in_a_service() {
@@ -139,33 +158,35 @@ mod tests {
             "\tpid = 37027\n",
             "\tlast exit code = 0\n}\n",
         );
-        assert_eq!(parse_print(output), State::Running { pid: Some(37027) });
+        assert_eq!(
+            parse_print(output),
+            Some(State::Running { pid: Some(37027) })
+        );
     }
 
     #[test]
     fn print_ignores_nested_fields_and_nonstandard_indentation() {
         assert_eq!(
             parse_print("\tstate = not running\n\t\tpid = 1"),
-            State::Idle
+            Some(State::Idle)
         );
-        assert_eq!(parse_print("\t\tstate = running"), State::Idle);
-        assert_eq!(
-            parse_print("\t state = running\n  pid = 2\npid = 3"),
-            State::Idle
-        );
+        assert_eq!(parse_print("\t state = running\n  pid = 2\npid = 3"), None);
     }
 
     #[test]
     fn either_running_state_or_pid_indicates_a_live_service() {
         assert_eq!(
             parse_print("\tstate = running \n"),
-            State::Running { pid: None }
+            Some(State::Running { pid: None })
         );
         assert_eq!(
             parse_print("\tstate = not running\n\tpid =  42 "),
-            State::Running { pid: Some(42) }
+            Some(State::Running { pid: Some(42) })
         );
-        assert_eq!(parse_print("\tpid = 4294967296\n\tpid = -1"), State::Idle);
+        assert_eq!(
+            parse_print("\tstate = not running\n\tpid = 4294967296\n\tpid = -1"),
+            Some(State::Idle)
+        );
     }
 
     #[test]
@@ -178,7 +199,7 @@ mod tests {
             "\tstate = running\n",
             "\tpid = 42\n}\n",
         );
-        assert_eq!(parse_print(output), State::Running { pid: Some(42) });
+        assert_eq!(parse_print(output), Some(State::Running { pid: Some(42) }));
     }
 
     #[test]

@@ -23,9 +23,11 @@ pub enum Call {
 /// A recording service manager for tests that never invokes launchctl.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StandIn {
+    uid: u32,
     session_ok: bool,
     disabled_unreadable: bool,
     stuck_unloads: bool,
+    loads_despite_failure: bool,
     disabled: BTreeSet<String>,
     state: RefCell<Recorded>,
 }
@@ -34,6 +36,7 @@ pub struct StandIn {
 struct Recorded {
     loaded: BTreeMap<String, State>,
     failing_loads: u32,
+    erroring_loads: u32,
     calls: Vec<Call>,
 }
 
@@ -44,15 +47,35 @@ impl Default for StandIn {
 }
 
 impl StandIn {
-    /// Creates a manager with an available session and no loaded or disabled services.
+    /// Creates a manager for uid 0 with an available session and no loaded or disabled services.
     pub fn new() -> Self {
         Self {
+            uid: 0,
             session_ok: true,
             disabled_unreadable: false,
             stuck_unloads: false,
+            loads_despite_failure: false,
             disabled: BTreeSet::new(),
             state: RefCell::default(),
         }
+    }
+
+    /// Sets the user whose service domain this manager drives.
+    pub fn with_uid(mut self, uid: u32) -> Self {
+        self.uid = uid;
+        self
+    }
+
+    /// Makes the next loads return a bootstrap error before any false results.
+    pub fn erroring_loads(mut self, n: u32) -> Self {
+        self.state.get_mut().erroring_loads = n;
+        self
+    }
+
+    /// Makes a configured load failure leave the service loaded and idle.
+    pub fn loads_despite_failure(mut self) -> Self {
+        self.loads_despite_failure = true;
+        self
     }
 
     /// Makes this manager report that its session is unavailable.
@@ -113,6 +136,10 @@ impl StandIn {
 }
 
 impl Manager for StandIn {
+    fn uid(&self) -> u32 {
+        self.uid
+    }
+
     fn session_ok(&self) -> Result<bool, ManagerError> {
         self.state.borrow_mut().calls.push(Call::SessionOk);
         Ok(self.session_ok)
@@ -144,14 +171,32 @@ impl Manager for StandIn {
     fn load(&self, plist: &Path) -> Result<bool, ManagerError> {
         let mut state = self.state.borrow_mut();
         state.calls.push(Call::Load(plist.into()));
-        if state.failing_loads > 0 {
+        let label = plist.file_name().and_then(|name| name.to_str());
+        let label = label.map(|name| name.strip_suffix(".plist").unwrap_or(name));
+        let failure = if state.erroring_loads > 0 {
+            state.erroring_loads -= 1;
+            Some(Err(ManagerError::Failed {
+                verb: "bootstrap",
+                code: Some(5),
+                stderr: String::new(),
+            }))
+        } else if state.failing_loads > 0 {
             state.failing_loads -= 1;
-            return Ok(false);
+            Some(Ok(false))
+        } else {
+            None
+        };
+        if let Some(result) = failure {
+            if self.loads_despite_failure
+                && let Some(label) = label
+            {
+                state.loaded.insert(label.into(), State::Idle);
+            }
+            return result;
         }
-        let Some(name) = plist.file_name().and_then(|name| name.to_str()) else {
+        let Some(label) = label else {
             return Ok(false);
         };
-        let label = name.strip_suffix(".plist").unwrap_or(name);
         if state.loaded.contains_key(label) {
             return Ok(false);
         }

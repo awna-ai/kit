@@ -2,15 +2,15 @@ use crate::{Manager, ManagerError, Platform, State, Unit, UnitError, render, val
 use std::fmt;
 use std::fs::{self, DirBuilder, Metadata, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::path::{Component, Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
 /// The state checks allowed after an unload request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Wait {
-    /// Maximum number of state checks.
+    /// Maximum number of state checks. Zero counts as one.
     pub checks: u32,
     /// Delay between consecutive checks.
     pub pause: Duration,
@@ -98,7 +98,7 @@ pub enum ApplyError {
     Unit(UnitError),
     /// The manager could not find a graphical session.
     NoSession,
-    /// The path has unsafe permissions or an unexpected file type.
+    /// The path has unsafe ownership, permissions, spelling, or file type.
     Unsafe(PathBuf),
     /// A file operation failed.
     Io {
@@ -122,6 +122,13 @@ pub enum ApplyError {
     LoadFailed {
         /// The number of attempts made.
         tries: u32,
+        /// The result of reverting the failed installation.
+        rollback: Rollback,
+    },
+    /// The manager reported an error loading the service.
+    LoadErrored {
+        /// The underlying manager error.
+        error: ManagerError,
         /// The result of reverting the failed installation.
         rollback: Rollback,
     },
@@ -151,6 +158,9 @@ impl fmt::Display for ApplyError {
                     "The service could not load after {tries} attempts (rollback: {rollback:?})"
                 )
             }
+            Self::LoadErrored { error, rollback } => {
+                write!(f, "{error} (rollback: {rollback:?})")
+            }
             Self::Unhealthy { rollback } => {
                 write!(
                     f,
@@ -165,7 +175,7 @@ impl std::error::Error for ApplyError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Unit(error) => Some(error),
-            Self::Launchctl(error) => Some(error),
+            Self::Launchctl(error) | Self::LoadErrored { error, .. } => Some(error),
             _ => None,
         }
     }
@@ -187,9 +197,13 @@ fn metadata(path: &Path) -> Result<Option<Metadata>, ApplyError> {
     }
 }
 
-fn regular_file(path: &Path) -> Result<bool, ApplyError> {
+fn safe_directory(metadata: &Metadata, uid: u32) -> bool {
+    metadata.is_dir() && metadata.uid() == uid && metadata.mode() & 0o022 == 0
+}
+
+fn regular_file(path: &Path, uid: u32) -> Result<bool, ApplyError> {
     match metadata(path)? {
-        Some(metadata) if metadata.is_file() => Ok(true),
+        Some(metadata) if metadata.is_file() && metadata.uid() == uid => Ok(true),
         Some(_) => Err(ApplyError::Unsafe(path.into())),
         None => Ok(false),
     }
@@ -210,24 +224,33 @@ fn log_paths(unit: &Unit) -> impl Iterator<Item = &Path> {
         .filter(|path| *path != Path::new("/dev/null"))
 }
 
-fn prepare_logs(unit: &Unit) -> Result<(), ApplyError> {
+fn missing_logs(unit: &Unit, uid: u32) -> Result<Vec<&Path>, ApplyError> {
+    let mut missing = Vec::new();
     for path in log_paths(unit) {
-        if regular_file(path)? {
-            continue;
+        if let Some(parent) = path.parent() {
+            let entry: PathBuf = parent.components().collect();
+            if metadata(&entry)?.is_some_and(|metadata| !safe_directory(&metadata, uid)) {
+                return Err(ApplyError::Unsafe(parent.into()));
+            }
         }
+        if !regular_file(path, uid)? && !missing.contains(&path) {
+            missing.push(path);
+        }
+    }
+    Ok(missing)
+}
+
+fn prepare_logs(missing: &[&Path]) -> Result<(), ApplyError> {
+    for path in missing {
         if let Some(parent) = path.parent() {
             make_dir(parent, 0o700)?;
         }
-        match OpenOptions::new()
+        OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(path)
-        {
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists && regular_file(path)? => {}
-            Err(error) => return Err(io_error("create log", path, error)),
-        }
+            .map_err(|error| io_error("create log", path, error))?;
     }
     Ok(())
 }
@@ -237,7 +260,7 @@ fn write_plist(dir: &Path, label: &str, path: &Path, bytes: &[u8]) -> Result<(),
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o644)
+        .mode(0o600)
         .open(&temporary)
         .map_err(|error| io_error("create temporary plist", &temporary, error))?;
     let result = file
@@ -280,7 +303,7 @@ fn protect_running(state: &State, policy: &Policy) -> Result<(), ApplyError> {
 
 fn unload(manager: &(impl Manager + ?Sized), label: &str, wait: Wait) -> Result<(), ApplyError> {
     manager.unload(label).map_err(ApplyError::Launchctl)?;
-    for check in 0..wait.checks {
+    for check in 0..wait.checks.max(1) {
         if check > 0 {
             thread::sleep(wait.pause);
         }
@@ -333,6 +356,13 @@ pub fn plist_path(agents_dir: &Path, label: &str) -> PathBuf {
 }
 
 /// Installs or updates a service and checks its health after loading it.
+///
+/// The agents directory must be absolute and contain no parent components. Existing
+/// plists, log files, the agents directory, and immediate log parents must belong
+/// to the manager's user. The two kinds of directories must also exclude group
+/// and other write access. Only the immediate log parent is checked. Callers
+/// choose which ancestors to trust, including system links such as `/var`.
+/// The special log destination `/dev/null` is exempt.
 pub fn apply<M: Manager + ?Sized>(
     manager: &M,
     agents_dir: &Path,
@@ -342,22 +372,29 @@ pub fn apply<M: Manager + ?Sized>(
 ) -> Result<Applied, ApplyError> {
     let rendered = render(unit, Platform::MacOs).map_err(ApplyError::Unit)?;
     require_session(manager)?;
+    if !agents_dir.is_absolute()
+        || agents_dir
+            .components()
+            .any(|part| part == Component::ParentDir)
+    {
+        return Err(ApplyError::Unsafe(agents_dir.into()));
+    }
+    let uid = manager.uid();
     // Strip trailing separators and "." so metadata inspects the final component itself.
     let directory_entry: PathBuf = agents_dir.components().collect();
     let dir = metadata(&directory_entry)?;
-    if let Some(metadata) = &dir
-        && (!metadata.is_dir() || metadata.permissions().mode() & 0o022 != 0)
+    if dir
+        .as_ref()
+        .is_some_and(|metadata| !safe_directory(metadata, uid))
     {
         return Err(ApplyError::Unsafe(agents_dir.into()));
     }
     let label = &unit.label;
     let path = plist_path(agents_dir, label);
-    let current = regular_file(&path)?
+    let current = regular_file(&path, uid)?
         .then(|| fs::read(&path).map_err(|error| io_error("read plist", &path, error)))
         .transpose()?;
-    for path in log_paths(unit) {
-        regular_file(path)?;
-    }
+    let logs = missing_logs(unit, uid)?;
 
     let state = manager.state(label).map_err(ApplyError::Launchctl)?;
     let loaded = state != State::NotLoaded;
@@ -369,8 +406,9 @@ pub fn apply<M: Manager + ?Sized>(
     if policy.keep_disabled && manager.disabled(label).map_err(ApplyError::Launchctl)? {
         if !unchanged {
             if dir.is_none() {
-                make_dir(agents_dir, 0o755)?;
+                make_dir(agents_dir, 0o700)?;
             }
+            prepare_logs(&logs)?;
             write_plist(agents_dir, label, &path, bytes)?;
         }
         return Ok(Applied::LeftDisabled);
@@ -378,9 +416,9 @@ pub fn apply<M: Manager + ?Sized>(
     protect_running(&state, policy)?;
 
     if dir.is_none() {
-        make_dir(agents_dir, 0o755)?;
+        make_dir(agents_dir, 0o700)?;
     }
-    prepare_logs(unit)?;
+    prepare_logs(&logs)?;
     if loaded {
         unload(manager, label, policy.bootout_wait)?;
     }
@@ -401,17 +439,24 @@ pub fn apply<M: Manager + ?Sized>(
             loaded,
         )
     };
+    let revert_failed_load = || match manager.state(label) {
+        Ok(State::NotLoaded) => revert(),
+        Ok(_) if unload(manager, label, policy.bootout_wait).is_ok() => revert(),
+        _ => Rollback::Failed,
+    };
     match load(manager, &path, policy.bootstrap_tries) {
         Ok(true) => {}
         Ok(false) => {
             return Err(ApplyError::LoadFailed {
                 tries: policy.bootstrap_tries.tries,
-                rollback: revert(),
+                rollback: revert_failed_load(),
             });
         }
         Err(error) => {
-            revert();
-            return Err(ApplyError::Launchctl(error));
+            return Err(ApplyError::LoadErrored {
+                error,
+                rollback: revert_failed_load(),
+            });
         }
     }
     if !health() {
@@ -469,4 +514,83 @@ pub fn retire<M: Manager + ?Sized>(
         .iter()
         .map(|label| remove(manager, agents_dir, label, policy))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ApplyError, missing_logs, regular_file};
+    use crate::{Run, Unit};
+    use std::fs::{self, DirBuilder, File};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            static NEXT: AtomicU32 = AtomicU32::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "example-apply-helpers-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            DirBuilder::new().mode(0o700).create(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn regular_file_requires_matching_owner() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("com.example.alpha.plist");
+        let own_uid = File::create(&path).unwrap().metadata().unwrap().uid();
+
+        assert_eq!(regular_file(&path, own_uid), Ok(true));
+        assert_eq!(
+            regular_file(&path, own_uid + 1),
+            Err(ApplyError::Unsafe(path))
+        );
+    }
+
+    #[test]
+    fn regular_file_distinguishes_missing_paths_from_directories() {
+        let scratch = Scratch::new();
+        let own_uid = File::create(scratch.0.join("owner"))
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .uid();
+
+        assert_eq!(regular_file(&scratch.0.join("missing"), own_uid), Ok(false));
+        assert_eq!(
+            regular_file(&scratch.0, own_uid),
+            Err(ApplyError::Unsafe(scratch.0.clone()))
+        );
+    }
+
+    #[test]
+    fn missing_logs_accepts_an_existing_log_for_its_owner() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("output.log");
+        let own_uid = File::create(&path).unwrap().metadata().unwrap().uid();
+        let mut unit = Unit::new(
+            "com.example.alpha",
+            vec!["/opt/example/bin/alpha".into()],
+            Run::Once,
+        );
+        unit.logs.stdout = Some(path);
+
+        assert!(missing_logs(&unit, own_uid).unwrap().is_empty());
+        assert!(matches!(
+            missing_logs(&unit, own_uid + 1),
+            Err(ApplyError::Unsafe(_))
+        ));
+    }
 }

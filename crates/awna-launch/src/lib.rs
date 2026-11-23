@@ -8,9 +8,11 @@
 //! use std::path::Path;
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let home = Path::new("/var/tmp/example/home");
+//! // Use the account's password-database entry for account_home, never $HOME.
 //! let account_home = Path::new("/var/tmp/example/home");
-//! let manager = Launchctl::resolve(None, account_home, account_home, 501)?;
-//! let agents = account_home.join("Library/LaunchAgents");
+//! let manager = Launchctl::resolve(None, home, account_home, 501)?;
+//! let agents = home.join("Library/LaunchAgents");
 //! let unit = Unit::new(
 //!     "com.example.alpha",
 //!     vec!["/opt/example/bin/alpha".into(), "serve".into()],

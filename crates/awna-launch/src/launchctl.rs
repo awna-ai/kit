@@ -1,6 +1,7 @@
 use crate::{Manager, ManagerError, State, parse_disabled, parse_print, valid_label};
 use std::ffi::OsStr;
 use std::fmt;
+use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -8,6 +9,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
+const SYSTEM_LAUNCHCTL: &str = "/bin/launchctl";
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const OUTPUT_LIMIT: usize = 1024 * 1024;
 
@@ -25,13 +27,19 @@ pub struct Launchctl {
 pub enum ResolveError {
     /// A home other than the account's own requires a stand-in.
     ForeignHome,
+    /// A supplied stand-in is relative.
+    StandInNotAbsolute,
+    /// A supplied stand-in resolves to system launchctl.
+    StandInIsSystem,
 }
 
 impl fmt::Display for ResolveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(
-            "Pass a stand-in because this home is outside the account's own home and the real launchctl is skipped",
-        )
+        f.write_str(match self {
+            Self::ForeignHome => "Pass a stand-in because this home is outside the account's own home and the real launchctl is skipped",
+            Self::StandInNotAbsolute => "The stand-in path must be absolute",
+            Self::StandInIsSystem => "The stand-in must differ from system launchctl",
+        })
     }
 }
 
@@ -50,10 +58,13 @@ impl Launchctl {
 
     /// Uses the system launchctl executable.
     pub fn system(uid: u32) -> Self {
-        Self::new("/bin/launchctl", uid)
+        Self::new(SYSTEM_LAUNCHCTL, uid)
     }
 
     /// Uses a nonempty stand-in when supplied and permits system launchctl only for the account's own home.
+    ///
+    /// Obtain `account_home` from the account's password-database entry rather than `$HOME`.
+    /// [Self::new] and [Self::system] bypass this guard.
     pub fn resolve(
         stand_in: Option<&OsStr>,
         home: &Path,
@@ -61,6 +72,18 @@ impl Launchctl {
         uid: u32,
     ) -> Result<Self, ResolveError> {
         if let Some(program) = stand_in.filter(|program| !program.is_empty()) {
+            let program = Path::new(program);
+            if !program.is_absolute() {
+                return Err(ResolveError::StandInNotAbsolute);
+            }
+            if program == Path::new(SYSTEM_LAUNCHCTL)
+                || matches!(
+                    (fs::canonicalize(program), fs::canonicalize(SYSTEM_LAUNCHCTL)),
+                    (Ok(candidate), Ok(system)) if candidate == system
+                )
+            {
+                return Err(ResolveError::StandInIsSystem);
+            }
             Ok(Self::new(program, uid))
         } else if home == account_home {
             Ok(Self::system(uid))
@@ -123,15 +146,21 @@ impl Launchctl {
 }
 
 impl Manager for Launchctl {
+    fn uid(&self) -> u32 {
+        self.uid
+    }
+
     fn session_ok(&self) -> Result<bool, ManagerError> {
         Ok(self.run("print", &[&self.domain()])?.status.success())
     }
 
     fn state(&self, label: &str) -> Result<State, ManagerError> {
         let target = self.checked_target(label)?;
-        let output = self.run("print", &[&target])?;
+        let verb = "print";
+        let output = self.run(verb, &[&target])?;
         if output.status.success() {
-            Ok(parse_print(&String::from_utf8_lossy(&output.stdout)))
+            parse_print(&String::from_utf8_lossy(&output.stdout))
+                .ok_or(ManagerError::Unparsed { verb })
         } else {
             Ok(State::NotLoaded)
         }

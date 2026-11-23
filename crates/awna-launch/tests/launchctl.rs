@@ -223,3 +223,34 @@ fn system_resolution_requires_the_accounts_home() {
         Path::new("/bin/launchctl")
     );
 }
+
+#[test]
+fn empty_successful_print_is_an_error() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager("exit 0");
+    assert_eq!(
+        manager.state(LABEL),
+        Err(ManagerError::Unparsed { verb: "print" })
+    );
+}
+
+#[test]
+fn resolve_requires_an_absolute_stand_in_other_than_system_launchctl() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager("exit 0");
+    let home = &fixture.0;
+    let account = Path::new("/var/tmp/example/account");
+    for (rejected, error) in [
+        ("launchctl", ResolveError::StandInNotAbsolute),
+        ("/bin/launchctl", ResolveError::StandInIsSystem),
+    ] {
+        assert_eq!(
+            Launchctl::resolve(Some(OsStr::new(rejected)), home, account, 501),
+            Err(error)
+        );
+    }
+    assert_eq!(
+        Launchctl::resolve(Some(manager.program().as_os_str()), home, account, 501),
+        Ok(manager)
+    );
+}

@@ -1,10 +1,11 @@
 use awna_launch::{
-    Applied, ApplyError, Call, Logs, Platform, Policy, Removed, Rollback, Run, StandIn, State,
-    Tries, Unit, UnitError, Wait, apply, plist_path, remove, render, retire,
+    Applied, ApplyError, Call, Logs, ManagerError, Platform, Policy, Removed, Rollback, Run,
+    StandIn, State, Tries, Unit, UnitError, Wait, apply, plist_path, remove, render, retire,
 };
 use std::fs;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
@@ -25,6 +26,18 @@ impl Scratch {
         ));
         fs::create_dir(&path).unwrap();
         Self(path)
+    }
+
+    fn uid(&self) -> u32 {
+        static UID: OnceLock<u32> = OnceLock::new();
+        *UID.get_or_init(|| {
+            let probe = self.0.join("owner");
+            fs::File::create(probe).unwrap().metadata().unwrap().uid()
+        })
+    }
+
+    fn manager(&self) -> StandIn {
+        StandIn::new().with_uid(self.uid())
     }
 
     fn agents(&self) -> PathBuf {
@@ -96,7 +109,7 @@ fn defaults_protect_running_and_disabled_services() {
 #[test]
 fn fresh_install_creates_plist_and_logs() {
     let scratch = Scratch::new();
-    let manager = StandIn::new();
+    let manager = scratch.manager();
     let mut unit = unit();
     let log_dir = scratch.0.join("logs");
     let log = log_dir.join("alpha.log");
@@ -118,7 +131,8 @@ fn fresh_install_creates_plist_and_logs() {
         fs::read(scratch.plist()).unwrap(),
         render(&unit, Platform::MacOs).unwrap().as_bytes()
     );
-    assert_eq!(mode(&scratch.plist()), 0o644);
+    assert_eq!(mode(&scratch.plist()), 0o600);
+    assert_eq!(mode(&scratch.agents()), 0o700);
     assert_eq!(mode(&log_dir), 0o700);
     assert_eq!(mode(&log), 0o600);
 }
@@ -126,10 +140,10 @@ fn fresh_install_creates_plist_and_logs() {
 #[test]
 fn missing_session_and_invalid_unit_write_nothing() {
     let scratch = Scratch::new();
-    let manager = StandIn::new().without_session();
+    let manager = scratch.manager().without_session();
     assert_eq!(install(&manager, &scratch), Err(ApplyError::NoSession));
     assert_eq!(manager.calls(), [Call::SessionOk]);
-    let manager = StandIn::new();
+    let manager = scratch.manager();
     let mut unit = unit();
     unit.label.clear();
     assert_eq!(
@@ -146,7 +160,7 @@ fn unchanged_services_are_skipped_only_when_loaded() {
     let unit = unit();
     scratch.seed(render(&unit, Platform::MacOs).unwrap().as_bytes());
     for state in [State::Idle, RUNNING] {
-        let manager = StandIn::new().with_loaded(LABEL, state);
+        let manager = scratch.manager().with_loaded(LABEL, state);
         assert_eq!(
             apply(
                 &manager,
@@ -162,8 +176,8 @@ fn unchanged_services_are_skipped_only_when_loaded() {
             [Call::SessionOk, Call::State(LABEL.into())]
         );
     }
-    assert_eq!(install(&StandIn::new(), &scratch), Ok(Applied::Loaded));
-    let manager = StandIn::new().with_loaded(LABEL, State::Idle);
+    assert_eq!(install(&scratch.manager(), &scratch), Ok(Applied::Loaded));
+    let manager = scratch.manager().with_loaded(LABEL, State::Idle);
     let policy = Policy {
         skip_unchanged: false,
         ..policy()
@@ -189,7 +203,7 @@ fn unchanged_services_are_skipped_only_when_loaded() {
 fn a_running_service_is_never_stopped_by_default() {
     let scratch = Scratch::new();
     scratch.seed(b"old");
-    let manager = StandIn::new().with_loaded(LABEL, RUNNING);
+    let manager = scratch.manager().with_loaded(LABEL, RUNNING);
     assert_eq!(
         install(&manager, &scratch),
         Err(ApplyError::Running { pid: Some(42) })
@@ -216,7 +230,7 @@ fn a_running_service_is_never_stopped_by_default() {
 #[test]
 fn disabled_service_gets_a_plist_without_service_calls() {
     let scratch = Scratch::new();
-    let manager = StandIn::new().with_disabled(LABEL);
+    let manager = scratch.manager().with_disabled(LABEL);
     assert_eq!(install(&manager, &scratch), Ok(Applied::LeftDisabled));
     assert_eq!(
         fs::read(scratch.plist()).unwrap(),
@@ -235,7 +249,7 @@ fn disabled_service_gets_a_plist_without_service_calls() {
 #[test]
 fn unreadable_disabled_state_prevents_writes() {
     let scratch = Scratch::new();
-    let manager = StandIn::new().with_disabled_unreadable();
+    let manager = scratch.manager().with_disabled_unreadable();
     assert!(matches!(
         install(&manager, &scratch),
         Err(ApplyError::Launchctl(_))
@@ -247,7 +261,8 @@ fn unreadable_disabled_state_prevents_writes() {
 fn stuck_unload_keeps_the_old_plist_after_bounded_polls() {
     let scratch = Scratch::new();
     scratch.seed(b"old");
-    let manager = StandIn::new()
+    let manager = scratch
+        .manager()
         .with_loaded(LABEL, State::Idle)
         .stuck_unloads();
     assert_eq!(install(&manager, &scratch), Err(ApplyError::StillLoaded));
@@ -268,7 +283,7 @@ fn stuck_unload_keeps_the_old_plist_after_bounded_polls() {
 #[test]
 fn loads_retry_and_roll_back_when_exhausted() {
     let scratch = Scratch::new();
-    let manager = StandIn::new().failing_loads(2);
+    let manager = scratch.manager().failing_loads(2);
     assert_eq!(install(&manager, &scratch), Ok(Applied::Loaded));
     assert_eq!(
         manager
@@ -280,7 +295,7 @@ fn loads_retry_and_roll_back_when_exhausted() {
     );
 
     let scratch = Scratch::new();
-    let manager = StandIn::new().failing_loads(3);
+    let manager = scratch.manager().failing_loads(3);
     assert_eq!(
         install(&manager, &scratch),
         Err(ApplyError::LoadFailed {
@@ -292,7 +307,8 @@ fn loads_retry_and_roll_back_when_exhausted() {
 
     let scratch = Scratch::new();
     scratch.seed(b"old");
-    let manager = StandIn::new()
+    let manager = scratch
+        .manager()
         .with_loaded(LABEL, State::Idle)
         .failing_loads(3);
     assert_eq!(
@@ -310,7 +326,7 @@ fn loads_retry_and_roll_back_when_exhausted() {
 fn failed_load_restores_an_unloaded_services_plist() {
     let scratch = Scratch::new();
     scratch.seed(b"old");
-    let manager = StandIn::new().failing_loads(3);
+    let manager = scratch.manager().failing_loads(3);
 
     assert_eq!(
         install(&manager, &scratch),
@@ -335,7 +351,7 @@ fn failed_load_restores_an_unloaded_services_plist() {
 fn failed_health_check_restores_an_unloaded_services_plist() {
     let scratch = Scratch::new();
     scratch.seed(b"old");
-    let manager = StandIn::new();
+    let manager = scratch.manager();
 
     assert_eq!(
         apply(&manager, &scratch.agents(), &unit(), &policy(), &mut || {
@@ -360,7 +376,7 @@ fn failed_health_check_restores_an_unloaded_services_plist() {
 #[test]
 fn unhealthy_service_is_unloaded_before_rollback() {
     let scratch = Scratch::new();
-    let manager = StandIn::new();
+    let manager = scratch.manager();
     let mut checks = 0;
     let result = apply(&manager, &scratch.agents(), &unit(), &policy(), &mut || {
         checks += 1;
@@ -384,7 +400,7 @@ fn unhealthy_service_is_unloaded_before_rollback() {
 #[test]
 fn unsafe_paths_are_rejected_before_writes() {
     let scratch = Scratch::new();
-    let manager = StandIn::new();
+    let manager = scratch.manager();
     let target = scratch.0.join("target");
     fs::create_dir(&target).unwrap();
     symlink(&target, scratch.agents()).unwrap();
@@ -429,14 +445,15 @@ fn unsafe_paths_are_rejected_before_writes() {
 fn remove_respects_running_and_stuck_services() {
     let scratch = Scratch::new();
     scratch.seed(b"old");
-    let manager = StandIn::new().with_loaded(LABEL, RUNNING);
+    let manager = scratch.manager().with_loaded(LABEL, RUNNING);
     assert_eq!(
         remove(&manager, &scratch.agents(), LABEL, &policy()),
         Err(ApplyError::Running { pid: Some(42) })
     );
     assert_eq!(fs::read(scratch.plist()).unwrap(), b"old");
 
-    let manager = StandIn::new()
+    let manager = scratch
+        .manager()
         .with_loaded(LABEL, State::Idle)
         .stuck_unloads();
     assert_eq!(
@@ -445,7 +462,7 @@ fn remove_respects_running_and_stuck_services() {
     );
     assert_eq!(fs::read(scratch.plist()).unwrap(), b"old");
 
-    let manager = StandIn::new().with_loaded(LABEL, State::Idle);
+    let manager = scratch.manager().with_loaded(LABEL, State::Idle);
     assert_eq!(
         remove(&manager, &scratch.agents(), LABEL, &policy()),
         Ok(Removed::Removed)
@@ -461,7 +478,8 @@ fn remove_respects_running_and_stuck_services() {
 #[test]
 fn retire_works_in_order_and_stops_at_first_error() {
     let scratch = Scratch::new();
-    let manager = StandIn::new()
+    let manager = scratch
+        .manager()
         .with_loaded(OLD, State::Idle)
         .with_loaded(BETA, State::Idle);
     assert_eq!(
@@ -481,7 +499,7 @@ fn retire_works_in_order_and_stops_at_first_error() {
             Call::State(BETA.into()),
         ]
     );
-    let manager = StandIn::new().with_loaded(OLD, RUNNING);
+    let manager = scratch.manager().with_loaded(OLD, RUNNING);
     assert_eq!(
         retire(&manager, &scratch.agents(), &[OLD, BETA], &policy()),
         Err(ApplyError::Running { pid: Some(42) })
@@ -497,7 +515,7 @@ fn a_failed_plist_write_reloads_the_previous_file() {
         .agents()
         .join(format!(".{LABEL}.plist.{}.tmp", std::process::id()));
     fs::write(&temporary, b"occupied").unwrap();
-    let manager = StandIn::new().with_loaded(LABEL, State::Idle);
+    let manager = scratch.manager().with_loaded(LABEL, State::Idle);
 
     assert!(matches!(
         install(&manager, &scratch),
@@ -515,7 +533,7 @@ fn a_failed_plist_write_reloads_the_previous_file() {
 #[test]
 fn a_stuck_unhealthy_service_keeps_its_plist() {
     let scratch = Scratch::new();
-    let manager = StandIn::new().stuck_unloads();
+    let manager = scratch.manager().stuck_unloads();
     assert_eq!(
         apply(&manager, &scratch.agents(), &unit(), &policy(), &mut || {
             false
@@ -532,7 +550,7 @@ fn a_stuck_unhealthy_service_keeps_its_plist() {
 fn remove_rejects_a_directory_and_unlinks_a_symlink() {
     let scratch = Scratch::new();
     fs::create_dir_all(scratch.plist()).unwrap();
-    let manager = StandIn::new();
+    let manager = scratch.manager();
     assert_eq!(
         remove(&manager, &scratch.agents(), LABEL, &policy()),
         Err(ApplyError::Unsafe(scratch.plist()))
@@ -553,12 +571,10 @@ fn remove_rejects_a_directory_and_unlinks_a_symlink() {
 
 #[test]
 fn a_disabled_service_with_matching_bytes_keeps_its_plist() {
-    use std::os::unix::fs::MetadataExt;
-
     let scratch = Scratch::new();
     scratch.seed(render(&unit(), Platform::MacOs).unwrap().as_bytes());
     let inode = fs::metadata(scratch.plist()).unwrap().ino();
-    let manager = StandIn::new().with_disabled(LABEL);
+    let manager = scratch.manager().with_disabled(LABEL);
     assert_eq!(install(&manager, &scratch), Ok(Applied::LeftDisabled));
     assert_eq!(fs::metadata(scratch.plist()).unwrap().ino(), inode);
 }
@@ -566,7 +582,7 @@ fn a_disabled_service_with_matching_bytes_keeps_its_plist() {
 #[test]
 fn zero_attempts_roll_back_without_calling_load() {
     let scratch = Scratch::new();
-    let manager = StandIn::new();
+    let manager = scratch.manager();
     let mut policy = policy();
     policy.bootstrap_tries.tries = 0;
     assert_eq!(
@@ -581,7 +597,8 @@ fn zero_attempts_roll_back_without_calling_load() {
         [
             Call::SessionOk,
             Call::State(LABEL.into()),
-            Call::Disabled(LABEL.into())
+            Call::Disabled(LABEL.into()),
+            Call::State(LABEL.into()),
         ]
     );
     assert!(!scratch.plist().exists());
@@ -594,7 +611,7 @@ fn a_directory_symlink_stays_unsafe_with_a_trailing_separator() {
     fs::create_dir(&target).unwrap();
     symlink(&target, scratch.agents()).unwrap();
     let agents = scratch.agents().join(".");
-    let manager = StandIn::new();
+    let manager = scratch.manager();
 
     assert_eq!(
         apply(&manager, &agents, &unit(), &policy(), &mut || true),
@@ -602,4 +619,175 @@ fn a_directory_symlink_stays_unsafe_with_a_trailing_separator() {
     );
     assert_eq!(manager.calls(), [Call::SessionOk]);
     assert_eq!(fs::read_dir(target).unwrap().count(), 0);
+}
+
+#[test]
+fn unsafe_agents_directory_spellings_are_rejected_before_state() {
+    let scratch = Scratch::new();
+    for agents in [
+        PathBuf::from("relative-agents"),
+        scratch.0.join("../agents"),
+    ] {
+        let manager = scratch.manager();
+        assert_eq!(
+            apply(&manager, &agents, &unit(), &policy(), &mut || true),
+            Err(ApplyError::Unsafe(agents))
+        );
+        assert_eq!(manager.calls(), [Call::SessionOk]);
+    }
+}
+
+#[test]
+fn unsafe_immediate_log_parents_are_rejected_before_writes() {
+    let scratch = Scratch::new();
+    let target = scratch.0.join("target");
+    fs::create_dir(&target).unwrap();
+    let link = scratch.0.join("link");
+    symlink(&target, &link).unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o770)).unwrap();
+    let file = scratch.0.join("file");
+    fs::write(&file, b"").unwrap();
+
+    for parent in [link, target, file] {
+        let manager = scratch.manager();
+        let mut unit = unit();
+        unit.logs = Logs::both(parent.join("alpha.log"));
+        assert_eq!(
+            apply(&manager, &scratch.agents(), &unit, &policy(), &mut || true),
+            Err(ApplyError::Unsafe(parent))
+        );
+        assert_eq!(manager.calls(), [Call::SessionOk]);
+        assert!(!scratch.agents().exists());
+    }
+}
+
+#[test]
+fn disabled_install_prepares_logs() {
+    let scratch = Scratch::new();
+    let manager = scratch.manager().with_disabled(LABEL);
+    let mut unit = unit();
+    let parent = scratch.0.join("logs");
+    let log = parent.join("alpha.log");
+    unit.logs = Logs::both(&log);
+
+    assert_eq!(
+        apply(&manager, &scratch.agents(), &unit, &policy(), &mut || true),
+        Ok(Applied::LeftDisabled)
+    );
+    assert_eq!(mode(&parent), 0o700);
+    assert_eq!(mode(&log), 0o600);
+}
+
+#[test]
+fn zero_unload_checks_still_observes_the_service_state() {
+    let scratch = Scratch::new();
+    scratch.seed(b"old");
+    let manager = scratch.manager().with_loaded(LABEL, State::Idle);
+    let mut policy = policy();
+    policy.bootout_wait.checks = 0;
+    policy.skip_unchanged = false;
+    assert_eq!(
+        apply(&manager, &scratch.agents(), &unit(), &policy, &mut || true),
+        Ok(Applied::Reloaded)
+    );
+}
+
+#[test]
+fn failed_health_check_reloads_the_previous_service() {
+    let scratch = Scratch::new();
+    scratch.seed(b"old");
+    let manager = scratch.manager().with_loaded(LABEL, State::Idle);
+
+    assert_eq!(
+        apply(&manager, &scratch.agents(), &unit(), &policy(), &mut || {
+            false
+        }),
+        Err(ApplyError::Unhealthy {
+            rollback: Rollback::Restored
+        })
+    );
+    assert_eq!(fs::read(scratch.plist()).unwrap(), b"old");
+    assert_eq!(manager.state_of(LABEL), State::Idle);
+}
+
+#[test]
+fn apply_rejects_an_existing_plist_for_a_different_user() {
+    let scratch = Scratch::new();
+    scratch.seed(b"old");
+    let manager = scratch.manager().with_uid(scratch.uid() ^ 1);
+    assert_eq!(
+        install(&manager, &scratch),
+        Err(ApplyError::Unsafe(scratch.agents()))
+    );
+    assert_eq!(fs::read(scratch.plist()).unwrap(), b"old");
+    assert_eq!(manager.calls(), [Call::SessionOk]);
+}
+
+#[test]
+fn failed_load_unloads_a_partially_loaded_service() {
+    let scratch = Scratch::new();
+    let manager = scratch.manager().failing_loads(3).loads_despite_failure();
+    assert_eq!(
+        install(&manager, &scratch),
+        Err(ApplyError::LoadFailed {
+            tries: 3,
+            rollback: Rollback::Removed
+        })
+    );
+    assert!(manager.calls().contains(&Call::Unload(LABEL.into())));
+    assert_eq!(manager.state_of(LABEL), State::NotLoaded);
+    assert!(!scratch.plist().exists());
+}
+
+#[test]
+fn failed_load_preserves_the_plist_if_the_partial_load_cannot_be_unloaded() {
+    let scratch = Scratch::new();
+    let manager = scratch
+        .manager()
+        .failing_loads(3)
+        .loads_despite_failure()
+        .stuck_unloads();
+    assert_eq!(
+        install(&manager, &scratch),
+        Err(ApplyError::LoadFailed {
+            tries: 3,
+            rollback: Rollback::Failed
+        })
+    );
+    assert!(manager.calls().contains(&Call::Unload(LABEL.into())));
+    assert_eq!(manager.state_of(LABEL), State::Idle);
+    assert_eq!(
+        fs::read(scratch.plist()).unwrap(),
+        render(&unit(), Platform::MacOs).unwrap().as_bytes()
+    );
+}
+
+#[test]
+fn load_error_reports_rollback_and_reloads_the_previous_service() {
+    let scratch = Scratch::new();
+    scratch.seed(b"old");
+    let manager = scratch
+        .manager()
+        .with_loaded(LABEL, State::Idle)
+        .erroring_loads(1);
+    let error = install(&manager, &scratch).unwrap_err();
+    let bootstrap = ManagerError::Failed {
+        verb: "bootstrap",
+        code: Some(5),
+        stderr: String::new(),
+    };
+    assert_eq!(
+        error,
+        ApplyError::LoadErrored {
+            error: bootstrap.clone(),
+            rollback: Rollback::Restored,
+        }
+    );
+    assert_eq!(
+        std::error::Error::source(&error).unwrap().downcast_ref(),
+        Some(&bootstrap)
+    );
+    assert!(error.to_string().contains("rollback: Restored"));
+    assert_eq!(fs::read(scratch.plist()).unwrap(), b"old");
+    assert_eq!(manager.state_of(LABEL), State::Idle);
 }
