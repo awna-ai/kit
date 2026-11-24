@@ -22,6 +22,7 @@ repository itself, a private term or a secret published in public history.
 | Consumer → `awna-agents` argument builder | typed options that become a child's argument list | the builder refuses a prompt or tool entry that looks like an option, an empty tool entry, a NUL in any value, a control character in a tool entry, a session id that is not a UUID and a budget that is negative or not finite; an option value that starts with `-` goes out as one `--flag=value` argument | the argument tests in `crates/awna-agents/tests/` |
 | Agent output → `awna-agents` | untrusted model and tool text | parsed as data only, never evaluated or passed to a shell; `serde_json`'s nesting limit stays on; identifier-like fields (permission mode, error category, model id, session id, result subtype) are kept only when they match a fixed pattern; numbers are range-checked | its tests |
 | Kit tag → a consumer's vendored `awna-gate` | the library's files, copied into another repository | `gate/vendor.sh` copies the `gate/` tree of a release tag, never the working tree, refuses a tag whose tree holds a link, a submodule, a `.gitattributes`, a `PIN`, an odd name or a `VERSION` that disagrees, checks the copy's git tree against the tag before swapping it in, and writes `PIN` with the tag and tree; `gate_run` recomputes the copy's tree in a throwaway repository with no user or system configuration and fails before any step on any difference | `tests/gate_vendor_test.sh`, a security review and an independent verification before release |
+| Consumer → its remote's `refs/green/*` | two refs | leased pushes, one run per repository, the check run as an argv in a scratch worktree, 75 never pushes anything | `tests/gate_verify_main_test.sh`, a security review and an independent verification before release |
 
 ## Data classes
 
@@ -39,13 +40,15 @@ The repository holds no secret and its gate needs none. Tests use invented value
 - `awna-agents`: streamed agent output, line by line (from its first release).
 - `awna-run`, `awna-keystore`, `awna-launch`: their public APIs, called by consumers (from each first release).
 - `scripts/*.sh` and `gate/*.sh`: run by contributors on their own checkout; they read the repo, the term list and
-  cargo's output; `gate/vendor.sh` also reads a local release tag and writes the destination it is given. `gate/lib.sh` runs only the step commands its consumer's own script registers, never `eval`, with
+  cargo's output; `gate/verify-main.sh` checks the given remote's `main` in a scratch worktree and pushes only
+  `refs/green/main` and `refs/green/frozen` to the remote it is given; `gate/vendor.sh` also reads a local release tag and writes the destination it is given. `gate/lib.sh` runs only the step commands its consumer's own script registers, never `eval`, with
   stdin from `/dev/null`; each step's output goes to a log in a private temporary directory, kept only when the gate
   is not green, so a step that prints a secret leaves it in that log as it would on a terminal.
 
 ## External integrations
 
-None over a network. The four core packages make no network calls; cargo fetches dependencies from crates.io at build
+The optional `gate/verify-main.sh` uses git to fetch and push to a consumer-configured remote.
+The four core packages make no network calls; cargo fetches dependencies from crates.io at build
 time. `awna-keystore` talks to the operating system's password store: `/usr/bin/security` on macOS, the Credential
 Manager API on Windows, and the Secret Service over the local D-Bus session on Linux (a `DBUS_SESSION_BUS_ADDRESS` that
 names anything but `unix:` sockets is refused, since the D-Bus library can also reach a TCP address or run a program).

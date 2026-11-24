@@ -15,6 +15,8 @@ gate/*.sh                   bash tests/gate_vendor_test.sh
 gate/*.sh                   bash tests/gate_lib_test.sh
 gate/*.sh                   bash tests/ci_local_test.sh
 gate/*.sh                   bash tests/gate_workflow_test.sh
+gate/verify-main.sh         bash tests/gate_verify_main_test.sh
+gate/README.md              bash tests/gate_verify_main_test.sh
 gate/term-check.sh          bash tests/term_check_test.sh
 gate/term-check.sh          bash tests/gate_scanners_test.sh
 gate/secret-scan.sh         bash tests/secret_scan_test.sh

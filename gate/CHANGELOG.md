@@ -2,6 +2,14 @@
 
 This package is versioned on its own. Its releases are tagged `awna-gate-vX.Y.Z` (for example `awna-gate-v0.1.0`).
 
+## 0.2.0
+
+Released 2026-11-24.
+
+- Added `verify-main.sh`, the opt-in green refs script: check a remote's `main` in a scratch worktree, advance
+  `refs/green/main` on green and freeze releases with `refs/green/frozen` on red, using leased pushes and a
+  repository-wide lock. Exit 75 never changes either ref.
+
 ## 0.1.0
 
 The first release.

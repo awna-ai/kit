@@ -313,7 +313,7 @@ for changed in README.md gate/README.md Cargo.lock tests/a_test.sh gate/.cargo/c
     mkdir "$repo/tests"
     printf 'exit 0\n' > "$repo/tests/a_test.sh"
     # Register every test label named by the map, without running those tests.
-    for test_name in gate_lib gate_workflow gate_scanners gate_vendor ci_local term_check secret_scan deps_check; do
+    for test_name in gate_lib gate_workflow gate_scanners gate_vendor gate_verify_main ci_local term_check secret_scan deps_check; do
         printf 'exit 0\n' > "$repo/tests/${test_name}_test.sh"
     done
     if [ -f "$root/scripts/ci-touched.map" ]; then cp "$root/scripts/ci-touched.map" "$repo/scripts/"; fi
@@ -336,7 +336,7 @@ for changed in README.md gate/README.md Cargo.lock tests/a_test.sh gate/.cargo/c
         wanted=$(printf '%s\n' 'bash tests/gate_vendor_test.sh' \
             'bash scripts/term-check.sh' 'bash scripts/secret-scan.sh' 'bash scripts/deps-check.sh')
     elif [ "$changed" = gate/README.md ]; then
-        wanted=$(printf '%s\n' 'bash tests/gate_scanners_test.sh' 'bash tests/gate_vendor_test.sh' \
+        wanted=$(printf '%s\n' 'bash tests/gate_scanners_test.sh' 'bash tests/gate_vendor_test.sh' 'bash tests/gate_verify_main_test.sh' \
             'bash scripts/term-check.sh' 'bash scripts/secret-scan.sh' 'bash scripts/deps-check.sh')
     elif [ "$changed" = tests/a_test.sh ]; then
         wanted=$(printf '%s\n' 'shellcheck scripts/*.sh tests/*.sh gate/*.sh' 'bash tests/a_test.sh' \
@@ -363,7 +363,7 @@ done
 
 new_case
 mkdir "$repo/tests"
-for test_name in gate_lib gate_workflow gate_scanners gate_vendor ci_local term_check secret_scan deps_check; do
+for test_name in gate_lib gate_workflow gate_scanners gate_vendor gate_verify_main ci_local term_check secret_scan deps_check; do
     printf 'exit 0\n' > "$repo/tests/${test_name}_test.sh"
 done
 cp "$root/scripts/ci-touched.map" "$repo/scripts/"

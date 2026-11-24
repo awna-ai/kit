@@ -35,6 +35,7 @@ into a script.
 The host supplies `bash`, `mktemp`, `rm` and `tail`; macOS-only steps also need `uname`.
 The touched tier and `--check-map` also need `git`; the pin check needs git 2.29 or later, `find`, `readlink` and `mktemp`.
 Workflow steps also need `env`, `tr` and `cmp`.
+The optional `verify-main.sh` also needs `git`, `mktemp`, `ps`, `readlink`, `ln` and `rm`.
 The library uses the shell's `pwd` builtin and `SECONDS` clock. Logs can contain any
 output the commands produce. Failed runs retain those logs in a temporary directory;
 the consumer is responsible for removing them after inspection.
@@ -611,3 +612,63 @@ A pin accepts blank lines and lines starting with `#`, plus exactly one valid
 drift; it is not a signature or a source-authenticity check.
 Removing `PIN` turns the check off, so the pin guards against accidental edits to
 the copy, not against someone who can also rewrite the consumer's repository.
+
+## Green refs (opt-in)
+
+`verify-main.sh` is a standalone script. Nothing in `lib.sh` calls it, and
+`gate_run` never runs it. Run it by hand, from cron or from your own hook:
+
+```sh
+bash gate/verify-main.sh --root <repo top> [--remote <name>] -- <check command> [<arg>...]
+```
+
+The root must be the repository's top directory. The remote defaults to `origin`
+and must be configured. Each option may occur once. The separator and a check
+command are required; there is no default check. The command runs as an argv,
+without evaluation, with stdin from `/dev/null`. Its working directory is a
+scratch worktree of the remote's `main`, detached at the fetched head. Check
+output goes to stderr; the result lines below go to stdout, except usage.
+
+The script fetches `main` and reads two refs from that remote:
+
+- `refs/green/main` records the newest checked commit that passed.
+- `refs/green/frozen` records a red head. A release process can refuse to ship
+  while this ref exists. A later green run clears it only if it is an ancestor
+  of the checked head. A freeze off `main` is retained for manual resolution.
+
+A red check runs once more to allow a flaky step to recover. A check that exits
+75 on either attempt stops immediately, without a further attempt or ref push.
+One run at a time holds a repository-wide symlink lock in the common git directory;
+stale locks and owned scratch worktrees left by a killed run are cleaned up.
+Normal exit and INT, TERM and HUP remove this run's scratch worktree and lock.
+
+| Exit | Meaning | Last stdout line |
+| --- | --- | --- |
+| 0 | Green advanced. | `green <oid>` |
+| 0 | Green already equals the fetched head. | `green is current: <oid>` |
+| 0 | Another writer published this head or a descendant. | `covered: green is <oid>` |
+| 0 | Another run holds the lock. | `verify-main: already running (pid <pid>)` |
+| 1 | Nothing judged: a git operation failed, green is off `main`, or a checked ref moved. | `verify-main: <reason>` |
+| 2 | Invalid arguments. | The usage line is on stderr. |
+| 5 | Red, with one first-parent suspect. | `red <head> culprit <oid>` |
+| 6 | Red, with several first-parent suspects. | `red <head> across <n> commits from <first> to <head>` |
+| 75 | The check cannot run here; neither ref changes. | `verify-main: the check cannot run on this host (exit 75); nothing changed` |
+| 75 | Git is missing. | `verify-main: git is missing` |
+
+Clearing a freeze also prints `releases unfrozen (freeze at <oid> cleared)`
+before the green result. A successful rerun prints
+`verify-main: the first run was red; the rerun passed`. A red result is preceded
+by an action line naming the suspect or range. A failed freeze push prints the
+red result before its exit-1 diagnostic. When green is current but the freeze is
+off `main`, a warning names that freeze and asks for manual deletion.
+
+Pushes use leases so two writers cannot clobber each other's green refs. Advancing
+green and clearing an ancestral freeze happen in one atomic push. The script
+re-fetches `main` before pushing and refuses a head that is no longer its ancestor.
+A rewind of `main` between that final re-fetch and the push is not caught: only
+the green refs are leased. The remote must accept pushes to `refs/green/*` and
+support atomic pushes; some hosts refuse non-branch refs. The script pushes only
+`refs/green/main` and `refs/green/frozen` to the configured remote it is given.
+
+Package files: `lib.sh`, `term-check.sh`, `secret-scan.sh`, `vendor.sh`,
+`verify-main.sh`, `VERSION`, `CHANGELOG.md` and this `README.md`.
