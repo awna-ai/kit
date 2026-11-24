@@ -959,7 +959,7 @@ _gate_slowest() {
 }
 
 _gate_literal_tree() {
-    local directory=$1 repository=$2 top=$3 child name mode kind sha target entries result
+    local directory=$1 repository=$2 top=$3 child name mode kind sha target entries result perm
     entries=$(mktemp "$repository/entries.XXXXXX") || return 1
     for child in "$directory"/* "$directory"/.[!.]* "$directory"/..?*; do
         if [ ! -e "$child" ] && [ ! -L "$child" ]; then continue; fi
@@ -976,7 +976,8 @@ _gate_literal_tree() {
             sha=$(_gate_literal_tree "$child" "$repository" 0) || return 1
         elif [ -f "$child" ]; then
             mode=100644
-            if find "$child" -prune -perm -u+x | grep -q .; then mode=100755; fi
+            if ! perm=$(find "$child" -prune -perm -u+x -print); then return 1; fi
+            if [ -n "$perm" ]; then mode=100755; fi
             sha=$(git --git-dir="$repository/.git" hash-object -w --no-filters -- "$child") || return 1
         else
             return 1
@@ -994,6 +995,7 @@ _gate_tree_hash() (
     # Bash 3.2 drops function locals before EXIT traps run; temporary stays in this subshell.
     local directory=$1 variable tree
     set +f
+    unset GREP_OPTIONS GREP_COLOR GREP_COLORS
     unset GLOBIGNORE
     shopt -u dotglob failglob nocaseglob
     if ! directory=$(CDPATH='' cd -- "$directory" 2> /dev/null && pwd -P); then return 1; fi
@@ -1047,15 +1049,17 @@ _gate_read_pin() {
 }
 
 _gate_check_pin() {
-    local directory pin tag tree found
+    local directory pin tag tree found tool
     if [ -z "$_GATE_LIBRARY_SOURCE" ] || [[ "$_GATE_LIBRARY_SOURCE" == *$'\n'* ]]; then _gate_error gate_run "cannot find the library's directory"; fi
     directory=${_GATE_LIBRARY_SOURCE%/*}
     pin="$directory/PIN"
     if [ ! -e "$pin" ] && [ ! -L "$pin" ]; then return 0; fi
-    if ! command -v git > /dev/null 2>&1; then
-        gate_missing git 'the library pin check'
-        return 0
-    fi
+    for tool in git find readlink mktemp; do
+        if ! command -v "$tool" > /dev/null 2>&1; then
+            gate_missing "$tool" 'the library pin check'
+            return 0
+        fi
+    done
     if ! _gate_read_pin "$pin"; then
         printf "%s: the library's pin cannot be read: %s\n" "$GATE_NAME" "$pin" >&2
         exit 1

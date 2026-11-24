@@ -6,13 +6,28 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 failed=0
+mkdir "$tmp/grep-bin"
+if [ -x /usr/bin/grep ] && /usr/bin/grep --version 2> /dev/null | /usr/bin/grep -q 'BSD grep'; then
+    ln -s /usr/bin/grep "$tmp/grep-bin/grep"
+else
+    # Model legacy grep's exported option handling on hosts whose grep ignores it.
+    TEST_REAL_GREP=$(type -P grep)
+    export TEST_REAL_GREP
+    cat > "$tmp/grep-bin/grep" <<'SH'
+#!/usr/bin/env bash
+if [ "${GREP_OPTIONS:-}" = -v ]; then set -- -v "$@"; fi
+exec "$TEST_REAL_GREP" "$@"
+SH
+    chmod +x "$tmp/grep-bin/grep"
+fi
 runner=$BASH
 source_repo="$tmp/source"
 destination="$tmp/copy"
 mkdir -p "$source_repo/gate" "$tmp/logs"
 cp -R "$root/gate/." "$source_repo/gate/"
 printf '0.1.0\n' > "$source_repo/gate/VERSION"
-mkdir "$source_repo/gate/sample"
+mkdir "$source_repo/gate/sample" "$source_repo/gate/sub"
+printf 'fixture\n' > "$source_repo/gate/sub/text"
 printf 'fixture\n' > "$source_repo/gate/sample/text"
 git init -q "$source_repo"
 git -C "$source_repo" config user.name Test
@@ -35,6 +50,10 @@ check() {
     shift
     if ! "$@"; then printf 'gate_vendor_test: FAIL %s\n' "$name"; failed=1; fi
 }
+check docs-accidental-edit grep -Fq 'which catches an accidental edit' "$root/README.md"
+check docs-pin-not-signature grep -Fq 'the pin is not a signature' "$root/README.md"
+# shellcheck disable=SC2016
+check docs-pin-editable grep -Fq 'edit the copy can also edit or delete its `PIN`' "$root/README.md"
 check docs-git-version grep -Fq 'pin check needs git 2.29 or later' "$root/gate/README.md"
 # shellcheck disable=SC2016
 check docs-direct-scanner grep -Fq 'Running a vendored scanner directly (without `gate_run`) checks no pin.' "$root/gate/README.md"
@@ -139,9 +158,10 @@ consumer_cases() {
         reset_copy
         expect "$style-failglob-clean" 0 't: library pinned at awna-gate-v0.1.0' run_glob_consumer -O failglob
         check failglob-marker test -f "$tmp/marker"
-        for change in bytes extra hidden double-dot git removed mode link tree nested empty; do
+        for change in nested-pin bytes extra hidden double-dot git removed mode link tree nested empty; do
             reset_copy
             case "$change" in
+                nested-pin) mkdir -p "$destination/sub"; printf x > "$destination/sub/PIN" ;;
                 bytes) printf '\n# changed\n' >> "$destination/lib.sh" ;;
                 extra) printf x > "$destination/extra" ;;
                 hidden) printf x > "$destination/.extra" ;;
@@ -176,6 +196,16 @@ consumer_cases() {
             esac
             expect "$style-pin-$change" 1 "t: the library's pin cannot be read:" run_consumer
             check no-marker test ! -e "$tmp/marker"
+        done
+        reset_copy
+        chmod +x "$destination/lib.sh"
+        expect "$style-grep-options-mode" 1 'differs from its pin awna-gate-v0.1.0' env PATH="$tmp/grep-bin:$PATH" GREP_OPTIONS=-v TMPDIR="$tmp/logs" "$runner" "$consumer"
+        check grep-options-no-marker test ! -e "$tmp/marker"
+        reset_copy
+        for missing in find readlink mktemp; do
+            rm "$tmp/pin-bin/$missing"
+            expect "$style-missing-$missing" 75 "$missing is missing on this host (CHECK_STRICT=1)" env CHECK_STRICT=1 PATH="$tmp/pin-bin" "$runner" "$consumer"
+            ln -s "$(type -P "$missing")" "$tmp/pin-bin/$missing"
         done
         reset_copy
         printf x > "$destination/extra"
@@ -225,6 +255,8 @@ run_map() { (cd "$tmp/consumer-repo" && run_consumer --check-map); }
 run_touched() { (cd "$tmp/consumer-repo" && run_consumer --tier touched); }
 mkdir "$tmp/bin"
 for tool in bash mktemp rm tail; do ln -s "$(type -P "$tool")" "$tmp/bin/$tool"; done
+mkdir "$tmp/pin-bin"
+for tool in bash git find readlink mktemp rm tail; do ln -s "$(type -P "$tool")" "$tmp/pin-bin/$tool"; done
 hash_runtime_cases
 owner_mode_cases
 directory_cases
@@ -258,7 +290,7 @@ for change in absent link pin attributes version nul-version missing-lib bad-pat
         absent) rm -rf "$source_repo/gate"; reason='has no gate directory' ;;
         link) ln -s VERSION "$source_repo/gate/link"; reason='holds an entry vendor.sh cannot copy' ;;
         pin) printf x > "$source_repo/gate/PIN"; reason='holds an entry vendor.sh cannot copy' ;;
-        attributes) mkdir "$source_repo/gate/sub"; printf x > "$source_repo/gate/sub/.gitattributes"; reason='holds an entry vendor.sh cannot copy' ;;
+        attributes) mkdir -p "$source_repo/gate/sub"; printf x > "$source_repo/gate/sub/.gitattributes"; reason='holds an entry vendor.sh cannot copy' ;;
         nul-version) printf '0.3.0\0\n' > "$source_repo/gate/VERSION"; reason='does not match its VERSION' ;;
         version) printf '0.9.0\n' > "$source_repo/gate/VERSION"; reason='does not match its VERSION' ;;
         missing-lib) rm "$source_repo/gate/lib.sh"; reason='holds an entry vendor.sh cannot copy' ;;
@@ -277,6 +309,30 @@ for change in absent link pin attributes version nul-version missing-lib bad-pat
     record "$tag"
     expect "refuse-$change" 2 "$reason" bash "$source_repo/vendor.sh" "$tag" "$destination"
     check "$change-unchanged" diff -r "$tmp/before" "$destination"
+done
+for control in .git/HEAD sub/.git/config .GITATTRIBUTES .gitignore sub/.Gitmodules; do
+    count=$((count + 1))
+    tag="awna-gate-v0.4.$count"
+    git -C "$source_repo" ls-tree 'awna-gate-v0.1.0:gate' | sed -e '/[[:space:]]VERSION$/d' -e '/[[:space:]]sub$/d' > "$tmp/control-entries"
+    version_blob=$(printf '%s\n' "${tag#awna-gate-v}" | git -C "$source_repo" hash-object -w --stdin)
+    printf '100644 blob %s\tVERSION\n' "$version_blob" >> "$tmp/control-entries"
+    control_sha=$(printf 'fixture\n' | git -C "$source_repo" hash-object -w --stdin)
+    rest=$control
+    control_mode=100644 control_kind=blob
+    while [[ "$rest" = */* ]]; do
+        component=${rest##*/}
+        control_sha=$(printf '%s %s %s\t%s\n' "$control_mode" "$control_kind" "$control_sha" "$component" | git -C "$source_repo" mktree)
+        control_mode=040000 control_kind=tree
+        rest=${rest%/*}
+    done
+    printf '%s %s %s\t%s\n' "$control_mode" "$control_kind" "$control_sha" "$rest" >> "$tmp/control-entries"
+    control_tree=$(git -C "$source_repo" mktree < "$tmp/control-entries")
+    release_tree=$(printf '040000 tree %s\tgate\n' "$control_tree" | git -C "$source_repo" mktree)
+    release_commit=$(printf 'Record a fixture.\n' | git -C "$source_repo" commit-tree "$release_tree")
+    git -C "$source_repo" tag "$tag" "$release_commit"
+    control_destination="$tmp/control-copy-$count"
+    expect "refuse-control-$control" 2 'holds an entry vendor.sh cannot copy' vendor "$tag" "$control_destination"
+    check "control-unwritten-$control" test ! -e "$control_destination"
 done
 rm -rf "$source_repo/gate"
 git -C "$source_repo" restore --source=awna-gate-v0.1.0 -- gate

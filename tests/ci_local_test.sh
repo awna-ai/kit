@@ -308,7 +308,7 @@ if [ "$map_status" -ne 0 ] || [ "$map_output" != 'ci-local: map ok' ]; then
     failed=1
 fi
 
-for changed in Cargo.lock tests/a_test.sh gate/.cargo/config.toml .ai/.cargo/config.toml docs/settings.md ignored/.cargo/config.toml; do
+for changed in gate/README.md Cargo.lock tests/a_test.sh gate/.cargo/config.toml .ai/.cargo/config.toml docs/settings.md ignored/.cargo/config.toml; do
     new_case
     mkdir "$repo/tests"
     printf 'exit 0\n' > "$repo/tests/a_test.sh"
@@ -332,6 +332,9 @@ for changed in Cargo.lock tests/a_test.sh gate/.cargo/config.toml .ai/.cargo/con
             'cargo fmt --all --check' 'cargo clippy --workspace --all-targets --all-features --locked -- -D warnings' \
             'cargo test --workspace --all-features --locked' 'cargo +1.99.0 check --workspace --all-targets --all-features --locked' \
             'bash scripts/deps-check.sh')
+    elif [ "$changed" = gate/README.md ]; then
+        wanted=$(printf '%s\n' 'bash tests/gate_scanners_test.sh' 'bash tests/gate_vendor_test.sh' \
+            'bash scripts/term-check.sh' 'bash scripts/secret-scan.sh' 'bash scripts/deps-check.sh')
     elif [ "$changed" = tests/a_test.sh ]; then
         wanted=$(printf '%s\n' 'shellcheck scripts/*.sh tests/*.sh gate/*.sh' 'bash tests/a_test.sh' \
             'bash scripts/term-check.sh' 'bash scripts/secret-scan.sh' 'bash scripts/deps-check.sh')

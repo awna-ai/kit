@@ -165,7 +165,7 @@ expect environment-toml 1 'leaks found'
 
 new_case
 mkdir "$tmp/bin"
-for tool in bash dirname grep git printenv; do
+for tool in bash dirname grep git; do
     ln -s "$(type -P "$tool")" "$tmp/bin/$tool"
 done
 export PATH="$tmp/bin" KIT_STRICT=1

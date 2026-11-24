@@ -19,6 +19,8 @@ gate/term-check.sh          bash tests/term_check_test.sh
 gate/term-check.sh          bash tests/gate_scanners_test.sh
 gate/secret-scan.sh         bash tests/secret_scan_test.sh
 gate/secret-scan.sh         bash tests/gate_scanners_test.sh
+gate/README.md              bash tests/gate_vendor_test.sh
+gate/README.md              bash tests/gate_scanners_test.sh
 gate/*.md                   -
 gate/VERSION                -
 scripts/*.sh                shellcheck *

@@ -2,6 +2,7 @@
 set -euo pipefail
 export LC_ALL=C
 export GIT_NO_REPLACE_OBJECTS=1
+unset GREP_OPTIONS GREP_COLOR GREP_COLORS
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR
 usage() {
     printf '%s\n' 'usage: vendor.sh <tag> <destination>' >&2
@@ -49,9 +50,14 @@ while IFS= read -r -d '' entry; do
     rest=$path
     while :; do
         component=${rest%%/*}
-        if [[ ! "$component" =~ ^[A-Za-z0-9._-]+$ ]] || [ "$component" = . ] || [ "$component" = .. ] || [ "$component" = .gitattributes ]; then
+        if [[ ! "$component" =~ ^[A-Za-z0-9._-]+$ ]] || [ "$component" = . ] || [ "$component" = .. ]; then
             fail "$tag holds an entry vendor.sh cannot copy"
         fi
+        case "$component" in
+            .[Gg][Ii][Tt]|.[Gg][Ii][Tt][Aa][Tt][Tt][Rr][Ii][Bb][Uu][Tt][Ee][Ss]|.[Gg][Ii][Tt][Ii][Gg][Nn][Oo][Rr][Ee]|.[Gg][Ii][Tt][Mm][Oo][Dd][Uu][Ll][Ee][Ss])
+                fail "$tag holds an entry vendor.sh cannot copy"
+                ;;
+        esac
         case "$rest" in */*) rest=${rest#*/} ;; *) break ;; esac
     done
     case "$path" in

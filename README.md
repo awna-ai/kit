@@ -38,7 +38,8 @@ bash kit/gate/vendor.sh awna-gate-v0.1.0 path/to/your-repo/tools/gate
 ```
 
 The copy carries a `PIN` file naming the tag and its git tree. The gate checks the copy against it on every run and
-fails if a file was changed, added or removed, so an edit to the vendored library can't pass unnoticed.
+fails if a file was changed, added or removed, which catches an accidental edit; the pin is not a signature,
+since whoever can edit the copy can also edit or delete its `PIN`.
 
 ## Working on the kit
 

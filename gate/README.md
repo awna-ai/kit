@@ -539,7 +539,9 @@ bash gate/secret-scan.sh --strict-var CHECK_STRICT --root /path/to/repository
 and `--message` is required for the term scanner; the secret scanner requires
 `--root`. Each option may occur once. `--strict-var` is optional, must be a shell
 variable name, and enables strict mode only when that variable's value is `1`.
-Without it, strict mode is off. Invalid arguments print usage to stderr and exit 2.
+The scanners read the variable from the environment, so it must be exported
+(unlike `gate_init`, which also reads a shell variable). Without it, strict mode is off.
+Invalid arguments print usage to stderr and exit 2.
 
 The term list holds one term per line; blank lines and comments starting with `#`
 (after whitespace) are ignored. The term scanner checks tracked and unignored

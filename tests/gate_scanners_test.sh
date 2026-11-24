@@ -6,6 +6,20 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 failed=0
+mkdir "$tmp/grep-bin"
+if [ -x /usr/bin/grep ] && /usr/bin/grep --version 2> /dev/null | /usr/bin/grep -q 'BSD grep'; then
+    ln -s /usr/bin/grep "$tmp/grep-bin/grep"
+else
+    # Model legacy grep's exported option handling on hosts whose grep ignores it.
+    TEST_REAL_GREP=$(type -P grep)
+    export TEST_REAL_GREP
+    cat > "$tmp/grep-bin/grep" <<'SH'
+#!/usr/bin/env bash
+if [ "${GREP_OPTIONS:-}" = -v ]; then set -- -v "$@"; fi
+exec "$TEST_REAL_GREP" "$@"
+SH
+    chmod +x "$tmp/grep-bin/grep"
+fi
 strict=${KIT_STRICT:-}
 term='Bramble''wick'
 printf '%s\n' "$term" > "$tmp/terms"
@@ -24,6 +38,10 @@ expect() {
 }
 if ! grep -Fq 'A path or link target that itself holds a term is printed as it is.' "$root/gate/README.md"; then
     printf 'gate_scanners_test: FAIL docs-diagnostic-paths\n'
+    failed=1
+fi
+if ! grep -Fq 'The scanners read the variable from the environment, so it must be exported' "$root/gate/README.md"; then
+    printf 'gate_scanners_test: FAIL docs-exported-strict\n'
     failed=1
 fi
 term_scan="$root/gate/term-check.sh"
@@ -52,6 +70,7 @@ expect no-strict-list 0 ', skipped' bash "$term_scan" --terms "$tmp/absent" --ro
 unset KIT_STRICT
 printf '%s\n' "$term" > "$tmp/target/text"
 expect target-dirty 1 'text:1 names a private term' bash "$term_scan" --terms "$tmp/terms" --root "$tmp/target"
+expect grep-options-term 1 'text:1 names a private term' env PATH="$tmp/grep-bin:$PATH" GREP_OPTIONS=-v bash "$term_scan" --terms "$tmp/terms" --root "$tmp/target"
 rm "$tmp/target/text"
 printf '%s\n' "$term" > text
 expect current-dirty 0 'term-check: clean' bash "$term_scan" --terms "$tmp/terms" --root "$tmp/target"
@@ -115,7 +134,9 @@ for scanner in "$term_scan" "$secret_scan"; do
     rm -rf "$tmp/history"
 done
 mkdir "$tmp/bin"
-for tool in git printenv; do ln -s "$(type -P "$tool")" "$tmp/bin/$tool"; done
+ln -s "$(type -P git)" "$tmp/bin/git"
+expect no-printenv-term 75 'term-check: no term list at' env -i PATH="$tmp/bin" OTHER=1 "$BASH" "$term_scan" --terms "$tmp/absent" --strict-var OTHER --root "$tmp/target"
+expect no-printenv-secret 75 'secret-scan: gitleaks is missing on this host (OTHER=1)' env -i PATH="$tmp/bin" OTHER=1 "$BASH" "$secret_scan" --strict-var OTHER --root "$tmp/target"
 expect strict-secret-name 75 'secret-scan: gitleaks is missing on this host (strict=1)' env strict=1 PATH="$tmp/bin" "$BASH" "$secret_scan" --strict-var strict --root "$tmp/target"
 expect named-strict 75 'secret-scan: gitleaks is missing on this host (OTHER=1)' env PATH="$tmp/bin" OTHER=1 "$BASH" "$secret_scan" --strict-var OTHER --root "$tmp/target"
 expect independent-secret 0 ', skipped' env PATH="$tmp/bin" KIT_STRICT=1 "$BASH" "$secret_scan" --strict-var OTHER --root "$tmp/target"

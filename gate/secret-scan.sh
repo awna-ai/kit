@@ -4,7 +4,10 @@ set -euo pipefail
 strict_value=$(
     while [ "$#" -ge 2 ]; do
         if [ "$1" = --strict-var ]; then
-            printenv -- "$2" || true
+            if [[ "$2" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] &&
+                [[ "$(declare -p "$2" 2> /dev/null)" =~ ^declare\ -[A-Za-z]*x ]]; then
+                printf '%s\n' "${!2}"
+            fi
             break
         fi
         shift 2
@@ -12,6 +15,7 @@ strict_value=$(
 )
 export LC_ALL=C
 export GIT_NO_REPLACE_OBJECTS=1
+unset GREP_OPTIONS GREP_COLOR GREP_COLORS
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR
 trap 'printf "%s\n" "secret-scan: internal error" >&2; exit 2' ERR
 usage() {
