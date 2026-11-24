@@ -28,6 +28,9 @@ gate_run
 Commands and labels must come from the consumer's own script. They are trusted shell
 code, never external input. Commands run with `bash -c`, without `eval`. A step
 inherits the consumer's environment, but not its unexported shell variables or functions.
+A step's status is its command's last status, so a pipeline or `;` list reports only
+its last part; start such a command with `set -o pipefail` (or `set -e`), or move it
+into a script.
 
 The host supplies `bash`, `mktemp`, `rm` and `tail`; macOS-only steps also need `uname`.
 The library uses the shell's `pwd` builtin and `SECONDS` clock. Logs can contain any
@@ -40,7 +43,8 @@ the consumer is responsible for removing them after inspection.
 
 `gate_init --name <name> [--strict-var <VAR>] [--] [<consumer arguments>...]`
 
-Call once before the other functions. It records `pwd -P` as the root where every
+Call exactly once before the other functions; a second call exits 2 with
+`<name>: gate_init: called twice`. It records `pwd -P` as the root where every
 step will run, even if the consumer later changes directory. It returns 0 on success.
 
 The required name matches `^[a-z0-9][a-z0-9._-]*$`. The optional strict variable name
@@ -73,7 +77,7 @@ For a consumer's own toolchain or component probes. In strict mode, except when
 listing, it prints `<name>: <what> is missing on this host (<VAR>=1)` to stderr and
 exits 75. Otherwise it prints `<name>: <what> is missing, skipping <skipping>` to
 stdout, increments the skip count and returns 0. Listing permits missing tools even
-in strict mode; probe diagnostics may therefore precede the listed labels.
+in strict mode; probe diagnostics go to stderr so stdout contains only the listed labels.
 
 ### gate_require
 

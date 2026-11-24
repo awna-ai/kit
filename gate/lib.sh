@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # A sourced library: leave the caller's options and traps alone.
-if [ "${_GATE_LOADED:-0}" = 1 ]; then
+if [ "${_GATE_LOADED:-0}" = 1 ] && declare -F gate_run > /dev/null; then
     return 0
 fi
 _GATE_LOADED=1
+_GATE_INITIALIZED=0
 
 _gate_error() {
     printf '%s: %s: %s\n' "${GATE_NAME:-gate}" "$1" "$2" >&2
@@ -16,6 +17,8 @@ _gate_usage() {
 }
 
 gate_init() {
+    if [ "$_GATE_INITIALIZED" -eq 1 ]; then _gate_error gate_init 'called twice'; fi
+    _GATE_INITIALIZED=1
     local name='' strict_var='' tier_seen=0
     while [ "$#" -gt 0 ]; do
         case "$1" in
@@ -77,7 +80,11 @@ gate_missing() {
         printf '%s: %s is missing on this host (%s=1)\n' "$GATE_NAME" "$1" "$_GATE_STRICT_VAR" >&2
         exit 75
     fi
-    printf '%s: %s is missing, skipping %s\n' "$GATE_NAME" "$1" "$2"
+    if [ "$GATE_LIST" -eq 1 ]; then
+        printf '%s: %s is missing, skipping %s\n' "$GATE_NAME" "$1" "$2" >&2
+    else
+        printf '%s: %s is missing, skipping %s\n' "$GATE_NAME" "$1" "$2"
+    fi
     _GATE_SKIPPED=$((_GATE_SKIPPED + 1))
     return 0
 }
@@ -127,6 +134,7 @@ _gate_tail() {
 }
 
 _gate_skips() {
+    if [ ! -r "$1" ]; then _gate_error gate_run "cannot read $1"; fi
     local line
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in

@@ -101,6 +101,43 @@ expect() {
     fi
 }
 
+for fixture in metacharacters prefix space; do
+    new_case
+    mkdir "$repo/tests"
+    case "$fixture" in
+        metacharacters) file='x_test.sh;true #_test.sh' ;;
+        prefix)
+            printf 'exit 0\n' > "$repo/tests/a_test.sh"
+            file='a_test.sh b_test.sh'
+            ;;
+        space) file='my ok_test.sh' ;;
+    esac
+    if [ "$fixture" = space ]; then
+        printf 'exit 0\n' > "$repo/tests/$file"
+        expect test-space 0 'ci-local: all passed' 'ci-local: all passed'
+    else
+        printf 'printf "fixture-failed\\n"; exit 1\n' > "$repo/tests/$file"
+        expect "test-$fixture" 1 '    fixture-failed'
+    fi
+done
+
+new_case
+# Both versions are available; the MSRV must be one literal cargo argument.
+printf '[workspace.package]\nrust-version = "1.99.0;true #"\n' > "$repo/Cargo.toml"
+cat > "$repo/bin/rustup" <<'STUB'
+#!/bin/sh
+if [ "$1" = toolchain ]; then
+    printf '1.99.0-host\n1.99.0;true #-host\n'
+else
+    printf 'rustfmt\nclippy\n'
+fi
+STUB
+expect msrv-quoted 0 'ci-local: all passed' 'ci-local: all passed'
+if ! grep -q '^+1.99.0;true # check ' "$CARGO_LOG"; then
+    printf 'ci_local_test: FAIL msrv-quoted: literal version argument absent\n'
+    failed=1
+fi
+
 new_case
 export KIT_STRICT=1
 expect strict-clean 0 'ci-local: all passed' 'ci-local: all passed'

@@ -56,7 +56,8 @@ else
 fi
 # Globs are sorted by name in the fixed C locale.
 for test_file in tests/*_test.sh; do
-    gate_step --test "bash $test_file"
+    printf -v quoted '%q' "$test_file"
+    gate_step --test "bash $test_file" "bash $quoted"
 done
 gate_step --contract 'bash scripts/term-check.sh'
 gate_step --contract 'bash scripts/secret-scan.sh'
@@ -65,7 +66,8 @@ if [ "$rust_ready" -eq 1 ]; then
     gate_step 'cargo fmt --all --check'
     gate_step 'cargo clippy --workspace --all-targets --all-features --locked -- -D warnings'
     gate_step 'cargo test --workspace --all-features --locked'
-    gate_step "cargo +$msrv check --workspace --all-targets --all-features --locked"
+    printf -v quoted '%q' "+$msrv"
+    gate_step "cargo +$msrv check --workspace --all-targets --all-features --locked" "cargo $quoted check --workspace --all-targets --all-features --locked"
     gate_step --contract 'bash scripts/deps-check.sh'
 fi
 

@@ -144,6 +144,88 @@ missing_cases() {
     expect non-strict-missing 0 't: invented-check is missing, skipping a check' returned
 }
 
+initialization_cases() {
+    new_case
+    cat >> "$consumer" <<'CASE'
+gate_init --name t
+gate_step first 'exit 1'
+gate_init --name other
+gate_step second :
+gate_run
+CASE
+    expect repeated-init 2 't: gate_init: called twice' 't: gate_init: called twice'
+
+    new_case
+    printf 'gate_init --name t\ngate_step first :\ngate_run\n' >> "$consumer"
+    export _GATE_INITIALIZED=1
+    expect inherited-init 0 't: all passed' 't: all passed'
+    unset _GATE_INITIALIZED
+}
+
+load_guard_cases() {
+    new_case
+    printf 'gate_init --name t\ngate_step first :\ngate_run\n' >> "$consumer"
+    export _GATE_LOADED=1
+    expect inherited-load-guard 0 't: all passed' 't: all passed'
+    unset _GATE_LOADED
+}
+
+list_stream_cases() {
+    new_case
+    cat >> "$consumer" <<'CASE'
+gate_init --name t --strict-var TEST_STRICT -- "$@"
+if gate_require invented-absent 'a check'; then exit 9; fi
+gate_step first :
+gate_step second :
+gate_run
+CASE
+    export TEST_STRICT=1
+    (cd "$case_dir" && PATH="$tmp/bin" TMPDIR="$case_dir/logs" "$runner" "$consumer" --list) > "$case_dir/out" 2> "$case_dir/err"
+    check list-missing-status test "$?" -eq 0
+    check list-missing-labels test "$(cat "$case_dir/out")" = "$(printf 'first\nsecond')"
+    check list-missing-stderr grep -qx 't: invented-absent is missing, skipping a check' "$case_dir/err"
+    unset TEST_STRICT
+}
+
+unreadable_log_cases() {
+    local kind
+    for kind in test contract; do
+        new_case
+        cat >> "$consumer" <<CASE
+gate_init --name t
+gate_step --$kind erased 'rm -rf "\$TMPDIR"'
+gate_run
+CASE
+        expect "unreadable-$kind" 2 't: gate_run: cannot read ' ''
+        check "unreadable-path-$kind" test "${output##*/}" = step-1.log
+    done
+}
+
+signal_cases() {
+    local kind option result wanted
+    for kind in plain test contract; do
+        new_case
+        option=''
+        if [ "$kind" != plain ]; then option="--$kind"; fi
+        printf "gate_init --name t\ngate_step %s signaled 'kill -9 \$\$'\ngate_run\n" "$option" >> "$consumer"
+        result=1 wanted='FAIL: signaled'
+        if [ "$kind" = contract ]; then result=2 wanted='ERROR: signaled (exit 137;'; fi
+        expect "signal-$kind" "$result" "$wanted" ''
+    done
+}
+
+consumer_cases() {
+    # The command runs in the child shell whose version is being inspected.
+    # shellcheck disable=SC2016
+    printf 'gate_lib_test: consumer bash %s\n' "$("$runner" -c 'printf %s "${BASH_VERSINFO[0]}"')"
+initialization_cases
+load_guard_cases
+list_stream_cases
+signal_cases
+unreadable_log_cases
+mode=strict
+unreadable_log_cases
+mode=loose
 core_cases
 missing_cases
 mode=strict
@@ -213,20 +295,36 @@ expect no-steps 2 't: no steps registered' ''
 new_case
 cat >> "$consumer" <<'CASE'
 gate_init --name t
-gate_step first :
-gate_step second 'sleep 1'
+gate_step first 'sleep 1'
+gate_step second 'sleep 2'
 gate_step third :
-gate_step fourth 'sleep 2'
+gate_step fourth :
 gate_step fifth :
 gate_step sixth :
+# Start just after a clock tick to keep command overhead away from the next boundary.
+tick=$SECONDS
+while [ "$SECONDS" -eq "$tick" ]; do sleep 0.01; done
 gate_run
 CASE
 expect slowest 0 't: slowest steps' 't: all passed'
 ranking=${output#*t: slowest steps$'\n'}
 check slow-count test "$(printf '%s\n' "$ranking" | grep -c '^  ')" -eq 5
-check slow-order test "$(printf '%s\n' "$ranking" | sed -n '1s/.*s //p')" = fourth
-check next-slow test "$(printf '%s\n' "$ranking" | sed -n '2s/.*s //p')" = second
-check tie-order test "$(printf '%s\n' "$ranking" | sed -n '3,5s/.*s //p')" = "$(printf 'first\nthird\nfifth')"
+check slow-order test "$(printf '%s\n' "$ranking" | sed -n '1s/.*s //p')" = second
+check next-slow test "$(printf '%s\n' "$ranking" | sed -n '2s/.*s //p')" = first
+check remaining-slow test "$(printf '%s\n' "$ranking" | sed -n '3,5p' | grep -Ec '^  [0-9]+s (third|fourth|fifth|sixth)$')" -eq 3
+# Only compare registration order when the measured durations actually tie.
+previous_time=-1 previous_position=0
+while read -r duration label; do
+    case "$label" in
+        first) position=1 ;; second) position=2 ;; third) position=3 ;;
+        fourth) position=4 ;; fifth) position=5 ;; sixth) position=6 ;;
+        *) continue ;;
+    esac
+    if [ "$duration" = "$previous_time" ]; then
+        check tie-order test "$position" -gt "$previous_position"
+    fi
+    previous_time=$duration previous_position=$position
+done <<< "$ranking"
 
 new_case
 printf 'gate_init --name t\ngate_step input "cat > input"\ncd elsewhere\ngate_step root "pwd > location"\ngate_run\n' >> "$consumer"
@@ -299,10 +397,16 @@ expect log-creation 2 't: gate_run: cannot create a log directory' 't: gate_run:
 rm "$tmp/bin/mktemp"
 ln -s "$(type -P mktemp)" "$tmp/bin/mktemp"
 
-if [ -x /bin/bash ] && [ "$(/bin/bash -c 'printf %s "${BASH_VERSINFO[0]}"')" != "${BASH_VERSINFO[0]}" ]; then
+}
+
+consumer_cases
+
+# Compare with the consumer runner, independently of this file's interpreter.
+# shellcheck disable=SC2016
+if [ -x /bin/bash ] && [ "$(/bin/bash -c 'printf %s "${BASH_VERSINFO[0]}"')" != "$("$runner" -c 'printf %s "${BASH_VERSINFO[0]}"')" ]; then
     runner=/bin/bash
-    mode=strict
-    core_cases
+    mode=loose
+    consumer_cases
 else
     printf 'gate_lib_test: alternate shell unavailable, skipped\n'
 fi
