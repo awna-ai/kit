@@ -108,7 +108,7 @@ read_refs() {
                     */refs/green/frozen) shadow=refs/green/frozen ;;
                     *) fail 'invalid green ref' ;;
                 esac
-                fail "$remote has $ref, which shadows $shadow; delete it" ;;
+                fail "$remote has ${ref//[^[:print:]]/?}, which shadows $shadow; delete it" ;;
         esac
         if ! git -C "$root" cat-file -e "$oid" 2>/dev/null; then
             git -C "$root" fetch --quiet --no-tags --no-recurse-submodules -- "$remote" "$oid" || fail 'cannot fetch green ref'
@@ -187,6 +187,7 @@ configuration_fingerprint() {
         [ -n "$file" ] || continue
         if [ -e "$file" ]; then
             cksum "$file" || return 1
+            if [ -x "$file" ]; then printf 'executable\n'; else printf 'not executable\n'; fi
         else
             printf 'missing %s\n' "$file"
         fi
@@ -200,6 +201,7 @@ configuration_fingerprint() {
                     readlink "$file" || return 1
                 elif [ -f "$file" ]; then
                     cksum "$file" || return 1
+                    if [ -x "$file" ]; then printf 'executable\n'; else printf 'not executable\n'; fi
                 fi
             done <<< "$entries"
         else
@@ -226,7 +228,7 @@ fresh_clone() {
     if [ -n "$copied_branch" ]; then
         git -C "$tree" update-ref -d "$copied_branch" || fail 'cannot remove the scratch branch'
     fi
-    git -C "$tree" remote add origin "$remote_url" || fail 'cannot set the scratch remote'
+    git -C "$tree" remote add -- origin "$remote_url" || fail 'cannot set the scratch remote'
     git -C "$tree" update-ref refs/remotes/origin/main "$head" || fail 'cannot set the scratch main'
 }
 fresh_clone

@@ -658,6 +658,19 @@ case_linked_tripwire() {
         check test ! -e "$common/verify-main.lock"
     done
 }
+case_main_pointer_tripwire() {
+    cp -R "$repo/.git" "$tmp/common-copy"
+    printf '#!/bin/sh\ntouch "%s/payload-ran"\n' "$tmp" > "$tmp/common-copy/hooks/reference-transaction"
+    chmod +x "$tmp/common-copy/hooks/reference-transaction"
+    printf 'printf "%%s\\n" "%s/common-copy" > "%s/.git/commondir"\n' "$tmp" "$repo" > "$tmp/hook"
+    run
+    check test "$actual" -eq 1
+    check test "$output" = "verify-main: the check changed the git configuration or hooks of $repo; nothing changed, inspect it"
+    check test ! -e "$tmp/payload-ran"
+    # Remove the pointer before expect() makes any root git calls.
+    rm "$repo/.git/commondir"
+    expect 1 "verify-main: the check changed the git configuration or hooks of $repo; nothing changed, inspect it"
+}
 case_linked_pointer_tripwire() {
     for pointer in commondir gitdir; do
         setup
@@ -679,6 +692,14 @@ case_linked_pointer_tripwire() {
         expect 1 "verify-main: the check changed the git configuration or hooks of $repo; nothing changed, inspect it"
         check test ! -e "$common/verify-main.lock"
     done
+}
+case_hook_mode_tripwire() {
+    printf '#!/bin/sh\ntouch "%s/payload-ran"\n' "$tmp" > "$repo/.git/hooks/pre-push"
+    chmod -x "$repo/.git/hooks/pre-push"
+    printf 'chmod +x "%s/.git/hooks/pre-push"\n' "$repo" > "$tmp/hook"
+    run
+    check test ! -e "$tmp/payload-ran"
+    expect 1 "verify-main: the check changed the git configuration or hooks of $repo; nothing changed, inspect it"
 }
 case_active_hooks_tripwire() {
     mkdir "$repo/.githooks"
@@ -741,6 +762,21 @@ case_follow_tags() {
         else want_frozen=$head; expect 5 "red $head culprit $head"; fi
         check test -z "$(git -C "$repo" ls-remote --tags origin)"
     done
+}
+case_shadow_control_chars() {
+    mkdir "$tmp/bin"
+    real_git=$(command -v git)
+    cat > "$tmp/bin/git" <<'GIT'
+#!/bin/sh
+"$REAL_GIT" "$@" || exit $?
+case " $* " in
+    *' ls-remote '*) printf '%s\trefs/x\033[2J/refs/green/main\n' "$TEST_OID" ;;
+esac
+GIT
+    chmod +x "$tmp/bin/git"
+    PATH="$tmp/bin:$PATH" REAL_GIT="$real_git" TEST_OID="$head" run
+    expect 1 'verify-main: origin has refs/x?[2J/refs/green/main, which shadows refs/green/main; delete it'
+    check test "$output" = "${output//$'\033'/}"
 }
 case_shadow() {
     for target in main frozen; do
@@ -1102,7 +1138,7 @@ case_repeat_red() {
     expect 5 "red $head culprit $head"
 }
 cases='repeat_red equal_freeze_advance rerun_unavailable_empty red_covered off_main_advance stolen_lock check_stdout merge_suspects remote_green_object lease_races missing_tools cleanup_status shallow green_push_failure lock_identity bad_lock check_environment relative_tmp inside_tmp cannot_start shadow follow_tags fresh_rerun noncommit_ref docs signals red_push_failure push_races failures environment scratch_config live_lock stale_lock freeze_race green_race covered main_moved rewritten unavailable fixed flaky no_green_red red_many red_one advance current_off_main current_ancestor_frozen current_frozen current first_green usage'
-cases="linked_pointer_tripwire tilde_remote colon_relative_remote detached_root linked_tripwire active_hooks_tripwire relative_path_command relative_remote ps_failure deleted_freeze tree_check check_exit_codes root_tripwire readonly_red dash_tmp fetch_tags lock_directory_link lock_timezone scratch_refs $cases"
+cases="shadow_control_chars hook_mode_tripwire main_pointer_tripwire linked_pointer_tripwire tilde_remote colon_relative_remote detached_root linked_tripwire active_hooks_tripwire relative_path_command relative_remote ps_failure deleted_freeze tree_check check_exit_codes root_tripwire readonly_red dash_tmp fetch_tags lock_directory_link lock_timezone scratch_refs $cases"
 selected=0
 for name in $cases; do
     if [ "$#" -gt 0 ] && [ "$1" != "$name" ]; then continue; fi
