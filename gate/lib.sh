@@ -6,6 +6,20 @@ fi
 _GATE_LOADED=1
 _GATE_INITIALIZED=0
 
+# Resolve the directory while sourcing, before the consumer can change directory.
+_gate_physical_file() {
+    local path=$1 directory
+    case "$path" in
+        */*) directory=${path%/*}; if [ -z "$directory" ]; then directory=/; fi ;;
+        *) directory=. ;;
+    esac
+    if ! directory=$(cd "$directory" && pwd -P); then return 1; fi
+    printf '%s/%s\n' "${directory%/}" "${path##*/}"
+}
+if ! _GATE_LIBRARY_SOURCE=$(_gate_physical_file "${BASH_SOURCE[0]}"); then
+    _GATE_LIBRARY_SOURCE=''
+fi
+
 _gate_error() {
     printf '%s: %s: %s\n' "${GATE_NAME:-gate}" "$1" "$2" >&2
     exit 2
@@ -98,6 +112,17 @@ gate_init() {
     _GATE_STRICT=0
     if [ -n "$strict_var" ] && [ "${!strict_var:-}" = 1 ]; then _GATE_STRICT=1; fi
     if ! _GATE_ROOT=$(pwd -P); then _gate_error gate_init 'cannot record the repository root'; fi
+    _GATE_OWN_PATHS=()
+    local own_file resolved
+    for own_file in "$_GATE_MAP" "$0" "$_GATE_LIBRARY_SOURCE"; do
+        if [ -n "$own_file" ] && resolved=$(_gate_physical_file "$own_file"); then
+            case "$resolved" in
+                "${_GATE_ROOT%/}"/*)
+                    _GATE_OWN_PATHS[${#_GATE_OWN_PATHS[@]}]=${resolved#"${_GATE_ROOT%/}/"}
+                    ;;
+            esac
+        fi
+    done
     _GATE_SKIPPED=0
     _GATE_LABELS=()
     _GATE_COMMANDS=()
@@ -165,13 +190,28 @@ gate_step() {
 }
 
 
+_gate_printable() {
+    local LC_ALL=C
+    local text=$1
+    printf '%s' "${text//[!\ -\~]/?}"
+}
+
+_gate_root_is_top() {
+    local top
+    if ! top=$(git -C "$_GATE_ROOT" rev-parse --show-toplevel 2> /dev/null) ||
+        ! top=$(cd "$top" && pwd -P); then return 1; fi
+    [ "$top" = "$_GATE_ROOT" ]
+}
+
 # Both map users share one parser; patterns remain data throughout.
 _gate_map_problem() {
+    local problem
+    problem=$(_gate_printable "$1")
     if [ "$GATE_CHECK_MAP" -eq 1 ]; then
-        printf 'FAIL: %s\n' "$1" >&2
+        printf 'FAIL: %s\n' "$problem" >&2
         _GATE_PROBLEMS=$((_GATE_PROBLEMS + 1))
     elif [ -z "$_GATE_REASON" ]; then
-        _GATE_REASON=$1
+        _GATE_REASON=$problem
     fi
     return 0
 }
@@ -180,6 +220,10 @@ _gate_read_map() {
     local file line path_pattern step_pattern label path matched number=0
     _GATE_PATH_PATTERNS=()
     _GATE_STEP_PATTERNS=()
+    if shopt -q nocasematch; then
+        _gate_map_problem 'nocasematch is set'
+        return 0
+    fi
     file=$_GATE_MAP
     case "$file" in /*) ;; *) file="$_GATE_ROOT/$file" ;; esac
     if [ ! -f "$file" ] || [ ! -r "$file" ]; then
@@ -228,6 +272,7 @@ _gate_read_map() {
 _gate_check_map() {
     local file path
     if ! command -v git > /dev/null 2>&1; then _gate_error gate_run 'git is unavailable'; fi
+    if ! _gate_root_is_top; then _gate_error gate_run 'the gate root is not the top of the repository'; fi
     if ! file=$(mktemp "${TMPDIR:-/tmp}/$GATE_NAME.XXXXXX"); then
         _gate_error gate_run 'could not list tracked files'
     fi
@@ -251,9 +296,10 @@ _gate_check_map() {
 }
 
 _gate_select_touched() {
-    local base file path previous duplicate index row mapped word text
+    local base file path previous duplicate index row mapped word text candidate commit count=0 own_file
+    # This host's locales cannot distinguish this byte guard; keep it defensive.
     local LC_ALL=C
-    local paths=() chosen=() words=()
+    local paths=() chosen=() words=() candidates=()
     _GATE_REASON=''
     if ! command -v git > /dev/null 2>&1; then
         _GATE_REASON='git is unavailable'
@@ -261,7 +307,26 @@ _gate_select_touched() {
     fi
     _gate_read_map
     if [ -n "$_GATE_REASON" ]; then return 0; fi
-    if ! base=$(git -C "$_GATE_ROOT" merge-base HEAD "$_GATE_BASE" 2> /dev/null); then
+    if ! _gate_root_is_top; then
+        _GATE_REASON='the gate root is not the top of the repository'
+        return 0
+    fi
+    case "$_GATE_BASE" in
+        refs/*) candidates=("$_GATE_BASE") ;;
+        *) candidates=("refs/$_GATE_BASE" "refs/tags/$_GATE_BASE" "refs/heads/$_GATE_BASE" "refs/remotes/$_GATE_BASE") ;;
+    esac
+    base=''
+    for candidate in "${candidates[@]+"${candidates[@]}"}"; do
+        if commit=$(git -C "$_GATE_ROOT" rev-parse --verify --quiet "$candidate^{commit}" 2> /dev/null); then
+            count=$((count + 1))
+            base=$commit
+        fi
+    done
+    if [ "$count" -gt 1 ]; then
+        _GATE_REASON="the base $_GATE_BASE is ambiguous"
+        return 0
+    fi
+    if [ "$count" -eq 0 ] || ! base=$(git -C "$_GATE_ROOT" merge-base HEAD "$base" 2> /dev/null); then
         _GATE_REASON="no merge base with $_GATE_BASE"
         return 0
     fi
@@ -269,7 +334,7 @@ _gate_select_touched() {
         _GATE_REASON='could not list the change'
         return 0
     fi
-    if ! git -C "$_GATE_ROOT" diff -z --name-only --no-renames --no-ext-diff --no-textconv "$base" -- > "$file" 2> /dev/null ||
+    if ! git -C "$_GATE_ROOT" diff -z --name-only --no-renames --no-ext-diff --no-textconv --ignore-submodules=none --no-relative "$base" -- > "$file" 2> /dev/null ||
         ! git -C "$_GATE_ROOT" ls-files -z --others --exclude-standard >> "$file" 2> /dev/null; then
         _GATE_REASON='could not list the change'
     else
@@ -287,6 +352,12 @@ _gate_select_touched() {
     if ! rm -f "$file"; then _gate_error gate_run 'cannot remove temporary files'; fi
     if [ -n "$_GATE_REASON" ]; then return 0; fi
     for path in "${paths[@]+"${paths[@]}"}"; do
+        for own_file in "${_GATE_OWN_PATHS[@]+"${_GATE_OWN_PATHS[@]}"}"; do
+            if [ "$path" = "$own_file" ]; then
+                _GATE_REASON="$path is one of the gate's own files"
+                return 0
+            fi
+        done
         mapped=0
         for ((row = 0; row < ${#_GATE_PATH_PATTERNS[@]}; row++)); do
             # shellcheck disable=SC2053 # The map's right-hand side is a pattern, not code.
@@ -301,10 +372,16 @@ _gate_select_touched() {
             fi
         done
         for ((index = 0; index < ${#_GATE_LABELS[@]}; index++)); do
+            if [[ "$path" == *' '* ]] && [[ " ${_GATE_LABELS[index]} " == *" $path "* ]]; then
+                chosen[index]=1
+                mapped=1
+            fi
             for text in "${_GATE_LABELS[index]}" "${_GATE_COMMANDS[index]}"; do
                 IFS=$' \t\n' read -r -a words <<< "$text"
                 for word in "${words[@]+"${words[@]}"}"; do
-                    if [ "$word" = "$path" ]; then chosen[index]=1; mapped=1; fi
+                    case "$word" in
+                        */*|*.*) if [ "$word" = "$path" ]; then chosen[index]=1; mapped=1; fi ;;
+                    esac
                 done
             done
         done
@@ -389,7 +466,13 @@ gate_run() {
         printf '%s: no steps registered\n' "$GATE_NAME" >&2
         exit 2
     fi
-    if [ "$GATE_CHECK_MAP" -eq 1 ]; then _gate_check_map; fi
+    if [ "$GATE_CHECK_MAP" -eq 1 ]; then
+        if [ "$_GATE_SKIPPED" -gt 0 ]; then
+            printf '%s: cannot check the map on this host: a tool is missing\n' "$GATE_NAME" >&2
+            exit 75
+        fi
+        _gate_check_map
+    fi
     _gate_selection
     total=${#_GATE_SELECTED[@]}
     if [ "$GATE_LIST" -eq 1 ]; then

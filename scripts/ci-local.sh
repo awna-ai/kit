@@ -68,7 +68,7 @@ if [ "$rust_ready" -eq 1 ]; then
     gate_step 'cargo test --workspace --all-features --locked'
     printf -v quoted '%q' "+$msrv"
     gate_step "cargo +$msrv check --workspace --all-targets --all-features --locked" "cargo $quoted check --workspace --all-targets --all-features --locked"
-    gate_step --contract 'bash scripts/deps-check.sh'
+    gate_step --contract --always 'bash scripts/deps-check.sh'
 fi
 
 gate_run

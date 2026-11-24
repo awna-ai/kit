@@ -33,6 +33,7 @@ its last part; start such a command with `set -o pipefail` (or `set -e`), or mov
 into a script.
 
 The host supplies `bash`, `mktemp`, `rm` and `tail`; macOS-only steps also need `uname`.
+The touched tier and `--check-map` also need `git`.
 The library uses the shell's `pwd` builtin and `SECONDS` clock. Logs can contain any
 output the commands produce. Failed runs retain those logs in a temporary directory;
 the consumer is responsible for removing them after inspection.
@@ -79,6 +80,7 @@ listing or checking the map, it prints `<name>: <what> is missing on this host (
 exits 75. Otherwise it prints `<name>: <what> is missing, skipping <skipping>` to
 stdout, increments the skip count and returns 0. Listing and checking the map permit missing tools even
 in strict mode; probe diagnostics go to stderr so stdout contains only the listed labels.
+Map checking then exits 75 if any probe reported a missing tool.
 
 ### gate_require
 
@@ -164,7 +166,12 @@ and contain no newline. Relative paths are resolved from the recorded repository
 root; absolute paths are allowed. The map is read only by `gate_run`, so a missing
 map is not an initialization error. The base defaults to `origin/main` and must
 match `^[A-Za-z0-9][A-Za-z0-9._/-]*$`; invalid values exit 2. A base without a map
-is allowed and has no effect. The base is read from the local ref only: the gate never fetches.
+is allowed and has no effect. The base is read from local refs only: the gate never fetches.
+A base starting with `refs/` names only that full ref. Otherwise the candidates are
+`refs/<base>`, `refs/tags/<base>`, `refs/heads/<base>` and `refs/remotes/<base>`.
+Exactly one must resolve to a commit; multiple candidates are ambiguous even when
+pointing at the same commit. Selection uses the merge base of HEAD and that commit.
+The recorded root must physically equal the top of the repository.
 
 With a map, consumer usage is:
 
@@ -180,7 +187,11 @@ after trimming leading and trailing spaces and tabs. The first field is the path
 pattern; the trimmed rest is the step pattern and may contain spaces. Both are
 Bash patterns used as data with `[[ $text == $pattern ]]`, never evaluated as code.
 `*` matches across slashes and spaces. A step pattern of `-` maps a path without
-selecting a step. Every other step pattern must match a registered label.
+selecting a step. Every other step pattern must match a registered label, not a
+command. Patterns follow the consumer's `extglob` setting; Bash 4.1 and later
+read `[[ ]]` patterns as extended globs. Maps should use plain globs. The library
+does not change shell options. With `nocasematch` set, touched selection falls
+back, and map checking reports `FAIL: nocasematch is set`.
 
 ```text
 # Changes to source run the matching registered checks.
@@ -188,17 +199,31 @@ src/*       build *
 docs/*      -
 ```
 
-Touched selection uses `git merge-base HEAD <base>`, then NUL-separated paths from
-`git diff -z --name-only --no-renames --no-ext-diff --no-textconv <merge base> --`
+Touched selection uses the resolved merge base, then NUL-separated paths from
+`git diff -z --name-only --no-renames --no-ext-diff --no-textconv --ignore-submodules=none --no-relative <merge base> --`
 and `git ls-files -z --others --exclude-standard`. It sees committed, staged,
 unstaged, deleted and untracked changes, excludes ignored untracked files, and
-counts each path once. Restored paths are not changes. Temporary files are created
-under `${TMPDIR:-/tmp}` with `mktemp` and removed before listing or running steps.
+counts each path once. The tier measures the working tree: index-only changes
+(staged then removed or reverted in the working tree) and files marked
+`--assume-unchanged` or `--skip-worktree` are not changed paths. Restored paths are
+not changes. Selecting many thousands of paths takes seconds (about 10 seconds
+for 3000 paths in a prior measured run).
+Temporary files are created under `${TMPDIR:-/tmp}` with `mktemp` and removed
+before listing or running steps. A signal between creation and removal can leave
+one 0600 file there; the library installs no cleanup trap.
 
 Every matching map line selects every matching step label; `-` does not cancel
-other matches. A step also maps and selects a changed path when a word of its label
-or command equals the path exactly. Words use `read -r -a` with default whitespace
-splitting, without pathname expansion or shell quote interpretation. `--always`
+other matches. Changes to the map, the consumer script or the sourced library
+always run the full tier, even with a matching `* -` row. These paths are recorded
+relative to the root at initialization, with directories resolved physically;
+files outside the root are ignored for this rule.
+
+A step also maps and selects a changed path when a word of its label or command
+equals the path exactly and holds a `/` or a `.`. Bare words such as `warnings`
+do not map root files. Words use `read -r -a` with default whitespace splitting,
+without pathname expansion or shell quote interpretation. A path containing spaces
+also matches a space-delimited run in the label: `bash tests/my ok_test.sh` names
+`tests/my ok_test.sh`. `--always`
 steps are selected even with no changes. Selected steps run once, in registration
 order. The notice is `<name>: tier touched, <p> paths changed, <s> steps` on stdout,
 or stderr when listing; listing's stdout holds only selected labels.
@@ -208,17 +233,22 @@ The first uncertainty falls back to every registered step, in this order:
 | Condition | Reason |
 | --- | --- |
 | No git on PATH | `git is unavailable` |
+| Case-insensitive matching enabled | `nocasematch is set` |
 | Unreadable map | `cannot read <map>` |
 | Missing step field | `<map> line <n> has no step` |
 | Step pattern matches no label | `<map> line <n> names no registered step: <pattern>` |
-| Merge-base fails | `no merge base with <base>` |
+| Root is not the physical repository top | `the gate root is not the top of the repository` |
+| Multiple base refs resolve to commits | `the base <base> is ambiguous` |
+| Merge-base fails or no base ref resolves | `no merge base with <base>` |
 | Change listing or temporary-file creation fails | `could not list the change` |
 | A changed path has bytes outside printable ASCII, a double quote or a backslash | `a changed path has a character the map cannot match` |
-| A path matches neither a map line nor a step word | `<path> has no entry in <map>` |
+| A changed path is the map, consumer or library | `<path> is one of the gate's own files` |
+| A path matches neither a map line nor a step path | `<path> has no entry in <map>` |
 
 Map problems use physical line numbers starting at 1 and the map path exactly as
 given. The notice is `<name>: tier touched falls back to the full tier: <reason>`
-on stdout, or stderr when listing. Unsafe path bytes are never printed. `GATE_TIER`
+on stdout, or stderr when listing. Map diagnostic bytes outside printable ASCII
+are replaced by `?`; unsafe changed-path bytes are never printed. `GATE_TIER`
 remains `touched`, including after fallback.
 
 Selection happens before listing and macOS preflight. Only selected macOS steps
@@ -227,12 +257,19 @@ cover only selected steps. An empty selection creates no log directory, prints n
 step timing or slowest list, and exits 0 with `<name>: all passed` (or
 `<name>: all passed, <s> skipped`). An empty list prints no labels and exits 0.
 
-`--check-map` requires git, lists tracked files with `git ls-files -z`, then checks
+If any `gate_missing` call happened, `--check-map` prints
+`<name>: cannot check the map on this host: a tool is missing` to stderr and exits
+75 before reading the map, in both strict and non-strict mode. This is unavailable,
+never a successful validation.
+
+Otherwise `--check-map` requires git, lists tracked files with `git ls-files -z`, then checks
 every map line in order. It prints `FAIL: <map problem>` to stderr for every map
 problem above, plus `FAIL: <map> line <n> matches no tracked file: <path pattern>`
 for each line whose path pattern matches no tracked file. No problems
 prints `<name>: map ok` to stdout and exits 0; otherwise the final stderr line is
-`<name>: map has <k> problems`, exit 1. Missing git, a failed tracked-file listing
-or a temporary-file failure exits 2 with a `gate_run` diagnostic. No steps still
+`<name>: map has <k> problems`, exit 1. Missing git, a failed tracked-file listing,
+a temporary-file failure or a root that is not the physical repository top exits
+2 with a `gate_run` diagnostic (`the gate root is not the top of the repository`
+for the root mismatch). No steps still
 exits 2 before map checking. Checking runs no step and creates no log directory;
-strict missing-tool probes are counted and printed to stderr rather than exiting 75.
+missing-tool probes are counted and printed to stderr before the final exit 75.

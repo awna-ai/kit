@@ -308,7 +308,7 @@ if [ "$map_status" -ne 0 ] || [ "$map_output" != 'ci-local: map ok' ]; then
     failed=1
 fi
 
-for changed in Cargo.lock tests/a_test.sh; do
+for changed in Cargo.lock tests/a_test.sh gate/.cargo/config.toml .ai/.cargo/config.toml docs/settings.md ignored/.cargo/config.toml; do
     new_case
     mkdir "$repo/tests"
     printf 'exit 0\n' > "$repo/tests/a_test.sh"
@@ -320,6 +320,10 @@ for changed in Cargo.lock tests/a_test.sh; do
     git -C "$repo" add .
     git -C "$repo" -c user.name=Test -c user.email=test@example.invalid -c commit.gpgsign=false commit -qm 'Record a fixture.'
     git -C "$repo" update-ref refs/remotes/origin/main HEAD
+    if [ "$changed" = ignored/.cargo/config.toml ]; then
+        printf 'ignored/\n' >> "$repo/.git/info/exclude"
+    fi
+    mkdir -p "$(dirname "$repo/$changed")"
     printf '# changed\n' >> "$repo/$changed"
     selected=$(PATH="$repo/bin" bash "$repo/scripts/ci-local.sh" --tier touched --list 2> "$tmp/touched-notice")
     selected_status=$?
@@ -328,9 +332,18 @@ for changed in Cargo.lock tests/a_test.sh; do
             'cargo fmt --all --check' 'cargo clippy --workspace --all-targets --all-features --locked -- -D warnings' \
             'cargo test --workspace --all-features --locked' 'cargo +1.99.0 check --workspace --all-targets --all-features --locked' \
             'bash scripts/deps-check.sh')
-    else
+    elif [ "$changed" = tests/a_test.sh ]; then
         wanted=$(printf '%s\n' 'shellcheck scripts/*.sh tests/*.sh gate/*.sh' 'bash tests/a_test.sh' \
-            'bash scripts/term-check.sh' 'bash scripts/secret-scan.sh')
+            'bash scripts/term-check.sh' 'bash scripts/secret-scan.sh' 'bash scripts/deps-check.sh')
+    fi
+    if [ "$changed" = docs/settings.md ] || [ "$changed" = ignored/.cargo/config.toml ]; then
+        wanted=$(printf '%s\n' 'bash scripts/term-check.sh' 'bash scripts/secret-scan.sh' 'bash scripts/deps-check.sh')
+    elif [[ "$changed" == */.cargo/* ]]; then
+        wanted=$(PATH="$repo/bin" bash "$repo/scripts/ci-local.sh" --list)
+        if ! grep -F -q 'falls back to the full tier:' "$tmp/touched-notice"; then
+            printf 'ci_local_test: FAIL touched-config-fallback: %s\n' "$changed"
+            failed=1
+        fi
     fi
     if [ "$selected_status" -ne 0 ] || [ "$selected" != "$wanted" ]; then
         printf 'ci_local_test: FAIL touched-%s: exit %s: %s\n' "$changed" "$selected_status" "$selected"

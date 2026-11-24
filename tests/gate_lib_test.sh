@@ -353,6 +353,9 @@ MAP
     expect unselected-mac 0 'step 1 ' 't: all passed' --tier touched
     rm "$case_dir/marker"
     printf 'docs/* mac\nmap -\n' > "$case_dir/map"
+    git -C "$case_dir" add map
+    git -C "$case_dir" -c user.name=Test -c user.email=test@example.invalid -c commit.gpgsign=false commit -qm 'Select a platform step.'
+    git -C "$case_dir" update-ref refs/remotes/origin/main HEAD
     expect selected-mac 75 'runs only on macOS' '' --tier touched
     check selected-mac-preflight test ! -e "$case_dir/marker"
 
@@ -360,6 +363,8 @@ MAP
     # Every matching row contributes, with each selected step run once.
     touched_fixture
     printf 'docs/* step-one\ndocs/* step-*\nmap -\n' > "$case_dir/map"
+    record_fixture
+    printf 'changed\n' > "$case_dir/docs/new.md"
     printf 'changed\n' > "$case_dir/docs/notes.md"
     touched_run multi-match 't: tier touched, 2 paths changed, 2 steps' "$(printf 'one\ntwo')"
 
@@ -476,8 +481,167 @@ CASE
     sed 's/--map map/--strict-var TEST_STRICT --map map/' "$consumer" > "$case_dir/replaced"
     mv "$case_dir/replaced" "$consumer"
     export TEST_STRICT=1
-    expect strict-map-missing 0 't: map ok' 't: map ok' --check-map
+    expect strict-map-missing 75 't: cannot check the map on this host: a tool is missing' '' --check-map
     unset TEST_STRICT
+    expect loose-map-missing 75 't: cannot check the map on this host: a tool is missing' '' --check-map
+}
+
+# Commit setup separately so each case measures only the intended change.
+record_fixture() {
+    git -C "$case_dir" add .
+    git -C "$case_dir" -c user.name=Test -c user.email=test@example.invalid -c commit.gpgsign=false commit -qm 'Record fixture setup.'
+    git -C "$case_dir" update-ref refs/remotes/origin/main HEAD
+}
+
+touched_fixup_cases() {
+    local change path first second
+    touched_fixture
+    git -C "$case_dir" tag origin/main HEAD
+    touched_run ambiguous-base 'the base origin/main is ambiguous' "$(printf 'one\ntwo')"
+
+    touched_fixture
+    git -C "$case_dir" branch -f main HEAD
+    sed 's/--map map/--map map --base refs\/heads\/main/' "$consumer" > "$case_dir/replaced"
+    mv "$case_dir/replaced" "$consumer"
+    printf x >> "$case_dir/docs/notes.md"
+    touched_run full-base-ref 't: tier touched, 1 paths changed, 1 steps' one
+
+    touched_fixture
+    first=$(git -C "$case_dir" rev-parse HEAD)
+    printf '[submodule "s"]\n path = vendor/s\n url = ./unused\n ignore = all\n' > "$case_dir/.gitmodules"
+    git -C "$case_dir" update-index --add --cacheinfo "160000,$first,vendor/s"
+    git -C "$case_dir" add .gitmodules
+    git -C "$case_dir" -c user.name=Test -c user.email=test@example.invalid -c commit.gpgsign=false commit -qm 'Record a gitlink.'
+    git -C "$case_dir" update-ref refs/remotes/origin/main HEAD
+    second=$(git -C "$case_dir" rev-parse HEAD)
+    git -C "$case_dir" update-index --cacheinfo "160000,$second,vendor/s"
+    git -C "$case_dir" -c user.name=Test -c user.email=test@example.invalid -c commit.gpgsign=false commit -qm 'Bump a gitlink.'
+    touched_run submodule-ignore 'vendor/s has no entry in map' "$(printf 'one\ntwo')"
+
+    touched_fixture
+    sed '/^gate_init/i\
+cd docs' "$consumer" > "$case_dir/replaced"
+    mv "$case_dir/replaced" "$consumer"
+    cp "$case_dir/map" "$case_dir/docs/map"
+    printf 'gate_run\n' >> "$consumer"
+    expect subdirectory-root 0 'the gate root is not the top of the repository' 't: all passed' --tier touched
+    check subdirectory-root-marker test "$(cat "$case_dir/docs/marker")" = "$(printf 'one\ntwo')"
+    expect subdirectory-check-map 2 't: gate_run: the gate root is not the top of the repository' '' --check-map
+
+    touched_fixture
+    mkdir "$case_dir/tests"
+    printf x > "$case_dir/tests/my ok_test.sh"
+    printf 'gate_step "bash tests/my ok_test.sh" '\''printf "space\\n" >> marker'\''\n' >> "$consumer"
+    touched_run space-label 't: tier touched, 1 paths changed, 1 steps' space
+
+    touched_fixture
+    printf x > "$case_dir/warnings"
+    printf 'gate_step warnings '\''printf "warnings\\n" >> marker'\''\n' >> "$consumer"
+    touched_run bare-word 'warnings has no entry in map' "$(printf 'one\ntwo\nwarnings')"
+
+    for change in map consumer library; do
+        touched_fixture
+        printf '* -\n' > "$case_dir/map"
+        # Use an in-repository library and a tracked consumer for these cases.
+        mkdir "$case_dir/gate"
+        cp "$root/gate/lib.sh" "$case_dir/gate/lib.sh"
+        sed "s|$root/gate/lib.sh|$case_dir/gate/lib.sh|" "$consumer" > "$case_dir/replaced"
+        mv "$case_dir/replaced" "$consumer"
+        printf 'gate_run\n' >> "$consumer"
+        git -C "$case_dir" add -f consumer.sh
+        record_fixture
+        case "$change" in
+            map) path=map ;;
+            consumer) path=consumer.sh ;;
+            library) path=gate/lib.sh ;;
+        esac
+        printf '# changed\n' >> "$case_dir/$path"
+        expect "own-$change" 0 "$path is one of the gate's own files" 't: all passed' --tier touched
+        check "own-$change-marker" test "$(cat "$case_dir/marker")" = "$(printf 'one\ntwo')"
+    done
+
+    touched_fixture
+    printf 'docs/* absent\033step\nmissing\033/* step-one\n' > "$case_dir/map"
+    printf 'gate_run\n' >> "$consumer"
+    expect escaped-map-fallback 0 'names no registered step: absent?step' 't: all passed' --tier touched
+    check escaped-map-fallback-no-escape test "${output#*$'\033'}" = "$output"
+    expect escaped-map-check 1 'matches no tracked file: missing?/*' 't: map has 2 problems' --check-map
+    check escaped-map-check-step test "${output#*names no registered step: absent?step}" != "$output"
+    check escaped-map-check-no-escape test "${output#*$'\033'}" = "$output"
+
+    touched_fixture
+    printf 'shopt -s nocasematch\ngate_run\n' >> "$consumer"
+    expect nocasematch-touched 0 'nocasematch is set' 't: all passed' --tier touched
+    expect nocasematch-check 1 'FAIL: nocasematch is set' 't: map has 1 problems' --check-map
+}
+
+touched_contract_cases() {
+    local path
+    touched_fixture
+    printf 'docs/notes.md step-one\ndocs/renamed.md -\n' > "$case_dir/map"
+    record_fixture
+    git -C "$case_dir" mv docs/notes.md docs/renamed.md
+    touched_run no-renames 't: tier touched, 2 paths changed, 1 steps' one
+
+    touched_fixture
+    printf 'docs/notes.md step-one\ndocs/base.md step-two\n' > "$case_dir/map"
+    record_fixture
+    path=$(git -C "$case_dir" rev-parse HEAD)
+    printf x > "$case_dir/docs/base.md"
+    git -C "$case_dir" add docs
+    git -C "$case_dir" -c user.name=Test -c user.email=test@example.invalid -c commit.gpgsign=false commit -qm 'Advance the base.'
+    git -C "$case_dir" update-ref refs/remotes/origin/main HEAD
+    git -C "$case_dir" switch -q -c topic "$path"
+    printf x >> "$case_dir/docs/notes.md"
+    touched_run merge-base-not-tip 't: tier touched, 1 paths changed, 1 steps' one
+
+    touched_fixture
+    printf 'docs/*\t-\ndocs/*\tstep-one' > "$case_dir/map"
+    record_fixture
+    printf x >> "$case_dir/docs/notes.md"
+    touched_run tab-final-dash 't: tier touched, 1 paths changed, 1 steps' one
+
+    touched_fixture
+    path=$'docs/a\177b'
+    printf x > "$case_dir/$path"
+    touched_run del-path 'a changed path has a character the map cannot match' "$(printf 'one\ntwo')"
+    check del-hidden test "${output#*"$path"}" = "$output"
+
+    touched_fixture
+    printf 'docs/* absent-first\ndocs/* absent-second\n' > "$case_dir/map"
+    git -C "$case_dir" update-ref -d refs/remotes/origin/main
+    touched_run map-problem-precedence 'full tier: map line 1 names no registered step: absent-first' "$(printf 'one\ntwo')"
+    check first-map-problem test "${output#*absent-second}" = "$output"
+
+    touched_fixture
+    printf 'docs/* stop\ndocs/* after\n' > "$case_dir/map"
+    record_fixture
+    printf x >> "$case_dir/docs/notes.md"
+    printf 'gate_step --contract stop "exit 2"\ngate_step after :\ngate_run\n' >> "$consumer"
+    expect selected-stop-count 2 'stopped after step 1; 1 steps not run' '' --tier touched
+
+    touched_fixture
+    printf 'docs/* command-only\n' > "$case_dir/map"
+    printf 'gate_step label-only command-only\ngate_run\n' >> "$consumer"
+    expect patterns-use-labels 0 'map line 1 names no registered step: command-only' '' --tier touched --list
+
+    touched_fixture
+    # Isolate selection's file I/O so a missing TMPDIR tests only log creation.
+    cat >> "$consumer" <<'CASE'
+TMPDIR="$TMPDIR/absent"
+gate_run
+CASE
+    rm "$tmp/bin/mktemp"
+    cat > "$tmp/bin/mktemp" <<'STUB'
+#!/bin/sh
+if [ "$1" = -d ]; then exit 1; fi
+STUB
+    printf 'exec "%s" "%s/selection.XXXXXX"\n' "$(type -P mktemp)" "$case_dir/logs" >> "$tmp/bin/mktemp"
+    chmod +x "$tmp/bin/mktemp"
+    expect empty-no-log-directory 0 '0 paths changed, 0 steps' 't: all passed' --tier touched
+    check empty-no-log-path test ! -e "$case_dir/logs/absent"
+    rm "$tmp/bin/mktemp"
+    ln -s "$(type -P mktemp)" "$tmp/bin/mktemp"
 }
 
 touched_safety_cases() {
@@ -495,6 +659,8 @@ touched_safety_cases() {
 }
 
 consumer_cases() {
+    touched_fixup_cases
+    touched_contract_cases
     touched_cases
     mode=strict
     touched_safety_cases
