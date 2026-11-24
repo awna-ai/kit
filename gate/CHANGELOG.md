@@ -23,6 +23,9 @@
 
 ### Fixed
 
+- Treat keyed block-scalar content in ignored workflow regions as literal until its key column ends the block.
+- Check ignored sequence items after stripping every dash followed by one or more spaces.
+- Clarify workflow credential access, env-hook name allowlists and the hooks' C locale.
 - Check whole workflow lines, including ignored keys and nested list items, and refuse explicit YAML keys.
 - Keep workflow parsing in the C locale inside each parser function, including on bash 3.2.
 - Keep every step of a workflow job selected when the touched tier selects any command of that job.

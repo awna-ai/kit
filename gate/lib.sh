@@ -312,7 +312,12 @@ _gate_workflow_inline() {
 _gate_workflow_line() {
     local LC_ALL=C
     local _GATE_WF_TEXT=$1 _GATE_WF_KEY _GATE_WF_VALUE
-    while [[ "$_GATE_WF_TEXT" == '- '* ]]; do _GATE_WF_TEXT=${_GATE_WF_TEXT#- }; done
+    local _GATE_WF_COLUMN=$_GATE_WF_INDENT
+    while [[ "$_GATE_WF_TEXT" == '- '* ]]; do
+        _GATE_WF_TEXT=${_GATE_WF_TEXT#-}
+        _GATE_WF_TEXT=${_GATE_WF_TEXT#"${_GATE_WF_TEXT%%[! ]*}"}
+    done
+    _GATE_WF_COLUMN=$((_GATE_WF_COLUMN + ${#1} - ${#_GATE_WF_TEXT}))
     if [ "$_GATE_WF_TEXT" = - ]; then return 0; fi
     case "$_GATE_WF_TEXT" in
         '?'|'? '*|':'|': '*)
@@ -344,6 +349,9 @@ _gate_workflow_line() {
     if [ "${2:-}" != keys ]; then
         _GATE_WF_VALUE=$(_gate_workflow_value "$_GATE_WF_VALUE")
         _gate_workflow_inline "$_GATE_WF_VALUE"
+        if [[ "$_GATE_WF_VALUE" =~ ^[\|\>][1-9]?[+-]?$ || "$_GATE_WF_VALUE" =~ ^[\|\>][+-]?[1-9]?$ ]]; then
+            _GATE_WF_BLOCK=$_GATE_WF_COLUMN
+        fi
     fi
     return 0
 }
@@ -366,7 +374,7 @@ _gate_workflow_file() {
     local _GATE_WF_KEY _GATE_WF_VALUE _GATE_WF_NAME _GATE_WF_ITEM _GATE_WF_DUPLICATE
     local _GATE_WF_COMMANDS=() _GATE_WF_JOB_ENV=()
     local _GATE_WF_TOP_KEYS='' _GATE_WF_JOB_IDS='' _GATE_WF_JOB_KEYS='' _GATE_WF_STEP_KEYS=''
-    local _GATE_WF_ENV_NAMES='' _GATE_WF_SERVICE_NAMES='' _GATE_WF_CONTENT=0
+    local _GATE_WF_ENV_NAMES='' _GATE_WF_SERVICE_NAMES='' _GATE_WF_CONTENT=0 _GATE_WF_BLOCK=-1
     _GATE_WF_PATH="$_GATE_WF_DIRECTORY/$_GATE_WF_FILE"
     if [ -L "$_GATE_WF_PATH" ]; then
         _gate_workflow_error "$_GATE_WF_FILE" '' 'workflow is a symbolic link'
@@ -395,12 +403,18 @@ _gate_workflow_file() {
             _gate_workflow_error "$_GATE_WF_FILE" '' "line $_GATE_WF_NUMBER: a byte outside printable ASCII"
         fi
         _GATE_WF_TEXT=${_GATE_WF_LINE#"$_GATE_WF_LEADING"}
+        _GATE_WF_INDENT=${#_GATE_WF_LEADING}
+        if [ "$_GATE_WF_BLOCK" -ne -1 ]; then
+            if [ -z "$_GATE_WF_TEXT" ] || [ "$_GATE_WF_INDENT" -gt "$_GATE_WF_BLOCK" ]; then
+                continue
+            fi
+            _GATE_WF_BLOCK=-1
+        fi
         case "$_GATE_WF_TEXT" in ''|\#*) continue ;; esac
         if [ "$_GATE_WF_TEXT" = --- ] && [ "$_GATE_WF_CONTENT" -eq 1 ]; then
             _gate_workflow_error "$_GATE_WF_FILE" '' "line $_GATE_WF_NUMBER: a second YAML document"
         fi
         _GATE_WF_CONTENT=1
-        _GATE_WF_INDENT=${#_GATE_WF_LEADING}
         if [ "$_GATE_WF_INDENT" -eq 0 ]; then
             _gate_workflow_finish_job
             _gate_workflow_line "$_GATE_WF_TEXT" keys

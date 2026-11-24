@@ -831,9 +831,69 @@ YAML
     check realistic-no-run test ! -e "$case_dir/marker"
 }
 
+block_scalar_cases() {
+    local reason='a quoted or flow value must close on its own line'
+    local steps=$'jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n      - uses: org/script@v1\n        with:'
+    local hooks='gate_workflow_uses() { :; }'
+    refuse block-ends-at-key "t: ci.yml, job build: line 10: $reason" "$steps"$'\n          script: |\n            const t = \'a\n          y: "b\n    needs: z"\n      - run: touch marker' "$hooks"
+    refuse block-seq-key-column "t: ci.yml, job build: line 9: $reason" "$steps"$'\n          - a: |\n            b: "x\nname: y"' "$hooks"
+    refuse block-comment-ends "t: ci.yml, job build: line 11: $reason" "$steps"$'\n          script: |\n            a\n# note\n            x: "b\nname: c"' "$hooks"
+
+    new_case
+    cat > "$case_dir/.github/workflows/ci.yml" <<'YAML'
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: example/db:1
+        options: >-
+          --health-cmd "probe ready"
+    steps:
+      - run: touch marker
+YAML
+    printf '%s\n' 'gate_workflow_service() { :; }' >> "$consumer"
+    setup_consumer
+    expect block-service-options 0 'build: touch marker' 'build: touch marker' --list
+    check block-service-no-run test ! -e "$case_dir/marker"
+
+    new_case
+    printf '%s\n' "$steps" > "$case_dir/.github/workflows/ci.yml"
+    cat >> "$case_dir/.github/workflows/ci.yml" <<'YAML'
+          script: |
+            const title = 'Nightly';
+            console.log([title]);
+YAML
+    setup_consumer
+    expect block-with-script 0 'build: true' 'build: true' --list
+    check block-script-exact-list test "$(cat "$case_dir/out")" = 'build: true'
+
+    cat >> "$case_dir/.github/workflows/ci.yml" <<'YAML'
+      - run: touch marker
+YAML
+    expect block-then-step 0 'build: true' 'build: touch marker' --list
+    check block-step-exact-list test "$(cat "$case_dir/out")" = $'build: true\nbuild: touch marker'
+    check block-step-no-run test ! -e "$case_dir/marker"
+}
+
+dash_space_cases() {
+    local steps=$'jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: touch marker'
+    local item reason
+    for item in '-  |' '-  >-' '- -  |' '-  ? x' '-  &a x' '-  !t x' '-  *a'; do
+        case "$item" in
+            *'|'*|*'>'*) reason='cannot be mirrored' ;;
+            *'?'*) reason='explicit keys are not mirrored' ;;
+            *) reason='anchors, aliases and tags are not mirrored' ;;
+        esac
+        refuse "dash-spaces $item" "t: ci.yml: line 2: $reason" $'on:\n  '"$item"$'\n'"$steps"
+    done
+}
+
 consumer_cases() {
     # shellcheck disable=SC2016 # Inspect the actual consumer interpreter.
     printf 'gate_workflow_test: consumer bash %s\n' "$("$runner" -c 'printf %s "${BASH_VERSINFO[0]}"')"
+    block_scalar_cases
+    dash_space_cases
     line_guard_cases
     byte_cases
     inline_cases
@@ -850,6 +910,8 @@ consumer_cases() {
     touched_cases
     boundary_cases
     mode=strict
+    block_scalar_cases
+    dash_space_cases
     line_guard_cases
     byte_cases
     inline_cases

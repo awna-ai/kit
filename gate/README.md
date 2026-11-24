@@ -296,6 +296,9 @@ missing-tool probes are counted and printed to stderr before the final exit 75.
 A consumer can read its local GitHub Actions files instead of maintaining a second
 list of commands. Workflows are executable input: use only repository files you
 trust, and define hooks to allow exactly the jobs and setup the local host can mirror.
+The environment scrub removes variables only: steps still run as you, with your
+`HOME`, so they can read files such as SSH and cloud credentials under it. Running
+`gate_workflow` on a branch you do not trust runs that branch's code with your credentials.
 The parser is deliberately a small indentation grammar, not a general YAML reader.
 All parsing and hook decisions happen during `gate_workflow`, including under
 `--list` and `--check-map`, before any step runs. The first problem exits 2.
@@ -355,10 +358,14 @@ must match `^\{[^][{}"']*\}$`. These checks apply after comment removal, includi
 to ignored inline names, ids, timeouts, setup arguments and replaced env values.
 Ignored nested blocks also receive this scalar check. The gate checks the whole
 line, including keys and standalone list items, after stripping leading sequence
-markers (`- `). Explicit YAML keys and values (`?` or `:` followed by a space,
+markers (`-` followed by one or more spaces). Explicit YAML keys and values (`?` or `:` followed by a space,
 or alone) are refused. Plain keys cannot contain any of `" ' [ ] { } # & * ! | > , ?`
 or a backtick. Plain scalar list items and continuations cannot contain
 `" ' [ ] { }`. Keyless block scalars (`|` or `>`) are refused.
+In ignored nested regions, a keyed block scalar (`|`, `>` and their indentation
+and chomping modifiers) has literal content until a non-blank line at or left of
+the key's column, including a comment line. Content still receives every byte
+check but is not checked for keys, quotes or flow values.
 Thus `name: "a # b"` is refused because comment removal leaves `"a`. A plain
 `run:` keeps its stricter rules below. Duplicate top-level keys, job ids, job keys,
 step keys, env names and service names are refused within their respective scopes.
@@ -414,6 +421,7 @@ Hooks must be shell functions defined before `gate_workflow`; an undefined hook
 allows nothing. Each runs in a subshell in a condition with stdin from `/dev/null`,
 so rejection works under `set -euo pipefail` and an `ERR` trap. Stderr passes through unchanged.
 Only the env hook's stdout is used; other hook stdout is discarded.
+Hooks run with `LC_ALL=C` set for the duration of `gate_workflow`.
 Parser locals use the reserved `_GATE_WF_` prefix so hooks can read their own
 consumer globals. Hook assignments cannot change parser state. Arguments are
 validated data, never evaluated as shell code.
@@ -422,7 +430,7 @@ validated data, never evaluated as shell code.
 | --- | --- | --- |
 | `gate_workflow_job` | `<file> <job>` | Mirror the job. |
 | `gate_workflow_job_key` | `<file> <job> <key>` | Ignore an extra job key and its entire nested block. |
-| `gate_workflow_env` | `<file> <job> <name>` | Supply the variable's value on stdout, replacing the workflow value. |
+| `gate_workflow_env` | `<file> <job> <name>` | Supply the variable's value on stdout, replacing the workflow value. The name comes from the workflow: allow only names the hook knows, and never pass a value through by name (such as `${!3}`). |
 | `gate_workflow_service` | `<file> <job> <name>` | Accept a service whose stand-in the consumer provides. |
 | `gate_workflow_uses` | `<file> <job> <ref>` | Skip an action whose setup the host already provides. |
 
