@@ -37,7 +37,14 @@ top=$(git -C "$root" rev-parse --show-toplevel 2>/dev/null) || usage
 top=$(CDPATH='' cd -- "$top" && pwd -P) || usage
 [ "$root" = "$top" ] || usage
 remote_url=$(git -C "$root" remote get-url -- "$remote" 2>/dev/null) || usage
-case "$remote_url" in /*|*:*) ;; *) remote_url="$root/$remote_url" ;; esac
+case "$remote_url" in
+    /*|\~*|*://*) ;;
+    *)
+        # A colon names an scp-like URL only before the first slash.
+        case "${remote_url%%:*}" in
+            */*|"$remote_url") remote_url="$root/$remote_url" ;;
+        esac ;;
+esac
 shallow=$(git -C "$root" rev-parse --is-shallow-repository) || fail 'cannot inspect history'
 [ "$shallow" != true ] || fail 'a shallow clone cannot name a culprit; fetch the full history'
 common=$(git -C "$root" rev-parse --git-common-dir) || fail 'cannot find the common directory'
@@ -176,7 +183,7 @@ git_file=''
 if [ -f "$root/.git" ]; then git_file="$root/.git"; fi
 configuration_fingerprint() {
     local file directory entries
-    for file in "$common/config" "$common/config.worktree" "$git_dir/config.worktree" "$git_file"; do
+    for file in "$common/config" "$common/config.worktree" "$git_dir/config.worktree" "$git_dir/commondir" "$git_dir/gitdir" "$git_file"; do
         [ -n "$file" ] || continue
         if [ -e "$file" ]; then
             cksum "$file" || return 1
@@ -205,7 +212,7 @@ check_configuration() {
     local current_configuration
     current_configuration=$(configuration_fingerprint) || fail 'cannot inspect git configuration or hooks'
     [ "$current_configuration" = "$configuration" ] ||
-        fail "the check changed $common's git configuration or hooks; nothing changed, inspect it"
+        fail "the check changed the git configuration or hooks of $root; nothing changed, inspect it"
 }
 attempt=0
 fresh_clone() {

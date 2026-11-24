@@ -670,11 +670,18 @@ the full history before running.
 
 Before the first attempt the script fingerprints the common `config` and `config.worktree`,
 the root's own `config.worktree` and `.git` file (when it is a regular file),
+the git directory's `commondir` and `gitdir` files (present or missing),
 `$common/hooks` and the active hooks directory resolved by Git. Missing configuration
 files and hooks directories are recorded; every hooks entry is listed, with checksums
 for files and targets for symlinks. Immediately after each check, before any further git command,
 a changed fingerprint exits 1 with no push and asks you to inspect the root's
-configuration or hooks. This tripwire does not cover files pulled in by `include.path`
+configuration or hooks:
+
+```text
+verify-main: the check changed the git configuration or hooks of <root>; nothing changed, inspect it
+```
+
+This tripwire does not cover files pulled in by `include.path`
 or anything else the check can write as the caller. It does not prevent deliberate
 code from writing the root or restoring a change before the comparison.
 
