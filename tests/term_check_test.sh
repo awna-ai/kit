@@ -18,15 +18,18 @@ failed=0
 new_case() {
     case_number=$1
     repo="$tmp/case-$case_number"
-    mkdir -p "$repo/scripts"
+    mkdir -p "$repo/scripts" "$repo/gate"
     git init -q "$repo"
     git -C "$repo" config user.name Test
     git -C "$repo" config user.email test@example.invalid
     git -C "$repo" config commit.gpgsign false
     # The copied checker is fixture tooling, not a file under test.
-    printf 'scripts/\n' > "$repo/.git/info/exclude"
+    printf 'scripts/\ngate/\n' > "$repo/.git/info/exclude"
     if [ -f "$root/scripts/term-check.sh" ]; then
         cp "$root/scripts/term-check.sh" "$repo/scripts/term-check.sh"
+    fi
+    if [ -f "$root/gate/term-check.sh" ]; then
+        cp "$root/gate/term-check.sh" "$repo/gate/"
     fi
     cd "$repo" || exit 1
     export KIT_TERMS_FILE="$terms"

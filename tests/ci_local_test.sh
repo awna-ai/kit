@@ -313,7 +313,7 @@ for changed in Cargo.lock tests/a_test.sh gate/.cargo/config.toml .ai/.cargo/con
     mkdir "$repo/tests"
     printf 'exit 0\n' > "$repo/tests/a_test.sh"
     # Register every test label named by the map, without running those tests.
-    for test_name in gate_lib gate_workflow ci_local term_check secret_scan deps_check; do
+    for test_name in gate_lib gate_workflow gate_scanners gate_vendor ci_local term_check secret_scan deps_check; do
         printf 'exit 0\n' > "$repo/tests/${test_name}_test.sh"
     done
     if [ -f "$root/scripts/ci-touched.map" ]; then cp "$root/scripts/ci-touched.map" "$repo/scripts/"; fi
@@ -357,7 +357,7 @@ done
 
 new_case
 mkdir "$repo/tests"
-for test_name in gate_lib gate_workflow ci_local term_check secret_scan deps_check; do
+for test_name in gate_lib gate_workflow gate_scanners gate_vendor ci_local term_check secret_scan deps_check; do
     printf 'exit 0\n' > "$repo/tests/${test_name}_test.sh"
 done
 cp "$root/scripts/ci-touched.map" "$repo/scripts/"

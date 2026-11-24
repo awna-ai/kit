@@ -958,6 +958,107 @@ _gate_slowest() {
     return 0
 }
 
+_gate_literal_tree() {
+    local directory=$1 repository=$2 top=$3 child name mode kind sha target entries result
+    entries=$(mktemp "$repository/entries.XXXXXX") || return 1
+    for child in "$directory"/* "$directory"/.[!.]* "$directory"/..?*; do
+        if [ ! -e "$child" ] && [ ! -L "$child" ]; then continue; fi
+        name=${child##*/}
+        if [ "$top" -eq 1 ] && [ "$name" = PIN ]; then continue; fi
+        kind=blob
+        if [ -L "$child" ]; then
+            mode=120000
+            target=$(readlink "$child" && printf '.') || return 1
+            target=${target%$'\n.'}
+            sha=$(printf '%s' "$target" | git --git-dir="$repository/.git" hash-object -w --stdin) || return 1
+        elif [ -d "$child" ]; then
+            mode=040000 kind=tree
+            sha=$(_gate_literal_tree "$child" "$repository" 0) || return 1
+        elif [ -f "$child" ]; then
+            mode=100644
+            if [ -x "$child" ]; then mode=100755; fi
+            sha=$(git --git-dir="$repository/.git" hash-object -w --no-filters -- "$child") || return 1
+        else
+            return 1
+        fi
+        printf '%s %s %s\t%s\0' "$mode" "$kind" "$sha" "$name" >> "$entries" || return 1
+    done
+    result=$(git --git-dir="$repository/.git" mktree -z < "$entries") || return 1
+    rm -f "$entries" || return 1
+    printf '%s\n' "$result"
+}
+
+# Build the tree id from bytes, modes and link targets with hash-object --no-filters and mktree
+# in a throwaway repository: no index, attributes or configuration can change it; -x reads the executable bit.
+_gate_tree_hash() (
+    local directory=$1 temporary variable tree
+    set +f
+    unset GLOBIGNORE
+    shopt -u dotglob failglob nocaseglob
+    if ! directory=$(cd -- "$directory" 2> /dev/null && pwd -P); then return 1; fi
+    while IFS= read -r variable; do
+        case "$variable" in GIT_*) unset "$variable" ;; esac
+    done < <(compgen -e)
+    if ! temporary=$(mktemp -d "${TMPDIR:-/tmp}/gate-tree.XXXXXX"); then return 1; fi
+    export GIT_CONFIG_NOSYSTEM=1 GIT_ATTR_NOSYSTEM=1 GIT_NO_REPLACE_OBJECTS=1
+    export HOME="$temporary" XDG_CONFIG_HOME="$temporary"
+    if ! git init -q "$temporary/repo" > /dev/null 2>&1; then
+        rm -rf "$temporary" > /dev/null 2>&1 || return 1
+        return 1
+    fi
+    if tree=$(_gate_literal_tree "$directory" "$temporary/repo" 1 2> /dev/null); then
+        if ! rm -rf "$temporary"; then return 1; fi
+        printf '%s\n' "$tree"
+        return 0
+    fi
+    rm -rf "$temporary" > /dev/null 2>&1 || return 1
+    return 1
+)
+
+_gate_check_pin() {
+    local directory pin line tag='' tree='' found invalid=0
+    if [ -z "$_GATE_LIBRARY_SOURCE" ]; then _gate_error gate_run "cannot find the library's directory"; fi
+    directory=${_GATE_LIBRARY_SOURCE%/*}
+    pin="$directory/PIN"
+    if [ ! -e "$pin" ] && [ ! -L "$pin" ]; then return 0; fi
+    if ! command -v git > /dev/null 2>&1; then
+        gate_missing git 'the library pin check'
+        return 0
+    fi
+    if [ -L "$pin" ] || [ ! -f "$pin" ] || [ ! -r "$pin" ]; then
+        invalid=1
+    else
+        if IFS= read -r -d '' line < "$pin"; then invalid=1; fi
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+                ''|'#'*) ;;
+                tag\ *)
+                    if [ -n "$tag" ] || [[ ! "$line" =~ ^tag\ awna-gate-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+                        invalid=1
+                    fi
+                    tag=${line#tag }
+                    ;;
+                tree\ *)
+                    if [ -n "$tree" ] || [[ ! "$line" =~ ^tree\ [0-9a-f]{40}$ ]]; then invalid=1; fi
+                    tree=${line#tree }
+                    ;;
+                *) invalid=1 ;;
+            esac
+        done < "$pin"
+    fi
+    if [ "$invalid" -ne 0 ] || [ -z "$tag" ] || [ -z "$tree" ]; then
+        printf "%s: the library's pin cannot be read: %s\n" "$GATE_NAME" "$pin" >&2
+        exit 1
+    fi
+    if ! found=$(_gate_tree_hash "$directory"); then _gate_error gate_run 'cannot hash the library'; fi
+    if [ "$found" != "$tree" ]; then
+        printf '%s: the library in %s differs from its pin %s (tree %s, found %s); vendor it again\n' \
+            "$GATE_NAME" "$directory" "$tag" "$tree" "$found" >&2
+        exit 1
+    fi
+    printf '%s: library pinned at %s\n' "$GATE_NAME" "$tag"
+}
+
 gate_run() {
     _gate_workflow_environment
     local total=${#_GATE_LABELS[@]} index position os logdir='' log started status outcome
@@ -984,6 +1085,7 @@ gate_run() {
         done
         exit 0
     fi
+    _gate_check_pin
     for index in "${_GATE_SELECTED[@]+"${_GATE_SELECTED[@]}"}"; do
         if [ "${_GATE_MAC[index]}" -eq 1 ]; then
             if ! os=$(uname -s); then _gate_error gate_run 'cannot identify this host'; fi

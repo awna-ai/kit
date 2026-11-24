@@ -33,7 +33,7 @@ its last part; start such a command with `set -o pipefail` (or `set -e`), or mov
 into a script.
 
 The host supplies `bash`, `mktemp`, `rm` and `tail`; macOS-only steps also need `uname`.
-The touched tier and `--check-map` also need `git`. Workflow steps also need `env`, `tr` and `cmp`.
+The touched tier, `--check-map` and runs with a library `PIN` also need `git`. Workflow steps also need `env`, `tr` and `cmp`.
 The library uses the shell's `pwd` builtin and `SECONDS` clock. Logs can contain any
 output the commands produce. Failed runs retain those logs in a temporary directory;
 the consumer is responsible for removing them after inspection.
@@ -126,7 +126,9 @@ refusals and execution rules.
 Runs the registered steps and exits; it never returns. No steps means exit 2 with
 `<name>: no steps registered` on stderr, including when listing. With `--list`, it
 prints labels in registration order, one per line, and exits 0 without creating logs
-or running commands. Listing also bypasses the operating-system preflight.
+or running commands. Listing also bypasses the library pin check and the operating-system preflight.
+Map checking also exits before the pin check. Other runs check the library pin
+after selection and before macOS preflight or log creation, even with no selected steps.
 
 Before any command runs, the first macOS-only step on another operating system
 causes exit 75 with this stderr line:
@@ -520,3 +522,84 @@ start at 1. Hook stderr can print additional lines of the consumer's own.
 | Rejected or malformed action reference | `step uses '<value>' is not mirrored` |
 | Step with neither or both run and uses | `line <n>: a step needs exactly one of run: and uses:` |
 | No run command across the entry and called files | `no run: steps found` (entry file) |
+
+## Scanners
+
+The standalone scanners run as `bash <script>`, from any directory. They take
+explicit inputs and do not read a consumer's strict setting unless named:
+
+```sh
+bash gate/term-check.sh --terms terms.txt --strict-var CHECK_STRICT --root .
+bash gate/term-check.sh --terms terms.txt --message message.txt
+bash gate/secret-scan.sh --strict-var CHECK_STRICT --root .
+```
+
+`--terms` is required and non-empty. Exactly one of `--root` (an existing directory)
+and `--message` is required for the term scanner; the secret scanner requires
+`--root`. Each option may occur once. `--strict-var` is optional, must be a shell
+variable name, and enables strict mode only when that variable's value is `1`.
+Without it, strict mode is off. Invalid arguments print usage to stderr and exit 2.
+
+The term list holds one term per line; blank lines and comments starting with `#`
+(after whitespace) are ignored. The term scanner checks tracked and unignored
+untracked files, binary contents, link targets, paths, ref names, all reachable
+history objects and commit and tag messages. Matching ignores case, uses whole
+words, and also separates underscores, camel case and adjacent letters and digits.
+It refuses grafted history and malformed message objects. `--message` checks only
+the named readable file. Diagnostics identify locations without printing matched
+contents. Exit 0 means clean, 1 means a term was found, and 2 means usage or an
+internal error. A missing, unreadable or empty list prints a `, skipped` line and
+exits 0, or prints the reason to stderr and exits 75 in strict mode.
+
+The secret scanner needs `gitleaks`, `git` and the usual shell tools, including
+`tar`. It scans every ref's history, every reachable object whole, and tracked and
+unignored untracked regular files. It ignores external scanner configuration and
+refuses repository files named `.gitleaks.toml` or `.gitleaksignore`, at any level
+and in any case. Reports are redacted. Exit 0 means clean, 1 means a finding or
+refused configuration, and 2 means usage or an internal error. Missing `gitleaks`
+prints a `, skipped` line and exits 0, or exits 75 in strict mode with the named
+variable in the diagnostic.
+
+## Vendoring and the pin
+
+Fetch the release tags before copying. The vendor script reads local tags only;
+it never fetches and never copies the source working tree:
+
+```sh
+bash <checkout>/gate/vendor.sh awna-gate-v0.1.0 <consumer>/vendor/gate
+```
+
+The destination's parent must exist. A new destination must be absent; an existing
+one must be a directory with a regular, non-link `PIN`. A destination link is
+refused. The script validates the tagged tree, writes and verifies a temporary
+copy beside the destination, then replaces the old copy. Success exits 0 and
+prints `vendor: copied <tag> (tree <tree>) to <destination>`. Usage and copy failures
+exit 2 with a diagnostic on stderr and preserve the destination.
+
+The copy holds the tag's files and modes plus this mode-644 `PIN`:
+
+```text
+# Written by vendor.sh. The gate fails when this directory differs from this tag's tree.
+tag awna-gate-v0.1.0
+tree <40 lowercase hex characters>
+```
+
+Treat the copied directory as read-only. Keep the consumer's scripts, maps and
+other files elsewhere. Re-run the vendor command to update or repair the copy.
+A checkout that drops executable bits or rewrites line endings shows as drift.
+
+On every run, `gate_run` hashes the library independently of the consumer's index
+and user Git configuration, leaving out only the top-level `PIN`. A matching copy
+prints `<name>: library pinned at <tag>`. A changed byte, mode, link, extra or
+removed file, or nested `.git` entry or an empty directory fails with exit 1 before
+any step or log directory is made. The diagnostic names the pinned and found trees and says to
+vendor it again. A malformed, linked or unreadable pin also exits 1. A hashing
+failure exits 2. Missing `git` calls `gate_missing git 'the library pin check'`:
+strict mode exits 75; otherwise the check is skipped and counted. Without a `PIN`,
+there is no check or pin output. `--list` and `--check-map` bypass it.
+
+A pin accepts blank lines and lines starting with `#`, plus exactly one valid
+`tag` line and one 40-lowercase-hex `tree` line, in either order. It detects local
+drift; it is not a signature or a source-authenticity check.
+Removing `PIN` turns the check off, so the pin guards against accidental edits to
+the copy, not against someone who can also rewrite the consumer's repository.

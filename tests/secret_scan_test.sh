@@ -31,13 +31,16 @@ fi
 new_case() {
     number=$((number + 1))
     repo="$tmp/case-$number"
-    mkdir -p "$repo/scripts"
+    mkdir -p "$repo/scripts" "$repo/gate"
     git init -q "$repo"
     git -C "$repo" config user.name Test
     git -C "$repo" config user.email test@example.invalid
-    printf 'scripts/\n' > "$repo/.git/info/exclude"
+    printf 'scripts/\ngate/\n' > "$repo/.git/info/exclude"
     if [ -f "$root/scripts/secret-scan.sh" ]; then
         cp "$root/scripts/secret-scan.sh" "$repo/scripts/secret-scan.sh"
+    fi
+    if [ -f "$root/gate/secret-scan.sh" ]; then
+        cp "$root/gate/secret-scan.sh" "$repo/gate/"
     fi
     cd "$repo" || exit 1
     printf 'hello\n' > text
