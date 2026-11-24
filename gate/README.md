@@ -25,15 +25,15 @@ gate_step --contract 'bash scripts/example-check.sh'
 gate_run
 ```
 
-Commands and labels must come from the consumer's own script. They are trusted shell
-code, never external input. Commands run with `bash -c`, without `eval`. A step
-inherits the consumer's environment, but not its unexported shell variables or functions.
-A step's status is its command's last status, so a pipeline or `;` list reports only
+Plain commands and labels come from the consumer's own script. They are trusted shell
+code. Workflow commands are read only through the strict parser described below.
+Plain commands run with `bash -c`, without `eval`, and inherit the consumer's
+environment, but not its unexported shell variables or functions. A plain step's status is its command's last status, so a pipeline or `;` list reports only
 its last part; start such a command with `set -o pipefail` (or `set -e`), or move it
 into a script.
 
 The host supplies `bash`, `mktemp`, `rm` and `tail`; macOS-only steps also need `uname`.
-The touched tier and `--check-map` also need `git`.
+The touched tier and `--check-map` also need `git`. Workflow steps also need `env`.
 The library uses the shell's `pwd` builtin and `SECONDS` clock. Logs can contain any
 output the commands produce. Failed runs retain those logs in a temporary directory;
 the consumer is responsible for removing them after inspection.
@@ -109,6 +109,15 @@ For passing test and contract steps, every output line ending in `, skipped` add
 one skip and is echoed to stdout with four spaces of indentation after the timing
 line. Plain steps do not contribute skips. Other passing output stays in the logs
 until successful completion removes them.
+
+### gate_workflow
+
+`gate_workflow [--dir <directory>] [--pass <VAR>]... [--] <file>`
+
+Registers workflow commands after `gate_init` and before `gate_run`, returning 0
+silently on success. Calls may repeat and mix with `gate_step`; registration order
+is preserved. See “Steps from GitHub Actions workflows” for its grammar, hooks,
+refusals and execution rules.
 
 ### gate_run
 
@@ -281,3 +290,188 @@ a temporary-file failure or a root that is not the physical repository top exits
 for the root mismatch). No steps still
 exits 2 before map checking. Checking runs no step and creates no log directory;
 missing-tool probes are counted and printed to stderr before the final exit 75.
+
+## Steps from GitHub Actions workflows
+
+A consumer can read its local GitHub Actions files instead of maintaining a second
+list of commands. Workflows are executable input: use only repository files you
+trust, and define hooks to allow exactly the jobs and setup the local host can mirror.
+The parser is deliberately a small indentation grammar, not a general YAML reader.
+All parsing and hook decisions happen during `gate_workflow`, including under
+`--list` and `--check-map`, before any step runs. The first problem exits 2.
+
+```bash
+gate_workflow_job() {
+    [ "$1" = ci.yml ] && [ "$2" = build ]
+}
+gate_workflow_uses() {
+    [ "$3" = org/setup@v1 ]
+}
+gate_workflow_env() {
+    if [ "$3" = APPLE ]; then printf '%s' 'a local value'; else return 1; fi
+}
+gate_init --name local-check -- "$@"
+gate_workflow --pass EXTRA_ONE ci.yml
+gate_run
+```
+
+The file argument is exactly one name matching `^[A-Za-z0-9._-]+\.ya?ml$`;
+paths containing `/` are refused. `--dir` defaults to `.github/workflows`. It may
+occur once and must be non-empty with no newline. Relative directories resolve
+from the recorded gate root, even after a directory change; absolute directories
+are accepted. Repeat `--pass` to name variables matching
+`^[A-Za-z_][A-Za-z0-9_]*$`. `--` ends option parsing.
+
+Invalid calls print `<name or gate>: gate_workflow: <reason>` on stderr and exit 2:
+`gate_init has not run`, `invalid workflow file name`, `invalid --dir`,
+`missing or repeated --dir`, `invalid --pass`, `unknown option: <option>`, or
+`expected one workflow file`.
+
+Files are read breadth-first: the entry file's jobs first, then each called local
+reusable workflow in discovery order. Each file is read once per call, so cycles
+end. A job-level `uses: ./.github/workflows/<name>` reads that name from the same
+`--dir`, even when it is a custom directory. The call itself registers no step.
+Every read workflow is added to the gate's own files using the same root-relative
+physical-directory resolution as `gate_init --own`; a workflow change forces the
+full tier. Files outside the root are not added to the own-path list.
+
+### Accepted grammar
+
+Blank lines containing only spaces and comments whose first non-space character
+is `#` are skipped. A carriage return anywhere, or a tab in indentation, is refused.
+For every value, text from the first space or tab followed by `#` is removed, then
+surrounding spaces are trimmed, without interpreting quotes or escapes.
+Thus `run: echo "a # b"` becomes the command `echo "a`, which fails in Bash.
+
+| Indentation | Accepted content |
+| --- | --- |
+| 0 | `---` or `<key>:` with an optional value; keys are `name`, `run-name`, `on`, `permissions`, `concurrency`, `jobs`. Keys match `^[A-Za-z_-]+$`. `jobs:` must have no value. |
+| Under another top-level key | Nested contents are ignored. Top-level `env` and `defaults` are refused. |
+| 2 under `jobs:` | `<job>:` with no value, matching `^[A-Za-z0-9_-]+$`; jobs keep file order. |
+| 4 | A job key matching `^[A-Za-z0-9_-]+$`, with an optional value. |
+| 6 under `env:` | Single-line `<NAME>: <value>` pairs with names matching `^[A-Za-z_][A-Za-z0-9_]*$`; deeper lines are refused. Workflow values are ignored and replaced by the env hook. |
+| 6 under `services:` | `<name>:` with no value, matching `^[A-Za-z0-9_-]+$`; deeper settings are ignored. |
+| 6 under `steps:` | `- <key>: <value>` starts a block-style step. |
+| 8 under a step | `<key>: <value>` continues the same step. |
+| 10 or deeper under step `with:` | Arguments are ignored. |
+
+Built-in job keys are `name`, `needs`, `runs-on`, `steps`, `env`, `services`,
+`permissions`, `timeout-minutes`, `uses`. Other keys require the job-key hook.
+Allowing such a key means the gate ignores the key and its whole nested block,
+including a matrix or condition; the hook must ensure ignoring it is appropriate.
+Nested contents of other built-in keys are ignored except for the specific blocks
+above. Odd indentation under `jobs:` is refused except inside an ignored job-key
+block, service settings deeper than 6, or `with:` arguments at 10 or deeper.
+A top-level line ends the current jobs block.
+
+`runs-on` must match `^[A-Za-z0-9._-]+$`. A `macos-*` label marks every run step
+of the job macOS-only. Only selected steps trigger the existing preflight: off
+macOS it exits 75 before any step runs, naming the step's label. Other plain labels
+impose no operating-system restriction; the gate does not provision a runner.
+A job with steps must have `runs-on`, and cannot also have job-level `uses`.
+Every job must contain at least one run command or a local reusable call.
+
+Step keys are only `name`, `id`, `run`, `uses`, `with`, `timeout-minutes`.
+Every step needs exactly one of `run` and `uses`. Allowed `uses` steps register
+nothing; names, ids, timeouts and setup arguments are ignored. An action reference
+must match `^[A-Za-z0-9._/@:-]+$` and pass its hook. No action is downloaded or run.
+
+A run value is the exact trimmed single-line command, without unquoting or
+unescaping. Empty values and block scalars (`|`, `>` and their modifiers) are
+refused. It cannot start with any of `' " | > [ ] { } & * ! % @` or a backtick,
+`# , ? :`, or `- `; cannot contain `: ` or end in `:`; and cannot contain `${{`.
+This refuses expressions, quoted YAML values, flow collections, anchors and tags.
+Multi-line commands, alternate shells, step conditions, step environments,
+working directories, outputs, matrices, remote reusable workflows, action behavior,
+service provisioning and dependency scheduling are deliberately not mirrored.
+`needs` is ignored: execution is sequential file order, not GitHub's scheduler.
+
+### Consumer hooks
+
+Hooks must be shell functions defined before `gate_workflow`; an undefined hook
+allows nothing. Each runs in a condition with stdin from `/dev/null`, so rejection
+works under `set -euo pipefail` and an `ERR` trap. Stderr passes through unchanged.
+Only the env hook's stdout is used; other hook stdout is discarded.
+Arguments are validated data, never evaluated as shell code.
+
+| Function | Arguments | Return 0 to |
+| --- | --- | --- |
+| `gate_workflow_job` | `<file> <job>` | Mirror the job. |
+| `gate_workflow_job_key` | `<file> <job> <key>` | Ignore an extra job key and its entire nested block. |
+| `gate_workflow_env` | `<file> <job> <name>` | Supply the variable's value on stdout, replacing the workflow value. |
+| `gate_workflow_service` | `<file> <job> <name>` | Accept a service whose stand-in the consumer provides. |
+| `gate_workflow_uses` | `<file> <job> <ref>` | Skip an action whose setup the host already provides. |
+
+Env stdout is captured with `$( )`, which removes trailing newlines. A value that
+still contains a newline is refused. Each job's assignments keep workflow order,
+including when `env:` follows `steps:`.
+
+### Execution and selection
+
+Run steps register as plain steps labelled `<job>: <command>`, with no `--always`
+flag. Lists and touched-map patterns match these labels like any other step; path
+words in labels or commands also select them. Their skip group is `<file>/<job>`,
+so identically named jobs in different workflow files remain independent.
+
+Workflow commands run from the recorded root with stdin `/dev/null`, the same
+private logs and timings as plain steps, using this argv:
+
+```text
+env -i <assignments...> "$BASH" -e -c "<command>"
+```
+
+`$BASH` is the running shell's absolute path. `-e` mirrors GitHub Actions'
+unspecified shell on Linux and macOS, `bash -e {0}`; no pipefail is implied.
+Each assignment is one argv word, never a re-parsed string. In order:
+
+1. The caller's set values of `HOME`, `USER`, `LOGNAME`, `PATH`, `TMPDIR`, `LANG`, `TERM`.
+2. `CI=true`.
+3. Each set `--pass` variable, in call order.
+4. The job env hook's assignments, in workflow order.
+
+Later assignments win. Unset variables are omitted; set empty values remain empty.
+Caller values are taken when `gate_run` starts. Other environment variables and
+exported functions are absent. Plain `gate_step` commands retain their existing
+inherited environment and `bash -c` behavior.
+
+After a red workflow step, later selected steps of the same group print
+`step <n> skipped <label> (an earlier step of job <job> failed)` to stdout. They
+create no log, have no timing, add nothing to the missing-tool skip count, and do
+not appear among the slowest steps. Numbering retains their selected positions.
+Other jobs and plain steps continue. The final red count, logs and exit 1 follow
+the existing contract.
+
+### Workflow refusals
+
+Each refusal prints one stderr line and exits 2: `<name>: <file>: <reason>` for
+file problems, or `<name>: <file>, job <job>: <reason>` for job problems.
+Non-printable bytes in workflow diagnostics become `?`. Physical line numbers
+start at 1. Hook stderr can print additional lines of the consumer's own.
+
+| Problem | Reason |
+| --- | --- |
+| Missing or unreadable file | `workflow not found in <dir as given>` |
+| Carriage return or tab in indentation | `line <n>: a carriage return or a tab` |
+| Unknown top-level key | `line <n>: top-level key '<key>' is not mirrored` |
+| Invalid top-level line or indentation/shape under jobs | `line <n>: cannot be mirrored` |
+| Missing or inline jobs block | `no jobs: block` |
+| Invalid job id or job with an inline value | `line <n>: cannot be mirrored` |
+| Rejected job (file-level) | `job '<job>' is not mirrored; define gate_workflow_job to allow it` |
+| Rejected extra job key | `job key '<key>' is not mirrored` |
+| Inline env, services or steps | `<key> must be a block` |
+| Non-plain runner | `runs-on '<value>' is not a plain runner label` |
+| Steps with no runner | `steps without runs-on` |
+| Non-local reusable call | `uses '<value>' is not a local reusable workflow` |
+| Job has steps and a call | `both steps and uses` |
+| Job has neither run commands nor a call | `no run: steps to mirror` |
+| Rejected env name or multiline hook value | `env variable <name> is not mirrored` |
+| Invalid or nested env pair | `line <n>: env must be single-line NAME: value pairs` |
+| Rejected service | `service '<name>' is not mirrored` |
+| Flow or bare step | `line <n>: write the step in block style` |
+| Unknown step key | `step key '<key>' is not mirrored` |
+| Empty or block-scalar run | `line <n>: a multi-line run: step` |
+| Non-plain run scalar | `line <n>: run: is not a plain one-line value` |
+| Expression in run | `line <n>: run: uses an expression` |
+| Rejected or malformed action reference | `step uses '<value>' is not mirrored` |
+| Step with neither or both run and uses | `line <n>: a step needs exactly one of run: and uses:` |
+| No run command across the entry and called files | `no run: steps found` (entry file) |

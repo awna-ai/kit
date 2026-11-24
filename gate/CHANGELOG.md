@@ -4,6 +4,11 @@
 
 ### Added
 
+- `gate_workflow` reads ordered single-line commands from GitHub Actions workflows and local reusable workflows.
+- Consumer hooks allow jobs, extra job keys, environment variables, services and setup steps explicitly.
+- Workflow commands run with `bash -e` in a scrubbed environment, with optional passed variables and job values.
+- A failed workflow step skips the remaining selected steps of its job while other jobs and plain steps continue.
+
 - Repeatable `gate_init --own <path>` names consumer files that force the full tier when changed.
 - `gate_init --map` opts a consumer into map-based selection and validation.
 - `gate_init --base` chooses the local ref used to measure changes.

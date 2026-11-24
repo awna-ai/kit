@@ -136,6 +136,13 @@ gate_init() {
     _GATE_KINDS=()
     _GATE_MAC=()
     _GATE_ALWAYS=()
+    _GATE_STEP_JOBS=()
+    _GATE_STEP_ENV_START=()
+    _GATE_STEP_ENV_COUNT=()
+    _GATE_STEP_PASS_START=()
+    _GATE_STEP_PASS_COUNT=()
+    _GATE_ENV=()
+    _GATE_PASSES=()
     return 0
 }
 
@@ -160,7 +167,7 @@ gate_require() {
 }
 
 gate_step() {
-    local kind=plain mac=0 always=0 label command
+    local kind=plain mac=0 always=0
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --test|--contract)
@@ -183,8 +190,12 @@ gate_step() {
         esac
     done
     if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then _gate_error gate_step 'expected a label and optional command'; fi
-    label=$1
-    command=${2-$label}
+    _gate_register_step "$kind" "$mac" "$always" "$1" "${2-$1}"
+}
+
+# Share validation and storage without treating a workflow label as an option.
+_gate_register_step() {
+    local kind=$1 mac=$2 always=$3 label=$4 command=$5
     if [ -z "$label" ] || [ -z "$command" ] || [[ "$label$command" == *$'\n'* ]]; then
         _gate_error gate_step 'label and command must be non-empty single lines'
     fi
@@ -193,6 +204,11 @@ gate_step() {
     _GATE_KINDS[${#_GATE_KINDS[@]}]=$kind
     _GATE_MAC[${#_GATE_MAC[@]}]=$mac
     _GATE_ALWAYS[${#_GATE_ALWAYS[@]}]=$always
+    _GATE_STEP_JOBS[${#_GATE_STEP_JOBS[@]}]=''
+    _GATE_STEP_ENV_START[${#_GATE_STEP_ENV_START[@]}]=0
+    _GATE_STEP_ENV_COUNT[${#_GATE_STEP_ENV_COUNT[@]}]=0
+    _GATE_STEP_PASS_START[${#_GATE_STEP_PASS_START[@]}]=0
+    _GATE_STEP_PASS_COUNT[${#_GATE_STEP_PASS_COUNT[@]}]=0
     return 0
 }
 
@@ -201,6 +217,331 @@ _gate_printable() {
     local LC_ALL=C
     local text=$1
     printf '%s' "${text//[!\ -\~]/?}"
+}
+
+_gate_workflow_error() {
+    local context=$1 reason
+    if [ -n "$2" ]; then context="$context, job $2"; fi
+    context=$(_gate_printable "$context")
+    reason=$(_gate_printable "$3")
+    _gate_error "$context" "$reason"
+}
+
+_gate_workflow_hook() {
+    local hook=$1
+    shift
+    if declare -F "$hook" > /dev/null; then
+        if "$hook" "$@" < /dev/null; then return 0; fi
+    fi
+    return 1
+}
+
+# The parser helpers use the file reader's dynamically scoped job and step state.
+_gate_workflow_finish_step() {
+    if [ "$step_line" -eq 0 ]; then return 0; fi
+    if [ "$((step_run + step_uses))" -ne 1 ]; then
+        _gate_workflow_error "$file" "$job" "line $step_line: a step needs exactly one of run: and uses:"
+    fi
+    if [ "$step_run" -eq 1 ]; then commands[${#commands[@]}]=$command; fi
+    step_line=0 step_run=0 step_uses=0 step_key='' command=''
+    return 0
+}
+
+_gate_workflow_finish_job() {
+    if [ -z "$job" ]; then return 0; fi
+    _gate_workflow_finish_step
+    if [ "$has_steps" -eq 1 ] && [ "$has_call" -eq 1 ]; then
+        _gate_workflow_error "$file" "$job" 'both steps and uses'
+    fi
+    if [ "$has_steps" -eq 1 ] && [ -z "$runner" ]; then
+        _gate_workflow_error "$file" "$job" 'steps without runs-on'
+    fi
+    if [ "${#commands[@]}" -eq 0 ] && [ "$has_call" -eq 0 ]; then
+        _gate_workflow_error "$file" "$job" 'no run: steps to mirror'
+    fi
+    local item index mac=0
+    case "$runner" in macos-*) mac=1 ;; esac
+    for item in "${commands[@]+"${commands[@]}"}"; do
+        index=${#_GATE_LABELS[@]}
+        _gate_register_step plain "$mac" 0 "$job: $item" "$item"
+        _GATE_STEP_JOBS[index]="$file/$job"
+        _GATE_STEP_ENV_START[index]=${#_GATE_ENV[@]}
+        _GATE_STEP_ENV_COUNT[index]=${#job_env[@]}
+        _GATE_STEP_PASS_START[index]=${#_GATE_PASSES[@]}
+        _GATE_STEP_PASS_COUNT[index]=${#passes[@]}
+        _GATE_ENV=("${_GATE_ENV[@]+"${_GATE_ENV[@]}"}" "${job_env[@]+"${job_env[@]}"}")
+        _GATE_PASSES=("${_GATE_PASSES[@]+"${_GATE_PASSES[@]}"}" "${passes[@]+"${passes[@]}"}")
+    done
+    job='' job_key='' runner='' has_steps=0 has_call=0
+    commands=() job_env=()
+    return 0
+}
+
+_gate_workflow_value() {
+    local value=$1
+    value=${value%%[$' \t']#*}
+    value=${value#"${value%%[! ]*}"}
+    value=${value%"${value##*[! ]}"}
+    printf '%s' "$value"
+}
+
+_gate_workflow_file() {
+    local file=$1 directory=$2 given_dir=$3 path resolved
+    local line text leading indent number=0 in_jobs=0 saw_jobs=0 top_key='' job='' job_key='' runner=''
+    local has_steps=0 has_call=0 step_line=0 step_run=0 step_uses=0 step_key='' command=''
+    local key value name item duplicate
+    local commands=() job_env=()
+    path="$directory/$file"
+    if [ ! -f "$path" ] || [ ! -r "$path" ]; then
+        _gate_workflow_error "$file" '' "workflow not found in $given_dir"
+    fi
+    if resolved=$(_gate_physical_file "$path"); then
+        case "$resolved" in
+            "${_GATE_ROOT%/}"/*)
+                _GATE_OWN_PATHS[${#_GATE_OWN_PATHS[@]}]=${resolved#"${_GATE_ROOT%/}/"}
+                ;;
+        esac
+    fi
+    while IFS= read -r line || [ -n "$line" ]; do
+        number=$((number + 1))
+        leading=${line%%[!$' \t']*}
+        if [[ "$line" == *$'\r'* || "$leading" == *$'\t'* ]]; then
+            _gate_workflow_error "$file" '' "line $number: a carriage return or a tab"
+        fi
+        text=${line#"$leading"}
+        case "$text" in ''|\#*) continue ;; esac
+        indent=${#leading}
+        if [ "$indent" -eq 0 ]; then
+            _gate_workflow_finish_job
+            in_jobs=0 top_key=''
+            if [ "$text" = --- ]; then continue; fi
+            if [[ ! "$text" =~ ^([A-Za-z_-]+):( .*)?$ ]]; then
+                _gate_workflow_error "$file" '' "line $number: cannot be mirrored"
+            fi
+            key=${BASH_REMATCH[1]}
+            top_key=$key
+            value=$(_gate_workflow_value "${text#*:}")
+            case "$key" in
+                jobs)
+                    if [ -n "$value" ]; then _gate_workflow_error "$file" '' 'no jobs: block'; fi
+                    in_jobs=1 saw_jobs=1
+                    ;;
+                name|run-name|on|permissions|concurrency) ;;
+                *) _gate_workflow_error "$file" '' "line $number: top-level key '$key' is not mirrored" ;;
+            esac
+            continue
+        fi
+        if [ "$in_jobs" -eq 0 ]; then
+            if [ -z "$top_key" ]; then _gate_workflow_error "$file" '' "line $number: cannot be mirrored"; fi
+            continue
+        fi
+        if [ "$indent" -eq 2 ]; then
+            _gate_workflow_finish_job
+            if [[ ! "$text" =~ ^([A-Za-z0-9_-]+):( .*)?$ ]]; then
+                _gate_workflow_error "$file" '' "line $number: cannot be mirrored"
+            fi
+            name=${BASH_REMATCH[1]}
+            value=$(_gate_workflow_value "${text#*:}")
+            if [ -n "$value" ]; then _gate_workflow_error "$file" '' "line $number: cannot be mirrored"; fi
+            if ! _gate_workflow_hook gate_workflow_job "$file" "$name" > /dev/null; then
+                _gate_workflow_error "$file" '' "job '$name' is not mirrored; define gate_workflow_job to allow it"
+            fi
+            job=$name
+            continue
+        fi
+        if [ -z "$job" ]; then _gate_workflow_error "$file" '' "line $number: cannot be mirrored"; fi
+        if [ "$indent" -eq 4 ]; then
+            _gate_workflow_finish_step
+            if [[ ! "$text" =~ ^([A-Za-z0-9_-]+):( .*)?$ ]]; then
+                _gate_workflow_error "$file" "$job" "line $number: cannot be mirrored"
+            fi
+            key=${BASH_REMATCH[1]}
+            value=$(_gate_workflow_value "${text#*:}")
+            job_key=$key
+            case "$key" in
+                name|needs|permissions|timeout-minutes) ;;
+                runs-on)
+                    if [[ ! "$value" =~ ^[A-Za-z0-9._-]+$ ]]; then
+                        _gate_workflow_error "$file" "$job" "runs-on '$value' is not a plain runner label"
+                    fi
+                    runner=$value
+                    ;;
+                env|services|steps)
+                    if [ -n "$value" ]; then _gate_workflow_error "$file" "$job" "$key must be a block"; fi
+                    if [ "$key" = steps ]; then has_steps=1; fi
+                    ;;
+                uses)
+                    name=${value#./.github/workflows/}
+                    if [ "$name" = "$value" ] || [[ ! "$name" =~ ^[A-Za-z0-9._-]+\.ya?ml$ ]]; then
+                        _gate_workflow_error "$file" "$job" "uses '$value' is not a local reusable workflow"
+                    fi
+                    has_call=1 duplicate=0
+                    for item in "${_GATE_WORKFLOW_QUEUE[@]+"${_GATE_WORKFLOW_QUEUE[@]}"}"; do
+                        if [ "$name" = "$item" ]; then duplicate=1; break; fi
+                    done
+                    if [ "$duplicate" -eq 0 ]; then _GATE_WORKFLOW_QUEUE[${#_GATE_WORKFLOW_QUEUE[@]}]=$name; fi
+                    ;;
+                *)
+                    if ! _gate_workflow_hook gate_workflow_job_key "$file" "$job" "$key" > /dev/null; then
+                        _gate_workflow_error "$file" "$job" "job key '$key' is not mirrored"
+                    fi
+                    ;;
+            esac
+            continue
+        fi
+        # Only the nested blocks below can ignore otherwise invalid indentation.
+        if [ "$indent" -gt 4 ]; then
+            case "$job_key" in
+                env)
+                    if [ "$indent" -ne 6 ] || [[ ! "$text" =~ ^([A-Za-z_][A-Za-z0-9_]*):( .*)?$ ]]; then
+                        _gate_workflow_error "$file" "$job" "line $number: env must be single-line NAME: value pairs"
+                    fi
+                    name=${BASH_REMATCH[1]}
+                    if ! value=$(_gate_workflow_hook gate_workflow_env "$file" "$job" "$name") || [[ "$value" == *$'\n'* ]]; then
+                        _gate_workflow_error "$file" "$job" "env variable $name is not mirrored"
+                    fi
+                    job_env[${#job_env[@]}]="$name=$value"
+                    continue
+                    ;;
+                services)
+                    if [ "$indent" -gt 6 ]; then continue; fi
+                    if [ "$indent" -ne 6 ] || [[ ! "$text" =~ ^([A-Za-z0-9_-]+):( .*)?$ ]]; then
+                        _gate_workflow_error "$file" "$job" "line $number: cannot be mirrored"
+                    fi
+                    name=${BASH_REMATCH[1]}
+                    value=$(_gate_workflow_value "${text#*:}")
+                    if [ -n "$value" ]; then _gate_workflow_error "$file" "$job" "line $number: cannot be mirrored"; fi
+                    if ! _gate_workflow_hook gate_workflow_service "$file" "$job" "$name" > /dev/null; then
+                        _gate_workflow_error "$file" "$job" "service '$name' is not mirrored"
+                    fi
+                    continue
+                    ;;
+                steps) ;;
+                '') ;;
+                *) continue ;;
+            esac
+        fi
+        if [ "$job_key" != steps ]; then _gate_workflow_error "$file" "$job" "line $number: cannot be mirrored"; fi
+        if [ "$indent" -ge 10 ] && [ "$step_key" = with ]; then continue; fi
+        if [ "$indent" -eq 6 ]; then
+            _gate_workflow_finish_step
+            if [[ "$text" == '- {'* ]] || [ "$text" = - ]; then
+                _gate_workflow_error "$file" "$job" "line $number: write the step in block style"
+            fi
+            if [[ "$text" != '- '* ]]; then _gate_workflow_error "$file" "$job" "line $number: cannot be mirrored"; fi
+            text=${text#- }
+            step_line=$number
+        elif [ "$indent" -ne 8 ] || [ "$step_line" -eq 0 ]; then
+            _gate_workflow_error "$file" "$job" "line $number: cannot be mirrored"
+        fi
+        if [[ ! "$text" =~ ^([A-Za-z0-9_-]+):( .*)?$ ]]; then
+            _gate_workflow_error "$file" "$job" "line $number: cannot be mirrored"
+        fi
+        key=${BASH_REMATCH[1]}
+        value=$(_gate_workflow_value "${text#*:}")
+        step_key=$key
+        case "$key" in
+            name|id|with|timeout-minutes) ;;
+            run)
+                case "$value" in
+                    ''|\|*|\>*) _gate_workflow_error "$file" "$job" "line $number: a multi-line run: step" ;;
+                    [\'\"\[\]\{\}\&\*\!%\@\`\#\,\?:]*|'- '*|*': '*|*:)
+                        _gate_workflow_error "$file" "$job" "line $number: run: is not a plain one-line value"
+                        ;;
+                esac
+                # shellcheck disable=SC2016 # The expression marker is data.
+                if [[ "$value" == *'${{'* ]]; then
+                    _gate_workflow_error "$file" "$job" "line $number: run: uses an expression"
+                fi
+                step_run=1 command=$value
+                ;;
+            uses)
+                if [[ ! "$value" =~ ^[A-Za-z0-9._/@:-]+$ ]] ||
+                    ! _gate_workflow_hook gate_workflow_uses "$file" "$job" "$value" > /dev/null; then
+                    _gate_workflow_error "$file" "$job" "step uses '$value' is not mirrored"
+                fi
+                step_uses=1
+                ;;
+            *) _gate_workflow_error "$file" "$job" "step key '$key' is not mirrored" ;;
+        esac
+    done < "$path"
+    _gate_workflow_finish_job
+    if [ "$saw_jobs" -eq 0 ]; then _gate_workflow_error "$file" '' 'no jobs: block'; fi
+    return 0
+}
+
+gate_workflow() {
+    if [ "$_GATE_INITIALIZED" -eq 0 ]; then _gate_error gate_workflow 'gate_init has not run'; fi
+    local directory=.github/workflows given_dir dir_seen=0 file index before=${#_GATE_LABELS[@]}
+    local passes=()
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --dir)
+                if [ "$dir_seen" -eq 1 ] || [ "$#" -lt 2 ]; then _gate_error gate_workflow 'missing or repeated --dir'; fi
+                directory=$2 dir_seen=1
+                if [ -z "$directory" ] || [[ "$directory" == *$'\n'* ]]; then _gate_error gate_workflow 'invalid --dir'; fi
+                shift 2
+                ;;
+            --pass)
+                if [ "$#" -lt 2 ] || [[ ! "$2" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then _gate_error gate_workflow 'invalid --pass'; fi
+                passes[${#passes[@]}]=$2
+                shift 2
+                ;;
+            --) shift; break ;;
+            -*) _gate_error gate_workflow "unknown option: $1" ;;
+            *) break ;;
+        esac
+    done
+    if [ "$#" -ne 1 ]; then _gate_error gate_workflow 'expected one workflow file'; fi
+    file=$1
+    if [[ ! "$file" =~ ^[A-Za-z0-9._-]+\.ya?ml$ ]]; then _gate_error gate_workflow 'invalid workflow file name'; fi
+    given_dir=$directory
+    case "$directory" in /*) ;; *) directory="$_GATE_ROOT/$directory" ;; esac
+    _GATE_WORKFLOW_QUEUE=("$file")
+    for ((index = 0; index < ${#_GATE_WORKFLOW_QUEUE[@]}; index++)); do
+        _gate_workflow_file "${_GATE_WORKFLOW_QUEUE[index]}" "$directory" "$given_dir"
+    done
+    if [ "${#_GATE_LABELS[@]}" -eq "$before" ]; then _gate_workflow_error "$file" '' 'no run: steps found'; fi
+    return 0
+}
+
+# Snapshot the caller's environment before gate_run introduces local variables.
+_gate_workflow_environment() {
+    local _GATE_EXEC_NAME
+    _GATE_BASE_ENV=()
+    _GATE_PASS_VALUES=()
+    _GATE_PASS_SET=()
+    for _GATE_EXEC_NAME in HOME USER LOGNAME PATH TMPDIR LANG TERM; do
+        if [ "${!_GATE_EXEC_NAME+set}" = set ]; then
+            _GATE_BASE_ENV[${#_GATE_BASE_ENV[@]}]="$_GATE_EXEC_NAME=${!_GATE_EXEC_NAME}"
+        fi
+    done
+    _GATE_BASE_ENV[${#_GATE_BASE_ENV[@]}]=CI=true
+    for _GATE_EXEC_NAME in "${_GATE_PASSES[@]+"${_GATE_PASSES[@]}"}"; do
+        _GATE_PASS_SET[${#_GATE_PASS_SET[@]}]=${!_GATE_EXEC_NAME+set}
+        _GATE_PASS_VALUES[${#_GATE_PASS_VALUES[@]}]="$_GATE_EXEC_NAME=${!_GATE_EXEC_NAME-}"
+    done
+    return 0
+}
+
+_gate_command() {
+    if [ -z "${_GATE_STEP_JOBS[$1]}" ]; then
+        bash -c "${_GATE_COMMANDS[$1]}"
+        return "$?"
+    fi
+    local index=$1 start count offset
+    local assignments=("${_GATE_BASE_ENV[@]+"${_GATE_BASE_ENV[@]}"}")
+    start=${_GATE_STEP_PASS_START[index]} count=${_GATE_STEP_PASS_COUNT[index]}
+    for ((offset = 0; offset < count; offset++)); do
+        if [ "${_GATE_PASS_SET[start + offset]}" = set ]; then
+            assignments[${#assignments[@]}]=${_GATE_PASS_VALUES[start + offset]}
+        fi
+    done
+    start=${_GATE_STEP_ENV_START[index]} count=${_GATE_STEP_ENV_COUNT[index]}
+    for ((offset = 0; offset < count; offset++)); do
+        assignments[${#assignments[@]}]=${_GATE_ENV[start + offset]}
+    done
+    env -i "${assignments[@]+"${assignments[@]}"}" "$BASH" -e -c "${_GATE_COMMANDS[index]}"
 }
 
 _gate_root_is_top() {
@@ -453,7 +794,7 @@ _gate_slowest() {
     for ((rank = 0; rank < count && rank < 5; rank++)); do
         best=-1
         for ((position = 0; position < count; position++)); do
-            index=${_GATE_SELECTED[position]}
+            index=${_GATE_RAN_STEPS[position]}
             if [ "${selected[index]:-0}" -eq 0 ]; then
                 if [ "$best" -lt 0 ] || [ "${_GATE_TIMES[index]}" -gt "${_GATE_TIMES[best]}" ]; then
                     best=$index
@@ -467,9 +808,12 @@ _gate_slowest() {
 }
 
 gate_run() {
+    _gate_workflow_environment
     local total=${#_GATE_LABELS[@]} index position os logdir='' log started status outcome
-    local ran=0 red=0 stop=''
+    local ran=0 red=0 stop='' _GATE_RUN_JOB _GATE_RUN_PREVIOUS _GATE_RUN_SKIP
+    local _GATE_FAILED_JOBS=()
     _GATE_TIMES=()
+    _GATE_RAN_STEPS=()
     if [ "$total" -eq 0 ]; then
         printf '%s: no steps registered\n' "$GATE_NAME" >&2
         exit 2
@@ -505,15 +849,27 @@ gate_run() {
     for ((position = 0; position < total; position++)); do
         index=${_GATE_SELECTED[position]}
         ran=$((position + 1))
+        _GATE_RUN_JOB=${_GATE_STEP_JOBS[index]}
+        _GATE_RUN_SKIP=0
+        if [ -n "$_GATE_RUN_JOB" ]; then
+            for _GATE_RUN_PREVIOUS in "${_GATE_FAILED_JOBS[@]+"${_GATE_FAILED_JOBS[@]}"}"; do
+                if [ "$_GATE_RUN_PREVIOUS" = "$_GATE_RUN_JOB" ]; then _GATE_RUN_SKIP=1; break; fi
+            done
+        fi
+        if [ "$_GATE_RUN_SKIP" -eq 1 ]; then
+            printf 'step %s skipped %s (an earlier step of job %s failed)\n' "$ran" "${_GATE_LABELS[index]}" "${_GATE_RUN_JOB#*/}"
+            continue
+        fi
         log="$logdir/step-$ran.log"
         started=$SECONDS
         status=0
-        if (cd "$_GATE_ROOT" && bash -c "${_GATE_COMMANDS[index]}") < /dev/null > "$log" 2>&1; then
+        if (cd "$_GATE_ROOT" && _gate_command "$index") < /dev/null > "$log" 2>&1; then
             status=0
         else
             status=$?
         fi
         _GATE_TIMES[index]=$((SECONDS - started))
+        _GATE_RAN_STEPS[${#_GATE_RAN_STEPS[@]}]=$index
         printf 'step %s %ss %s\n' "$ran" "${_GATE_TIMES[index]}" "${_GATE_LABELS[index]}"
         outcome=red
         if [ "$status" -eq 0 ]; then
@@ -531,6 +887,7 @@ gate_run() {
                 ;;
             red)
                 red=$((red + 1))
+                if [ -n "$_GATE_RUN_JOB" ]; then _GATE_FAILED_JOBS[${#_GATE_FAILED_JOBS[@]}]=$_GATE_RUN_JOB; fi
                 printf 'FAIL: %s (whole log: %s)\n' "${_GATE_LABELS[index]}" "$log" >&2
                 _gate_tail "$log"
                 ;;
@@ -547,7 +904,7 @@ gate_run() {
                 ;;
         esac
     done
-    if [ "$ran" -gt 0 ]; then _gate_slowest "$ran"; fi
+    if [ "${#_GATE_RAN_STEPS[@]}" -gt 0 ]; then _gate_slowest "${#_GATE_RAN_STEPS[@]}"; fi
     if [ "$stop" = internal ]; then
         printf '%s: internal error (logs: %s)\n' "$GATE_NAME" "$logdir" >&2
         exit 2

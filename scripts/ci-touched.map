@@ -13,6 +13,7 @@ rust-toolchain.toml         cargo *
 gate/*.sh                   shellcheck *
 gate/*.sh                   bash tests/gate_lib_test.sh
 gate/*.sh                   bash tests/ci_local_test.sh
+gate/*.sh                   bash tests/gate_workflow_test.sh
 gate/*.md                   -
 gate/VERSION                -
 scripts/*.sh                shellcheck *
