@@ -355,6 +355,25 @@ for changed in Cargo.lock tests/a_test.sh gate/.cargo/config.toml .ai/.cargo/con
     fi
 done
 
+new_case
+mkdir "$repo/tests"
+for test_name in gate_lib ci_local term_check secret_scan deps_check; do
+    printf 'exit 0\n' > "$repo/tests/${test_name}_test.sh"
+done
+cp "$root/scripts/ci-touched.map" "$repo/scripts/"
+git -C "$repo" add .
+git -C "$repo" -c user.name=Test -c user.email=test@example.invalid -c commit.gpgsign=false commit -qm 'Record a fixture.'
+git -C "$repo" update-ref refs/remotes/origin/main HEAD
+printf '# changed\n' >> "$repo/scripts/ci-local.sh"
+selected=$(cd "$repo/scripts" && PATH="$repo/bin" bash ci-local.sh --tier touched --list 2> "$tmp/touched-notice")
+selected_status=$?
+wanted=$(PATH="$repo/bin" bash "$repo/scripts/ci-local.sh" --list)
+if [ "$selected_status" -ne 0 ] || [ "$selected" != "$wanted" ] ||
+    ! grep -F -qx "ci-local: tier touched falls back to the full tier: scripts/ci-local.sh is one of the gate's own files" "$tmp/touched-notice"; then
+    printf 'ci_local_test: FAIL touched-own-relative\n'
+    failed=1
+fi
+
 # shellcheck disable=SC2016
 if [ -x /bin/bash ] && [ "$(/bin/bash -c 'printf %s "${BASH_VERSINFO[0]}"')" != "$(bash -c 'printf %s "${BASH_VERSINFO[0]}"')" ]; then
     for fixture in metacharacters space msrv-quoted; do

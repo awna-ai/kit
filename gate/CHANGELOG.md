@@ -4,6 +4,7 @@
 
 ### Added
 
+- Repeatable `gate_init --own <path>` names consumer files that force the full tier when changed.
 - `gate_init --map` opts a consumer into map-based selection and validation.
 - `gate_init --base` chooses the local ref used to measure changes.
 - `--tier touched` selects steps for working-tree and committed changes, falling back to the full tier on uncertainty.
@@ -17,6 +18,9 @@
 
 ### Fixed
 
+- Record consumer files explicitly with `--own`, independent of relative invocation and directory changes.
+- Silence directory-resolution errors for own paths that cannot be resolved.
+- Require a slash or a dot followed by a letter in both path word rules, so cargo fragments do not map root files.
 - Resolve the base to one full commit ref, refusing ambiguous names, and compare from its merge base.
 - Include submodule changes despite ignore settings, use repository-relative paths and require the physical repository top.
 - Select file names containing spaces from labels and require `/` or `.` in individual path words.

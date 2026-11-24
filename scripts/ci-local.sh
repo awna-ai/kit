@@ -8,7 +8,7 @@ trap 'exit 2' ERR
 cd "$(dirname "$0")/.."
 # shellcheck source=gate/lib.sh
 . gate/lib.sh
-gate_init --name ci-local --strict-var KIT_STRICT --map scripts/ci-touched.map -- "$@"
+gate_init --name ci-local --strict-var KIT_STRICT --map scripts/ci-touched.map --own scripts/ci-local.sh -- "$@"
 
 shopt -s nullglob
 if gate_require shellcheck 'the shell checks'; then

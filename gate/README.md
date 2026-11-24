@@ -42,7 +42,7 @@ the consumer is responsible for removing them after inspection.
 
 ### gate_init
 
-`gate_init --name <name> [--strict-var <VAR>] [--map <path>] [--base <ref>] [--] [<consumer arguments>...]`
+`gate_init --name <name> [--strict-var <VAR>] [--map <path>] [--base <ref>] [--own <path>]... [--] [<consumer arguments>...]`
 
 Call exactly once before the other functions; a second call exits 2 with
 `<name>: gate_init: called twice`. It records `pwd -P` as the root where every
@@ -161,8 +161,8 @@ record the root or remove logs exits 2 with a diagnostic on stderr.
 ## The touched tier
 
 Opt in with `gate_init --name <name> --map <path> [--base <ref>] -- "$@"`.
-Every initialization option may occur at most once. The map path must be non-empty
-and contain no newline. Relative paths are resolved from the recorded repository
+Every initialization option except `--own` may occur at most once. The map path
+must be non-empty and contain no newline. Relative paths are resolved from the recorded repository
 root; absolute paths are allowed. The map is read only by `gate_run`, so a missing
 map is not an initialization error. The base defaults to `origin/main` and must
 match `^[A-Za-z0-9][A-Za-z0-9._/-]*$`; invalid values exit 2. A base without a map
@@ -213,16 +213,24 @@ before listing or running steps. A signal between creation and removal can leave
 one 0600 file there; the library installs no cleanup trap.
 
 Every matching map line selects every matching step label; `-` does not cancel
-other matches. Changes to the map, the consumer script or the sourced library
-always run the full tier, even with a matching `* -` row. These paths are recorded
-relative to the root at initialization, with directories resolved physically;
-files outside the root are ignored for this rule.
+other matches. Changes to the map, the sourced library or any file named by
+`gate_init --own <path>` always run the full tier, even with a matching `* -` row.
+A consumer names its own script with `--own`, for example `--own scripts/check.sh`;
+the library never guesses that path from the invocation. Repeat `--own` to name
+additional files. Each value must be non-empty and contain no newline; a missing
+or invalid value is a `gate_init` error (exit 2). Paths are resolved from the
+recorded root at initialization, with directories resolved physically; paths
+outside the root or whose directories cannot be resolved are silently ignored.
+The map and sourced library are added automatically.
 
 A step also maps and selects a changed path when a word of its label or command
-equals the path exactly and holds a `/` or a `.`. Bare words such as `warnings`
-do not map root files. Words use `read -r -a` with default whitespace splitting,
-without pathname expansion or shell quote interpretation. A path containing spaces
-also matches a space-delimited run in the label: `bash tests/my ok_test.sh` names
+equals the path exactly and holds a `/` or matches `*.[A-Za-z]*` (a dot followed
+by a letter, as in a file extension). Bare words such as `warnings` and cargo
+fragments such as `-D warnings` or `+1.99.0` do not map root files. Words use
+`read -r -a` with default whitespace splitting, without pathname expansion or
+shell quote interpretation. A path containing spaces
+also matches a space-delimited run in the label when the path passes that same
+slash-or-extension test: `bash tests/my ok_test.sh` names
 `tests/my ok_test.sh`. `--always`
 steps are selected even with no changes. Selected steps run once, in registration
 order. The notice is `<name>: tier touched, <p> paths changed, <s> steps` on stdout,
@@ -242,7 +250,7 @@ The first uncertainty falls back to every registered step, in this order:
 | Merge-base fails or no base ref resolves | `no merge base with <base>` |
 | Change listing or temporary-file creation fails | `could not list the change` |
 | A changed path has bytes outside printable ASCII, a double quote or a backslash | `a changed path has a character the map cannot match` |
-| A changed path is the map, consumer or library | `<path> is one of the gate's own files` |
+| A changed path is the map, library or a file named by `--own` | `<path> is one of the gate's own files` |
 | A path matches neither a map line nor a step path | `<path> has no entry in <map>` |
 
 Map problems use physical line numbers starting at 1 and the map path exactly as

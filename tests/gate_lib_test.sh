@@ -545,7 +545,7 @@ cd docs' "$consumer" > "$case_dir/replaced"
         # Use an in-repository library and a tracked consumer for these cases.
         mkdir "$case_dir/gate"
         cp "$root/gate/lib.sh" "$case_dir/gate/lib.sh"
-        sed "s|$root/gate/lib.sh|$case_dir/gate/lib.sh|" "$consumer" > "$case_dir/replaced"
+        sed -e "s|$root/gate/lib.sh|$case_dir/gate/lib.sh|" -e 's/--map map/--map map --own consumer.sh/' "$consumer" > "$case_dir/replaced"
         mv "$case_dir/replaced" "$consumer"
         printf 'gate_run\n' >> "$consumer"
         git -C "$case_dir" add -f consumer.sh
@@ -645,6 +645,7 @@ STUB
 }
 
 touched_safety_cases() {
+    own_path_cases
     touched_fixture
     printf 'changed\n' > "$case_dir/docs/notes.md"
     git -C "$case_dir" add docs
@@ -658,7 +659,65 @@ touched_safety_cases() {
     expect strict-good-map 0 't: map ok' 't: map ok' --check-map
 }
 
+# Explicit own paths survive a consumer changing to its root before initialization.
+own_path_cases() {
+    local invocation changed start script actual reason
+    for invocation in parent local; do
+        touched_fixture
+        printf '* -\n' > "$case_dir/map"
+        sed 's/--map map/--map map --own consumer.sh --own docs\/settings.sh --own absent\/file.sh/' "$consumer" > "$case_dir/replaced"
+        mv "$case_dir/replaced" "$consumer"
+        { printf 'cd "%s"\n' "$case_dir"; cat "$consumer"; } > "$case_dir/replaced"
+        mv "$case_dir/replaced" "$consumer"
+        printf 'gate_run\n' >> "$consumer"
+        printf ':\n' > "$case_dir/docs/settings.sh"
+        git -C "$case_dir" add -f consumer.sh
+        record_fixture
+        start=$case_dir
+        script=consumer.sh
+        if [ "$invocation" = parent ]; then start="$case_dir/docs"; script=../consumer.sh; fi
+        for changed in consumer.sh docs/settings.sh; do
+            printf '# changed\n' >> "$case_dir/$changed"
+            output=$(cd "$start" && PATH="$tmp/bin" TMPDIR="$case_dir/logs" "$runner" "$script" --tier touched --list 2>&1)
+            actual=$?
+            check "explicit-own-$invocation-$changed-status" test "$actual" -eq 0
+            check "explicit-own-$invocation-$changed-reason" test "${output#*"$changed is one of the gate's own files"}" != "$output"
+            check "explicit-own-$invocation-$changed-no-cd" test "${output#*cd:}" = "$output"
+            check "explicit-own-$invocation-$changed-labels" test "${output##*$'\n'}" = step-two
+            record_fixture
+        done
+    done
+    for changed in empty newline missing; do
+        new_case
+        case "$changed" in
+            empty) printf 'gate_init --name t --own ""\n' >> "$consumer" ;;
+            newline) printf 'gate_init --name t --own $'"'bad\\nfile'"'\n' >> "$consumer" ;;
+            missing) printf 'gate_init --name t --own\n' >> "$consumer" ;;
+        esac
+        reason='invalid --own'
+        if [ "$changed" = missing ]; then reason='missing --own'; fi
+        expect "invalid-own-$changed" 2 "t: gate_init: $reason" ''
+    done
+}
+
+path_word_cases() {
+    local path
+    for path in '-D warnings' '+1.99.0'; do
+        touched_fixture
+        printf x > "$case_dir/$path"
+        printf 'gate_step "cargo clippy -- -D warnings" :\ngate_step "cargo +1.99.0 check" :\n' >> "$consumer"
+        touched_run "non-path-$path" "$path has no entry in map" "$(printf 'one\ntwo')"
+    done
+    touched_fixture
+    mkdir "$case_dir/scripts"
+    printf x > "$case_dir/scripts/x.sh"
+    printf 'gate_step "bash scripts/x.sh" '\''printf "path\\n" >> marker'\''\n' >> "$consumer"
+    touched_run slash-word 't: tier touched, 1 paths changed, 1 steps' path
+}
+
 consumer_cases() {
+    own_path_cases
+    path_word_cases
     touched_fixup_cases
     touched_contract_cases
     touched_cases

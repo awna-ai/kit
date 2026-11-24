@@ -13,7 +13,7 @@ _gate_physical_file() {
         */*) directory=${path%/*}; if [ -z "$directory" ]; then directory=/; fi ;;
         *) directory=. ;;
     esac
-    if ! directory=$(cd "$directory" && pwd -P); then return 1; fi
+    if ! directory=$(cd "$directory" 2> /dev/null && pwd -P); then return 1; fi
     printf '%s/%s\n' "${directory%/}" "${path##*/}"
 }
 if ! _GATE_LIBRARY_SOURCE=$(_gate_physical_file "${BASH_SOURCE[0]}"); then
@@ -38,6 +38,7 @@ gate_init() {
     if [ "$_GATE_INITIALIZED" -eq 1 ]; then _gate_error gate_init 'called twice'; fi
     _GATE_INITIALIZED=1
     local name='' strict_var='' tier_seen=0 map_seen=0 base_seen=0 argument_count
+    local own_files=()
     _GATE_MAP=''
     _GATE_BASE=origin/main
     while [ "$#" -gt 0 ]; do
@@ -64,6 +65,12 @@ gate_init() {
                 _GATE_MAP=$2
                 if [ -z "$_GATE_MAP" ] || [[ "$_GATE_MAP" == *$'\n'* ]]; then _gate_error gate_init 'invalid --map'; fi
                 map_seen=1
+                shift 2
+                ;;
+            --own)
+                if [ "$#" -lt 2 ]; then _gate_error gate_init 'missing --own'; fi
+                if [ -z "$2" ] || [[ "$2" == *$'\n'* ]]; then _gate_error gate_init 'invalid --own'; fi
+                own_files[${#own_files[@]}]=$2
                 shift 2
                 ;;
             --base)
@@ -114,7 +121,7 @@ gate_init() {
     if ! _GATE_ROOT=$(pwd -P); then _gate_error gate_init 'cannot record the repository root'; fi
     _GATE_OWN_PATHS=()
     local own_file resolved
-    for own_file in "$_GATE_MAP" "$0" "$_GATE_LIBRARY_SOURCE"; do
+    for own_file in "$_GATE_MAP" "${own_files[@]+"${own_files[@]}"}" "$_GATE_LIBRARY_SOURCE"; do
         if [ -n "$own_file" ] && resolved=$(_gate_physical_file "$own_file"); then
             case "$resolved" in
                 "${_GATE_ROOT%/}"/*)
@@ -372,7 +379,8 @@ _gate_select_touched() {
             fi
         done
         for ((index = 0; index < ${#_GATE_LABELS[@]}; index++)); do
-            if [[ "$path" == *' '* ]] && [[ " ${_GATE_LABELS[index]} " == *" $path "* ]]; then
+            if [[ "$path" == *' '* ]] && [[ "$path" == */* || "$path" == *.[A-Za-z]* ]] &&
+                [[ " ${_GATE_LABELS[index]} " == *" $path "* ]]; then
                 chosen[index]=1
                 mapped=1
             fi
@@ -380,7 +388,7 @@ _gate_select_touched() {
                 IFS=$' \t\n' read -r -a words <<< "$text"
                 for word in "${words[@]+"${words[@]}"}"; do
                     case "$word" in
-                        */*|*.*) if [ "$word" = "$path" ]; then chosen[index]=1; mapped=1; fi ;;
+                        */*|*.[A-Za-z]*) if [ "$word" = "$path" ]; then chosen[index]=1; mapped=1; fi ;;
                     esac
                 done
             done
