@@ -35,7 +35,7 @@ root=$(CDPATH='' cd -- "$root" 2>/dev/null && pwd -P) || usage
 top=$(git -C "$root" rev-parse --show-toplevel 2>/dev/null) || usage
 top=$(CDPATH='' cd -- "$top" && pwd -P) || usage
 [ "$root" = "$top" ] || usage
-git -C "$root" remote get-url -- "$remote" >/dev/null 2>&1 || usage
+remote_url=$(git -C "$root" remote get-url -- "$remote" 2>/dev/null) || usage
 shallow=$(git -C "$root" rev-parse --is-shallow-repository) || fail 'cannot inspect history'
 [ "$shallow" != true ] || fail 'a shallow clone cannot name a culprit; fetch the full history'
 common=$(git -C "$root" rev-parse --git-common-dir) || fail 'cannot find the common directory'
@@ -44,20 +44,20 @@ common=$(CDPATH='' cd -- "$common" && pwd -P) || fail 'cannot find the common di
 lock="$common/verify-main.lock"
 working='' owned=0
 already_running() { printf 'verify-main: already running (pid %s)\n' "$1"; exit 0; }
-start=$(ps -o lstart= -p "$$") || { printf 'verify-main: cannot inspect this process\n'; exit 75; }
+start=$(TZ=UTC0 ps -o lstart= -p "$$") || { printf 'verify-main: cannot inspect this process\n'; exit 75; }
 identity="$$ $start"
 if [ -e "$lock" ] && [ ! -L "$lock" ]; then fail "$lock is not a lock; remove it"; fi
-if ! ln -s "$identity" "$lock" 2>/dev/null; then
+if ! ln -sn "$identity" "$lock" 2>/dev/null; then
     [ -L "$lock" ] || fail "$lock is not a lock; remove it"
     holder=$(readlink "$lock") || fail 'cannot read the lock'
     pid=${holder%% *}
     recorded=${holder#* }
     if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && [ "$pid" != "$$" ] && [ "$recorded" != "$holder" ]; then
-        current=$(ps -o lstart= -p "$pid" 2>/dev/null) || current=''
+        current=$(TZ=UTC0 ps -o lstart= -p "$pid" 2>/dev/null) || current=''
         if [ -n "$current" ] && [ "$current" = "$recorded" ]; then already_running "$pid"; fi
     fi
     if [ "$(readlink "$lock")" = "$holder" ]; then rm -f "$lock" || fail 'cannot remove a stale lock'; fi
-    if ! ln -s "$identity" "$lock" 2>/dev/null; then
+    if ! ln -sn "$identity" "$lock" 2>/dev/null; then
         [ -L "$lock" ] || fail "$lock is not a lock; remove it"
         holder=$(readlink "$lock") || fail 'cannot read the lock'
         already_running "${holder%% *}"
@@ -67,6 +67,7 @@ owned=1
 cleanup() {
     local status=$?
     if [ -n "$working" ]; then
+        chmod -R u+w "$working" 2>/dev/null || :
         rm -rf "$working" || printf 'verify-main: warning: cannot remove scratch directory %s\n' "$working" >&2
     fi
     if [ "$owned" -eq 1 ] && [ "$(readlink "$lock" 2>/dev/null)" = "$identity" ]; then
@@ -79,7 +80,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 fetch_main() {
-    git -C "$root" fetch --quiet -- "$remote" "+refs/heads/main:refs/remotes/$remote/main" || fail 'cannot fetch main'
+    git -C "$root" fetch --quiet --no-tags --no-recurse-submodules -- "$remote" "+refs/heads/main:refs/remotes/$remote/main" || fail 'cannot fetch main'
     main=$(git -C "$root" rev-parse --verify "refs/remotes/$remote/main^{commit}") || fail 'cannot read main'
 }
 read_refs() {
@@ -101,7 +102,7 @@ read_refs() {
                 fail "$remote has $ref, which shadows $shadow; delete it" ;;
         esac
         if ! git -C "$root" cat-file -e "$oid" 2>/dev/null; then
-            git -C "$root" fetch --quiet -- "$remote" "$oid" || fail 'cannot fetch green ref'
+            git -C "$root" fetch --quiet --no-tags --no-recurse-submodules -- "$remote" "$oid" || fail 'cannot fetch green ref'
         fi
         git -C "$root" cat-file -e "$oid^{commit}" 2>/dev/null || fail 'green ref is not a commit'
     done <<< "$refs"
@@ -113,11 +114,14 @@ push_failure() {
     if [ "$green" = "$old_green" ] && [ "$frozen" = "$old_frozen" ]; then
         fail 'the remote refused the push; nothing changed'
     fi
-    if [ "$frozen" != "$old_frozen" ] && ! { [ "$clear" -eq 1 ] && [ "$push_result" -eq 0 ] && [ -z "$frozen" ]; }; then
+    if [ "$frozen" != "$old_frozen" ] && ! {
+        [ "$status" -eq 0 ] && [ -z "$frozen" ] && [ -n "$green" ] &&
+            git -C "$root" merge-base --is-ancestor "$head" "$green"
+    }; then
         fail 'the freeze moved during the check'
     fi
     if [ "$status" -eq 0 ] && [ -n "$green" ] && git -C "$root" merge-base --is-ancestor "$head" "$green"; then
-        if [ "$clear" -eq 1 ] && [ -z "$frozen" ]; then
+        if [ "$clear" -eq 1 ] && [ "$push_result" -eq 0 ] && [ -z "$frozen" ]; then
             printf 'releases unfrozen (freeze at %s cleared)\n' "$old_frozen"
         fi
         printf 'covered: green is %s\n' "$green"
@@ -148,13 +152,62 @@ if [ -n "$green" ] && ! git -C "$root" merge-base --is-ancestor "$green" "$head"
     short=$(git -C "$root" rev-parse --short "$green")
     fail "green $short is not on $remote/main; nothing changed"
 fi
-working=$(mktemp -d "${TMPDIR:-/tmp}/verify-main.XXXXXX") || fail 'cannot create a scratch directory'
+case "$1" in
+    /*) tree_command=0 ;;
+    */*) tree_command=1 ;;
+    *) tree_command=0 ;;
+esac
+if [ "$tree_command" -eq 0 ]; then
+    check_program=$(type -P -- "$1") || check_program=''
+    [ -n "$check_program" ] || fail "the check could not start ($1 not found); nothing changed"
+    shift
+    set -- "$check_program" "$@"
+fi
+working=$(mktemp -d -- "${TMPDIR:-/tmp}/verify-main.XXXXXX") || fail 'cannot create a scratch directory'
 working=$(CDPATH='' cd -- "$working" && pwd -P) || fail 'cannot resolve the scratch directory'
 case "$working/" in "$root/"*) fail 'the scratch directory must be outside the root' ;; esac
+configuration_fingerprint() {
+    local file entries
+    for file in "$common/config" "$common/config.worktree"; do
+        if [ -e "$file" ]; then
+            cksum "$file" || return 1
+        else
+            printf 'missing %s\n' "$file"
+        fi
+    done
+    if [ -d "$common/hooks" ]; then
+        entries=$(find "$common/hooks" -print | sort) || return 1
+        printf '%s\n' "$entries"
+        while IFS= read -r file; do
+            if [ -L "$file" ]; then
+                readlink "$file" || return 1
+            elif [ -f "$file" ]; then
+                cksum "$file" || return 1
+            fi
+        done <<< "$entries"
+    else
+        printf 'missing %s/hooks\n' "$common"
+    fi
+}
+configuration=$(configuration_fingerprint) || fail 'cannot inspect git configuration or hooks'
+check_configuration() {
+    local current_configuration
+    current_configuration=$(configuration_fingerprint) || fail 'cannot inspect git configuration or hooks'
+    [ "$current_configuration" = "$configuration" ] ||
+        fail "the check changed $common's git configuration or hooks; nothing changed, inspect it"
+}
+attempt=0
 fresh_clone() {
-    rm -rf "$working/wt" || fail 'cannot remove a scratch clone'
-    git clone --quiet --shared --no-checkout -- "$root" "$working/wt" || fail 'cannot create a scratch clone'
-    git -C "$working/wt" checkout --quiet --detach "$head" || fail 'cannot check out main'
+    attempt=$((attempt + 1))
+    tree="$working/wt$attempt"
+    git clone --quiet --shared --no-tags --no-checkout -- "$root" "$tree" || fail 'cannot create a scratch clone'
+    git -C "$tree" remote remove origin || fail 'cannot remove the scratch remote'
+    local copied_branch
+    copied_branch=$(git -C "$tree" symbolic-ref HEAD) || fail 'cannot read the scratch branch'
+    git -C "$tree" checkout --quiet --detach "$head" || fail 'cannot check out main'
+    git -C "$tree" update-ref -d "$copied_branch" || fail 'cannot remove the scratch branch'
+    git -C "$tree" remote add origin "$remote_url" || fail 'cannot set the scratch remote'
+    git -C "$tree" update-ref refs/remotes/origin/main "$head" || fail 'cannot set the scratch main'
 }
 fresh_clone
 unavailable() {
@@ -162,22 +215,21 @@ unavailable() {
         printf 'verify-main: the check cannot run on this host (exit 75); nothing changed\n'
         exit 75
     fi
-    if [ "$status" -eq 126 ] || [ "$status" -eq 127 ]; then
-        fail "the check could not start (exit $status); nothing changed"
-    fi
 }
 run_check() (
     if [ "$caller_lc_set" = x ]; then export LC_ALL="$caller_lc"; else unset LC_ALL; fi
     if [ "$caller_replace_set" = x ]; then export GIT_NO_REPLACE_OBJECTS="$caller_replace"; else unset GIT_NO_REPLACE_OBJECTS; fi
-    CDPATH='' cd -- "$working/wt" || exit 1
+    CDPATH='' cd -- "$tree" || exit 1
     command -- "$@" </dev/null
 )
 status=0
 run_check "$@" >&2 || status=$?
+check_configuration
 unavailable
 if [ "$status" -ne 0 ]; then
     fresh_clone
     run_check "$@" >&2 && status=0 || status=$?
+    check_configuration
     unavailable
     if [ "$status" -eq 0 ]; then printf 'verify-main: the first run was red; the rerun passed\n'; fi
 fi

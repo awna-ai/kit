@@ -290,7 +290,7 @@ case_stale_lock() {
 case_live_lock() {
     sleep 30 &
     pid=$!
-    start=$(ps -o lstart= -p "$pid")
+    start=$(TZ=UTC0 ps -o lstart= -p "$pid")
     ln -s "$pid $start" "$repo/.git/verify-main.lock"
     run
     check test "$actual" -eq 0
@@ -308,7 +308,7 @@ case_lock_identity() {
     actual=0
     # shellcheck disable=SC2016
     output=$(TMPDIR="$tmp/scratch" "$runner" -c '
-        ln -s "$$ $(ps -o lstart= -p "$$")" "$1/.git/verify-main.lock"
+        ln -s "$$ $(TZ=UTC0 ps -o lstart= -p "$$")" "$1/.git/verify-main.lock"
         exec "$2" "$3" --root "$1" -- true
     ' fixture "$repo" "$runner" "$root/gate/verify-main.sh" 2>"$tmp/err") || actual=$?
     want_green=$head
@@ -382,6 +382,36 @@ WRAP
     expect 75 'verify-main: git is missing'
 
 }
+case_deleted_freeze() {
+    for mode in current advance; do
+        setup
+        seed_frozen "$head"
+        commit
+        seed_green "$head"
+        if [ "$mode" = advance ]; then
+            commit
+        fi
+        mkdir "$tmp/bin"
+        real_git=$(command -v git)
+        cat > "$tmp/bin/git" <<'WRAP'
+#!/bin/sh
+case " $* " in
+    *' push '*)
+        "$REAL_GIT" -C "$TEST_REPO" push -q origin :refs/green/frozen
+        # In the advance case the other writer also publishes the checked head.
+        if [ "$RACE_MODE" = advance ]; then
+            "$REAL_GIT" -C "$TEST_REPO" push -q origin "$RACE_HEAD:refs/green/main"
+        fi ;;
+esac
+exec "$REAL_GIT" "$@"
+WRAP
+        chmod +x "$tmp/bin/git"
+        PATH="$tmp/bin:$PATH" REAL_GIT="$real_git" TEST_REPO="$repo" RACE_MODE="$mode" RACE_HEAD="$head" run
+        want_green=$head want_frozen=''
+        expect 0 "covered: green is $head"
+        check test "$output" = "covered: green is $head"
+    done
+}
 case_push_races() {
     seed_green "$head"
     commit
@@ -445,6 +475,14 @@ case_signals() {
     done
 
 }
+case_ps_failure() {
+    mkdir "$tmp/bin"
+    printf '#!/bin/sh\nexit 1\n' > "$tmp/bin/ps"
+    chmod +x "$tmp/bin/ps"
+    PATH="$tmp/bin:$PATH" run
+    expect 75 'verify-main: cannot inspect this process'
+    check test ! -e "$tmp/runs"
+}
 case_docs() {
     check grep -Fq '## Green refs (opt-in)' "$root/gate/README.md"
     check grep -Fq 'rewind' "$root/gate/README.md"
@@ -457,7 +495,18 @@ case_docs() {
     done
     check grep -Fq "the check runs the remote's code with the caller's environment" "$root/.ai/SECURITY.md"
     check grep -Fq 'best effort' "$root/.ai/SECURITY.md"
-
+    # shellcheck disable=SC2016
+    for phrase in 'git commands inside the check' "root's configuration, refs or hooks" 'can read and write anything the caller can' 'every object' 'alternates' 'Only run it on a' 'INT, TERM and HUP are handled once the running check exits' 'SIGKILL leaves the check running' 'hung check delays cleanup' 'must require `refs/green/main` to equal the commit it ships' "caller's \`GIT_CONFIG_*\`, \`GIT_SSH_COMMAND\` and \`GIT_EXEC_PATH\`" 'credential helper may need more' 'cannot inspect this process' 'config.worktree' 'not found' "\`origin\` names the remote's URL"; do
+        check grep -Fq "$phrase" "$root/gate/README.md"
+    done
+    # shellcheck disable=SC2016
+    check grep -Fq 'env -i PATH="$PATH" HOME="$HOME" SSH_AUTH_SOCK="$SSH_AUTH_SOCK" bash gate/verify-main.sh' "$root/gate/README.md"
+    for phrase in 'git commands inside the check' "root's configuration, refs or hooks" 'can read and write anything the caller can' 'every object' 'alternates' 'Only run it on a'; do
+        check grep -Fq "$phrase" "$root/.ai/SECURITY.md"
+    done
+    for phrase in 'fresh scratch clone per attempt' 'best-effort lock per local clone' 'configuration or hooks' 'missing host commands' 'shallow roots' 'shadowing refs'; do
+        check grep -Fq "$phrase" "$root/gate/CHANGELOG.md"
+    done
 }
 case_noncommit_ref() {
     blob=$(printf 'fixture\n' | git -C "$repo" hash-object -w --stdin)
@@ -479,6 +528,74 @@ WRAP
     expect 1 'verify-main: green ref is not a commit'
     check test ! -e "$tmp/fetched"
 
+}
+case_dash_tmp() {
+    mkdir -p "$tmp/elsewhere/-x"
+    actual=0
+    output=$(cd "$tmp/elsewhere"; TMPDIR=-x "$runner" "$root/gate/verify-main.sh" --root "$repo" -- true 2>"$tmp/err") || actual=$?
+    want_green=$head
+    expect 0 "green $head"
+    check test -z "$(find "$tmp/elsewhere/-x" -mindepth 1 -print)"
+}
+case_fetch_tags() {
+    git -C "$repo" tag -a remote-fixture -m 'Record a remote fixture.'
+    git -C "$repo" push -q origin refs/tags/remote-fixture
+    git -C "$repo" tag -d remote-fixture >/dev/null
+    run
+    want_green=$head
+    expect 0 "green $head"
+    check test -z "$(git -C "$repo" tag --list)"
+}
+case_lock_directory_link() {
+    mkdir "$tmp/lock-target"
+    ln -s "$tmp/lock-target" "$repo/.git/verify-main.lock"
+    run
+    want_green=$head
+    expect 0 "green $head"
+    check test -z "$(find "$tmp/lock-target" -mindepth 1 -print)"
+}
+case_lock_timezone() {
+    mkdir "$tmp/bin"
+    model_ps=$(command -v ps)
+    cat > "$tmp/bin/ps" <<'PS'
+#!/bin/sh
+if [ "${TZ-}" != UTC0 ]; then printf 'another local start time\n'; exit 0; fi
+exec "$MODEL_PS" "$@"
+PS
+    chmod +x "$tmp/bin/ps"
+    sleep 30 &
+    pid=$!
+    start=$(TZ=UTC0 ps -o lstart= -p "$pid")
+    ln -s "$pid $start" "$repo/.git/verify-main.lock"
+    PATH="$tmp/bin:$PATH" MODEL_PS="$model_ps" TZ=HST10 run
+    check test "$actual" -eq 0
+    check test "$output" = "verify-main: already running (pid $pid)"
+    check test "$(readlink "$repo/.git/verify-main.lock" 2>/dev/null || :)" = "$pid $start"
+    kill "$pid"
+    wait "$pid" 2>/dev/null || :
+    rm -f "$repo/.git/verify-main.lock"
+    # The check still receives the caller's timezone.
+    # shellcheck disable=SC2016
+    printf 'test "$TZ" = HST10\n' > "$tmp/hook"
+    TZ=HST10 run
+    want_green=$head
+    expect 0 "green $head"
+}
+case_scratch_refs() {
+    commit
+    checked=$head
+    git -C "$repo" reset -q --hard "$base"
+    git -C "$repo" checkout -qb private-fixture
+    git -C "$repo" commit -q --allow-empty -m 'Record a local fixture.'
+    git -C "$repo" tag local-fixture
+    printf 'git remote > "%s/remotes"\ngit remote get-url origin > "%s/url"\ngit rev-parse origin/main > "%s/checked"\ngit for-each-ref --format="%%(refname)" > "%s/refs"\n' "$tmp" "$tmp" "$tmp" "$tmp" > "$tmp/hook"
+    run
+    want_green=$checked
+    expect 0 "green $checked"
+    check test "$(cat "$tmp/remotes")" = origin
+    check test "$(cat "$tmp/url")" = "$remote"
+    check test "$(cat "$tmp/checked")" = "$checked"
+    check test "$(cat "$tmp/refs")" = refs/remotes/origin/main
 }
 case_scratch_config() {
     printf 'git config core.hooksPath /nonexistent-x\ngit remote set-url origin /nonexistent-y\n' > "$tmp/hook"
@@ -517,19 +634,60 @@ case_shadow() {
 }
 case_cannot_start() {
     for program in no-such-command-xyz usage; do
-        invoke --root "$repo" -- "$program"
-        expect 1 'verify-main: the check could not start (exit 127); nothing changed'
+        mkdir -p "$tmp/bin"
+        real_git=$(command -v git)
+        cat > "$tmp/bin/git" <<'WRAP'
+#!/bin/sh
+if [ "$1" = clone ]; then : > "$ATTEMPT_MARKER"; fi
+exec "$REAL_GIT" "$@"
+WRAP
+        chmod +x "$tmp/bin/git"
+        PATH="$tmp/bin:$PATH" REAL_GIT="$real_git" ATTEMPT_MARKER="$tmp/attempt" invoke --root "$repo" -- "$program"
+        expect 1 "verify-main: the check could not start ($program not found); nothing changed"
+        check test ! -e "$tmp/attempt"
+        check test ! -e "$tmp/runs"
     done
-    printf '#!/bin/sh\nexit 0\n' > "$tmp/not-executable"
-    invoke --root "$repo" -- "$tmp/not-executable"
-    expect 1 'verify-main: the check could not start (exit 126); nothing changed'
+}
+case_check_exit_codes() {
     for status in 126 127; do
+        setup
         printf '%s\n' "$status" > "$tmp/status"
-        rm -f "$tmp/runs"
         run
-        expect 1 "verify-main: the check could not start (exit $status); nothing changed"
-        check test "$(wc -l < "$tmp/runs" | tr -d ' ')" = 1
+        want_frozen=$head
+        expect 5 "red $head culprit $head"
+        check test "$(wc -l < "$tmp/runs" | tr -d ' ')" = 2
     done
+    setup
+    printf '#!/bin/sh\nno-such-command-xyz\n' > "$repo/ci.sh"
+    chmod +x "$repo/ci.sh"
+    git -C "$repo" add ci.sh
+    commit
+    seed_green "$base"
+    invoke --root "$repo" -- ./ci.sh
+    want_frozen=$head
+    expect 5 "red $head culprit $head"
+}
+case_tree_check() {
+    printf '#!/bin/sh\nexit 0\n' > "$repo/ci.sh"
+    chmod +x "$repo/ci.sh"
+    git -C "$repo" add ci.sh
+    commit
+    invoke --root "$repo" -- ./ci.sh
+    want_green=$head
+    expect 0 "green $head"
+    git -C "$repo" rm -q ci.sh
+    commit
+    invoke --root "$repo" -- ./ci.sh
+    want_frozen=$head
+    expect 5 "red $head culprit $head"
+    setup
+    printf '#!/bin/sh\nexit 0\n' > "$repo/ci.sh"
+    git -C "$repo" add ci.sh
+    commit
+    seed_green "$base"
+    invoke --root "$repo" -- ./ci.sh
+    want_frozen=$head
+    expect 5 "red $head culprit $head"
 }
 case_relative_tmp() {
     mkdir -p "$tmp/elsewhere/rel" "$tmp/bin"
@@ -571,6 +729,71 @@ case_check_environment() {
     printf 'test -z "${LC_ALL+x}${GIT_NO_REPLACE_OBJECTS+x}"\n' > "$tmp/hook"
     (unset LC_ALL GIT_NO_REPLACE_OBJECTS; run; want_green=$head; expect 0 "green $head")
 }
+case_root_tripwire() {
+    for mutation in config worktree hook deleted-hook symlink-hook retargeted-hook; do
+        for attempt in 1 2; do
+            setup
+            printf '#!/bin/sh\ntouch "%s/payload-ran"\n' "$tmp" > "$tmp/payload"
+            chmod +x "$tmp/payload"
+            if [ "$mutation" = deleted-hook ]; then
+                printf 'fixture\n' > "$repo/.git/hooks/fixture"
+            fi
+            if [ "$mutation" = retargeted-hook ]; then
+                cp "$tmp/payload" "$tmp/original-payload"
+                ln -s "$tmp/original-payload" "$repo/.git/hooks/post-checkout"
+            fi
+            before=$(cat "$repo/.git/config")
+            cat > "$tmp/check-tripwire" <<'CHECK'
+#!/bin/sh
+printf 'ran\n' >> "$1/attempts"
+[ "$(wc -l < "$1/attempts" | tr -d ' ')" = "$4" ] || exit 1
+case "$3" in
+    config) git -C "$2" config core.fsmonitor "$1/payload" ;;
+    worktree) printf 'fixture\n' > "$2/.git/config.worktree" ;;
+    hook) printf 'fixture\n' > "$2/.git/hooks/new-hook" ;;
+    deleted-hook) rm "$2/.git/hooks/fixture" ;;
+    symlink-hook) ln -s "$1/payload" "$2/.git/hooks/post-checkout" ;;
+    retargeted-hook)
+        rm "$2/.git/hooks/post-checkout"
+        ln -s "$1/payload" "$2/.git/hooks/post-checkout"
+        ;;
+esac
+: > "$1/changed"
+CHECK
+            mkdir "$tmp/bin"
+            real_git=$(command -v git)
+            cat > "$tmp/bin/git" <<'WRAP'
+#!/bin/sh
+if [ -e "$TRIPWIRE_CHANGED" ]; then : > "$LATE_GIT"; fi
+exec "$REAL_GIT" "$@"
+WRAP
+            chmod +x "$tmp/bin/git"
+            PATH="$tmp/bin:$PATH" REAL_GIT="$real_git" TRIPWIRE_CHANGED="$tmp/changed" LATE_GIT="$tmp/late-git" invoke --root "$repo" -- sh "$tmp/check-tripwire" "$tmp" "$repo" "$mutation" "$attempt"
+            check test "$actual" -eq 1
+            check test "$output" = "verify-main: the check changed $repo/.git's git configuration or hooks; nothing changed, inspect it"
+            check test ! -e "$tmp/payload-ran"
+            check test ! -e "$tmp/late-git"
+            check test "$(wc -l < "$tmp/attempts" | tr -d ' ')" = "$attempt"
+            # Inspect refs only after restoring the fixture's safe configuration.
+            printf '%s\n' "$before" > "$repo/.git/config"
+            expect 1 "verify-main: the check changed $repo/.git's git configuration or hooks; nothing changed, inspect it"
+        done
+    done
+}
+case_readonly_red() {
+    for target in nested root; do
+        setup
+        if [ "$target" = nested ]; then
+            invoke --root "$repo" -- sh -c 'mkdir -p fx/ro && touch fx/ro/f && chmod 555 fx/ro; exit 1'
+        else
+            invoke --root "$repo" -- sh -c 'chmod 555 .; exit 1'
+        fi
+        want_frozen=$head
+        expect 5 "red $head culprit $head"
+        # Restore fixture permissions even on red, so the suite can clean up.
+        chmod -R u+w "$tmp/scratch"
+    done
+}
 case_cleanup_status() {
     for result in 0 5 6 75; do
         setup
@@ -578,7 +801,7 @@ case_cleanup_status() {
         real_rm=$(command -v rm)
         cat > "$tmp/bin/rm" <<'WRAP'
 #!/bin/sh
-case "$*" in *'/wt'|*'/verify-main.lock') ;; *'/verify-main.'*) exit 1 ;; esac
+case "${2##*/}" in verify-main.lock) ;; verify-main.*) exit 1 ;; esac
 exec "$REAL_RM" "$@"
 WRAP
         chmod +x "$tmp/bin/rm"
@@ -757,6 +980,7 @@ case_repeat_red() {
     expect 5 "red $head culprit $head"
 }
 cases='repeat_red equal_freeze_advance rerun_unavailable_empty red_covered off_main_advance stolen_lock check_stdout merge_suspects remote_green_object lease_races missing_tools cleanup_status shallow green_push_failure lock_identity bad_lock check_environment relative_tmp inside_tmp cannot_start shadow follow_tags fresh_rerun noncommit_ref docs signals red_push_failure push_races failures environment scratch_config live_lock stale_lock freeze_race green_race covered main_moved rewritten unavailable fixed flaky no_green_red red_many red_one advance current_off_main current_ancestor_frozen current_frozen current first_green usage'
+cases="ps_failure deleted_freeze tree_check check_exit_codes root_tripwire readonly_red dash_tmp fetch_tags lock_directory_link lock_timezone scratch_refs $cases"
 selected=0
 for name in $cases; do
     if [ "$#" -gt 0 ] && [ "$1" != "$name" ]; then continue; fi

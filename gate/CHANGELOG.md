@@ -6,9 +6,14 @@ This package is versioned on its own. Its releases are tagged `awna-gate-vX.Y.Z`
 
 Released 2026-11-24.
 
-- Added `verify-main.sh`, the opt-in green refs script: check a remote's `main` in a scratch worktree, advance
+- Added `verify-main.sh`, the opt-in green refs script: check a remote's `main` in a fresh scratch clone per attempt, advance
   `refs/green/main` on green and freeze releases with `refs/green/frozen` on red, using leased pushes and a
-  repository-wide lock. Exit 75 never changes either ref.
+  best-effort lock per local clone. Exit 75 never changes either ref.
+- Refuse changed root git configuration or hooks, missing host commands, shallow roots, shadowing refs, and a green
+  ref and freeze naming the same commit. Missing tree commands and checks that exit 126 or 127 are red.
+- Keep only the actual remote's URL and checked `origin/main` in each scratch clone, disable tag following and
+  submodule recursion for fetches and pushes, compare lock start times in UTC, and recover read-only attempt trees
+  during cleanup. A scratch clone is not a sandbox; its shared alternates expose the root's object store.
 
 ## 0.1.0
 

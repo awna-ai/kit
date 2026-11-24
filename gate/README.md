@@ -626,8 +626,9 @@ The root must be the repository's top directory. The remote defaults to `origin`
 and must be configured. Each option may occur once. The separator and a check
 command are required; there is no default check. The command runs as an argv,
 without evaluation, with stdin from `/dev/null`. Its working directory is a
-scratch clone of the remote's `main`, detached at the fetched head. Check
-output goes to stderr; the result lines below go to stdout, except usage.
+fresh scratch clone of the remote's `main`, detached at the fetched head. Inside
+the check, `origin` names the remote's URL and `origin/main` names the checked head;
+no other refs are copied from the root. Check output goes to stderr; the result lines below go to stdout, except usage.
 
 The script fetches `main` and reads two refs from that remote:
 
@@ -639,25 +640,50 @@ The script fetches `main` and reads two refs from that remote:
   A green run retains an off-main freeze for manual resolution; a red run
   overwrites an off-main freeze with the red head.
 
-The check executes the code on the remote's `main` with the caller's environment
-and user. It is only as trustworthy as everyone who can push `main`. The scratch
-clone keeps the check from changing the repository's own git configuration, but
-it is not a sandbox. Consider a minimal environment, for example
-`env -i PATH=… HOME=… bash gate/verify-main.sh --root <repo top> -- <check command>`.
+The check executes the code on the remote's `main` with the caller's user and
+environment. The scratch clone keeps git commands inside the check's tree from
+writing the root's configuration, refs or hooks. It is not a sandbox: the check
+can read and write anything the caller can, the root repository included, and can
+read every object in the root's object store through the clone's alternates.
+Only run it on a `main` you would run on your own machine.
+
+The caller's `GIT_CONFIG_*`, `GIT_SSH_COMMAND` and `GIT_EXEC_PATH` reach both the
+script's own git commands and the check. Consider a minimal environment:
+
+```sh
+env -i PATH="$PATH" HOME="$HOME" SSH_AUTH_SOCK="$SSH_AUTH_SOCK" bash gate/verify-main.sh --root <repo top> -- <check command>
+```
+
+This keeps what the script's own push needs; a credential helper may need more.
 
 A red check runs once more in a fresh scratch clone to allow a flaky step to
 recover. A check that exits 75 on either attempt stops immediately, without a
-further attempt or ref push. Exit 126 or 127 means the check could not start:
-exit 1, without a rerun or ref changes. Shallow roots are refused; fetch the full
-history before running.
+further attempt or ref push. A release must require `refs/green/main` to equal the commit it ships,
+never only the absence of `refs/green/frozen`.
+
+Before the first attempt, a command word containing a slash but not starting with
+one names a file in the checked tree. A missing or non-executable tree command is
+red, as is any check that starts and exits 126 or 127. Other command words are
+resolved to a program on the host (never a function or builtin); a word not found
+exits 1 before any attempt, with no ref changes. Shallow roots are refused; fetch
+the full history before running.
+
+Before the first attempt the script fingerprints the root common directory's
+`config`, `config.worktree` when present, and all files under `hooks`, including
+missing files. Immediately after each check, before any further git command,
+a changed fingerprint exits 1 with no push and asks you to inspect the root's
+configuration or hooks. This tripwire does not prevent deliberate code from
+writing the root or restoring a change before the comparison.
 
 The symlink lock provides one run at a time per repository on this host, best effort;
 the leased pushes keep two runs from overwriting each other's refs. The lock is
 per local clone: two clones rely on the leases alone. A holder is identified by
 its pid and process start time. Stale-lock stealing is non-atomic: two contenders
 can both proceed. A non-symlink lock path is refused for manual removal.
-Normal exit and INT, TERM and HUP remove this run's scratch directory and owned
-lock. A killed run can leave a scratch directory in `TMPDIR`; no reaper removes it.
+Normal exit removes this run's scratch directory and owned lock.
+INT, TERM and HUP are handled once the running check exits, so a hung check delays cleanup.
+SIGKILL leaves the check running and its scratch directory behind in `TMPDIR`,
+along with the lock; no reaper removes the scratch directory.
 `TMPDIR` may be relative, but its resolved scratch directory must be outside the root.
 A cleanup failure warns on stderr and preserves the result's exit code.
 
@@ -672,6 +698,7 @@ A cleanup failure warns on stderr and preserves the result's exit code.
 | 5 | Red, with one first-parent suspect. | `red <head> culprit <oid>` |
 | 6 | Red, with several first-parent suspects. | `red <head> across <n> commits from <first> to <head>` |
 | 75 | The check cannot run here; neither ref changes. | `verify-main: the check cannot run on this host (exit 75); nothing changed` |
+| 75 | The host refuses process inspection. | `verify-main: cannot inspect this process` |
 | 75 | A required host tool (`git`, `ps`, `readlink`, `mktemp`) is missing. | `verify-main: <tool> is missing` |
 
 An exit 0 does not mean the head was checked. A release process decides from
@@ -690,7 +717,7 @@ off `main`, a warning names that freeze and asks for manual deletion.
 A ref that shadows refs/green/main or refs/green/frozen (for example a branch
 named `refs/heads/refs/green/main`) is refused by name; delete it before retrying.
 
-Pushes disable following tags and recursion into submodules. Pushes use leases
+Fetches and pushes disable following tags and recursion into submodules. Pushes use leases
 so two writers cannot clobber each other's green refs. Advancing green and
 clearing an ancestral freeze happen in one atomic push. The script
 re-fetches `main` before pushing and refuses a head that is no longer its ancestor.
