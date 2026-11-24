@@ -1,47 +1,28 @@
-# Changelog
+# Changelog: awna-gate
 
-## Unreleased
+This package is versioned on its own. Its releases are tagged `awna-gate-vX.Y.Z` (for example `awna-gate-v0.1.0`).
 
-### Added
+## 0.1.0
 
-- `gate_workflow` reads ordered single-line commands from GitHub Actions workflows and local reusable workflows.
-- Consumer hooks allow jobs, extra job keys, environment variables, services and setup steps explicitly.
-- Workflow commands run with `bash -e` in a scrubbed environment, with optional passed variables and job values.
-- A failed workflow step skips the remaining selected steps of its job while other jobs and plain steps continue.
+The first release.
 
-- Repeatable `gate_init --own <path>` names consumer files that force the full tier when changed.
-- `gate_init --map` opts a consumer into map-based selection and validation.
-- `gate_init --base` chooses the local ref used to measure changes.
-- `--tier touched` selects steps for working-tree and committed changes, falling back to the full tier on uncertainty.
-- `--check-map` validates map entries against registered steps and tracked paths without running steps.
-- `gate_step --always` keeps repository-wide checks in every touched run.
-- `gate_init` records the repository root and parses the gate's name, strict variable and consumer arguments.
-- `gate_missing` reports and counts a missing host capability, or exits 75 in strict mode.
-- `gate_require` checks whether a tool is available before a consumer registers its steps.
-- `gate_step` registers a command with its label, result kind and optional macOS requirement.
-- `gate_run` runs the steps with logs and timings, reports the slowest five and exits with the gate's contract.
-
-### Fixed
-
-- Treat keyed block-scalar content in ignored workflow regions as literal until its key column ends the block.
-- Check ignored sequence items after stripping every dash followed by one or more spaces.
-- Clarify workflow credential access, env-hook name allowlists and the hooks' C locale.
-- Check whole workflow lines, including ignored keys and nested list items, and refuse explicit YAML keys.
-- Keep workflow parsing in the C locale inside each parser function, including on bash 3.2.
-- Keep every step of a workflow job selected when the touched tier selects any command of that job.
-- Refuse unsafe workflow bytes, continued quoted or flow values, anchors, aliases and tags before running steps.
-- Refuse duplicate workflow keys, later document markers, empty job blocks and symbolic-link workflow files.
-- Isolate hook state in subshells and reserve parser locals so hooks read consumer globals safely.
-- Recognize mixed-case macOS labels, require exported passed variables and separate job skip groups across calls.
-- Refuse case-insensitive parser matching without changing the caller's shell options.
-- Record consumer files explicitly with `--own`, independent of relative invocation and directory changes.
-- Silence directory-resolution errors for own paths that cannot be resolved.
-- Require a slash or a dot followed by a letter in both path word rules, so cargo fragments do not map root files.
-- Resolve the base to one full commit ref, refusing ambiguous names, and compare from its merge base.
-- Include submodule changes despite ignore settings, use repository-relative paths and require the physical repository top.
-- Select file names containing spaces from labels and require `/` or `.` in individual path words.
-- Always run the full tier for changes to the map, consumer script or sourced library, even under catch-all map rows.
-- Replace non-printable map diagnostic bytes with `?` and refuse `nocasematch` without changing consumer options.
-- Document plain map globs and the consumer's `extglob` setting, working-tree limits and selection time for large changes.
-- Document that a signal can leave one 0600 selection file under `TMPDIR` between creation and removal.
-- Refuse map validation with exit 75 when a host tool is missing, in strict and non-strict mode.
+- `lib.sh`, a sourced library for Bash 3.2 and later that leaves the caller's options and traps alone: `gate_init`
+  parses the consumer's arguments (`--tier full|land|touched`, `--list`, `--check-map`) and records the repository
+  root; `gate_require` and `gate_missing` skip and count a missing tool, or exit 75 in strict mode; `gate_step`
+  registers a command as plain, `--test` or `--contract`, optionally `--mac-only` or `--always`; `gate_run` runs each
+  step from the root with its own log, prints its timing, the last lines of a failed log and the slowest five, and
+  exits 0 green, 1 red, 2 on an internal error or 75 when this host cannot run the gate.
+- The touched tier: a map of path patterns to step patterns selects the steps a change needs, measured from the merge
+  base with the base ref through the working tree and untracked files; anything it cannot be sure of (no merge base,
+  an unmapped path, a path it cannot match, a change to the gate's own files) runs the full tier. `--check-map`
+  checks the map against the registered steps and the tracked files.
+- `gate_workflow` reads single-line `run:` steps from GitHub Actions workflows, job by job, following local reusable
+  workflows, and refuses with exit 2 anything it cannot mirror; the consumer allows jobs, job keys, environment
+  variables, services and setup steps through hooks. Workflow steps run with `bash -e` in a scrubbed environment, and
+  a failed step skips the rest of its job.
+- `term-check.sh` checks every file, path, object, commit and tag message and ref name in a repository, or one
+  message file, against a term list the caller names; `secret-scan.sh` runs gitleaks over every ref's history, every
+  reachable object and the working tree, and refuses a repository-level gitleaks configuration. Both take the
+  repository and the strict switch as arguments.
+- `vendor.sh` copies the package as it is in a release tag into a consumer's tree, with a `PIN` file naming the tag
+  and its git tree. `gate_run` checks a pinned copy before any step and fails on any drift.

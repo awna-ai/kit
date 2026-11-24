@@ -21,6 +21,7 @@ repository itself, a private term or a secret published in public history.
 | Consumer → `awna-launch` | unit definitions written to disk and loaded by launchd or the systemd user manager | units are rendered from typed fields, never raw text: labels from a fixed character set, an absolute program, control characters refused; property list text is XML-escaped; a systemd `ExecStart` item holding anything outside a plain set of letters, digits and `/._-+,:=@` is quoted, and every `Environment` value is quoted, with `\`, `"`, `%` (and in `ExecStart` `$`) escaped; three values systemd would refuse or not expand (a nice of 20, Unicode noncharacters, `$` in the program path) are refused; and a log or working directory path holding a character systemd would reinterpret is refused, never escaped; unit files are written 0600 through a temporary file and a rename; every existing file and directory `apply` trusts must belong to the manager's user, and the directories must have no group or other write; a log directory `apply` creates is checked again before a log file is made in it, and a log file that appears meanwhile must be a regular file of that user with one link; a systemd mask link (a link to `/dev/null`) in the units directory counts as disabled and is not written over or deleted; a running service is never stopped by default; `resolve` picks the real `launchctl` or `systemctl` only for the account's own home (`new` and `system` skip that guard) and refuses a stand-in that is, resolves to or hard-links to it (advisory: a copy or a wrapper script passes); lingering is reported, never enabled | `crates/awna-launch/tests/` (a recording stand-in manager; stand-in `launchctl` and `systemctl` scripts that record argv; unit text compared byte for byte), a live launchd round trip run by hand, a security review and an independent verification before release |
 | Consumer → `awna-agents` argument builder | typed options that become a child's argument list | the builder refuses a prompt or tool entry that looks like an option, an empty tool entry, a NUL in any value, a control character in a tool entry, a session id that is not a UUID and a budget that is negative or not finite; an option value that starts with `-` goes out as one `--flag=value` argument | the argument tests in `crates/awna-agents/tests/` |
 | Agent output → `awna-agents` | untrusted model and tool text | parsed as data only, never evaluated or passed to a shell; `serde_json`'s nesting limit stays on; identifier-like fields (permission mode, error category, model id, session id, result subtype) are kept only when they match a fixed pattern; numbers are range-checked | its tests |
+| Kit tag → a consumer's vendored `awna-gate` | the library's files, copied into another repository | `gate/vendor.sh` copies the `gate/` tree of a release tag, never the working tree, refuses a tag whose tree holds a link, a submodule, a `.gitattributes`, a `PIN`, an odd name or a `VERSION` that disagrees, checks the copy's git tree against the tag before swapping it in, and writes `PIN` with the tag and tree; `gate_run` recomputes the copy's tree in a throwaway repository with no user or system configuration and fails before any step on any difference | `tests/gate_vendor_test.sh`, a security review and an independent verification before release |
 
 ## Data classes
 
@@ -37,8 +38,8 @@ The repository holds no secret and its gate needs none. Tests use invented value
 
 - `awna-agents`: streamed agent output, line by line (from its first release).
 - `awna-run`, `awna-keystore`, `awna-launch`: their public APIs, called by consumers (from each first release).
-- `scripts/*.sh` and `gate/lib.sh`: run by contributors on their own checkout; they read the repo, the term list and
-  cargo's output. `gate/lib.sh` runs only the step commands its consumer's own script registers, never `eval`, with
+- `scripts/*.sh` and `gate/*.sh`: run by contributors on their own checkout; they read the repo, the term list and
+  cargo's output; `gate/vendor.sh` also reads a local release tag and writes the destination it is given. `gate/lib.sh` runs only the step commands its consumer's own script registers, never `eval`, with
   stdin from `/dev/null`; each step's output goes to a log in a private temporary directory, kept only when the gate
   is not green, so a step that prints a secret leaves it in that log as it would on a terminal.
 
@@ -91,3 +92,5 @@ names anything but `unix:` sockets is refused, since the D-Bus library can also 
   advisory-scan gap revisited for its dependencies, and its accepted limits.
 - 2026-11-23: `awna-agents` 0.1.0: the argument builder's and the output parser's boundaries, and its first
   dependency under supply chain.
+- 2026-11-24: `awna-gate` 0.1.0: the vendored copy's boundary (the tag, the copy and its pin), and `gate/*.sh` among the
+  entry points.
