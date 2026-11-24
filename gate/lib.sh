@@ -995,7 +995,6 @@ _gate_tree_hash() (
     # Bash 3.2 drops function locals before EXIT traps run; temporary stays in this subshell.
     local directory=$1 variable tree
     set +f
-    unset GREP_OPTIONS GREP_COLOR GREP_COLORS
     unset GLOBIGNORE
     shopt -u dotglob failglob nocaseglob
     if ! directory=$(CDPATH='' cd -- "$directory" 2> /dev/null && pwd -P); then return 1; fi

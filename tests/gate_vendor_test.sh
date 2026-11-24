@@ -56,6 +56,9 @@ check docs-pin-not-signature grep -Fq 'the pin is not a signature' "$root/README
 check docs-pin-editable grep -Fq 'edit the copy can also edit or delete its `PIN`' "$root/README.md"
 check docs-git-version grep -Fq 'pin check needs git 2.29 or later' "$root/gate/README.md"
 # shellcheck disable=SC2016
+check docs-pin-tools grep -Fq 'pin check needs git 2.29 or later, `find`, `readlink` and `mktemp`.' "$root/gate/README.md"
+check docs-pin-missing-tools grep -Fq "Missing \`git\`, \`find\`, \`readlink\` or \`mktemp\` calls \`gate_missing <tool> 'the library pin check'\`:" "$root/gate/README.md"
+# shellcheck disable=SC2016
 check docs-direct-scanner grep -Fq 'Running a vendored scanner directly (without `gate_run`) checks no pin.' "$root/gate/README.md"
 check docs-rename-race grep -Fq "A concurrent writer in the destination's parent can race the final rename" "$root/gate/README.md"
 expect() {
@@ -310,7 +313,7 @@ for change in absent link pin attributes version nul-version missing-lib bad-pat
     expect "refuse-$change" 2 "$reason" bash "$source_repo/vendor.sh" "$tag" "$destination"
     check "$change-unchanged" diff -r "$tmp/before" "$destination"
 done
-for control in .git/HEAD sub/.git/config .GITATTRIBUTES .gitignore sub/.Gitmodules; do
+for control in .git/HEAD .GIT/HEAD sub/.git/config .GITATTRIBUTES .gitignore .GITIGNORE sub/.Gitmodules; do
     count=$((count + 1))
     tag="awna-gate-v0.4.$count"
     git -C "$source_repo" ls-tree 'awna-gate-v0.1.0:gate' | sed -e '/[[:space:]]VERSION$/d' -e '/[[:space:]]sub$/d' > "$tmp/control-entries"

@@ -33,7 +33,7 @@ its last part; start such a command with `set -o pipefail` (or `set -e`), or mov
 into a script.
 
 The host supplies `bash`, `mktemp`, `rm` and `tail`; macOS-only steps also need `uname`.
-The touched tier and `--check-map` also need `git`; the pin check needs git 2.29 or later.
+The touched tier and `--check-map` also need `git`; the pin check needs git 2.29 or later, `find`, `readlink` and `mktemp`.
 Workflow steps also need `env`, `tr` and `cmp`.
 The library uses the shell's `pwd` builtin and `SECONDS` clock. Logs can contain any
 output the commands produce. Failed runs retain those logs in a temporary directory;
@@ -601,7 +601,7 @@ prints `<name>: library pinned at <tag>`. A changed byte, mode, link, extra or
 removed file, or nested `.git` entry or an empty directory fails with exit 1 before
 any step or log directory is made. The diagnostic names the pinned and found trees and says to
 vendor it again. A malformed, linked or unreadable pin also exits 1. A hashing
-failure exits 2. Missing `git` calls `gate_missing git 'the library pin check'`:
+failure exits 2. Missing `git`, `find`, `readlink` or `mktemp` calls `gate_missing <tool> 'the library pin check'`:
 strict mode exits 75; otherwise the check is skipped and counted. Without a `PIN`,
 there is no check or pin output. `--list` and `--check-map` bypass it.
 Running a vendored scanner directly (without `gate_run`) checks no pin.

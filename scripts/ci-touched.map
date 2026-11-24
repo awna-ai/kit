@@ -31,6 +31,7 @@ scripts/deps-check.sh       bash tests/deps_check_test.sh
 tests/*.sh                  shellcheck *
 
 # Prose and settings: the scanners, which every change runs, are enough.
+README.md                   bash tests/gate_vendor_test.sh
 *.md                        -
 .ai/*.md                    -
 LICENSE                     -
