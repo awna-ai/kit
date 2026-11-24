@@ -113,6 +113,16 @@ fn invalid_arguments_run_nothing() {
 }
 
 #[test]
+fn a_masked_unit_reads_as_disabled_and_not_loaded() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager(
+        r#"printf 'LoadState=masked\nActiveState=inactive\nMainPID=0\nUnitFileState=masked\n'"#,
+    );
+    assert_eq!(manager.disabled(LABEL), Ok(true));
+    assert_eq!(manager.state(LABEL), Ok(State::NotLoaded));
+}
+
+#[test]
 fn a_failed_show_is_an_error_not_a_state() {
     for (script, error) in [
         (

@@ -15,7 +15,7 @@ fn keep_alive_unit_renders_byte_for_byte() {
     assert_eq!(
         render(&service, Platform::Linux),
         Ok(concat!(
-            "[Unit]\nDescription=com.example.alpha\n\n",
+            "[Unit]\nDescription=com.example.alpha\nStartLimitIntervalSec=0\n\n",
             "[Service]\nType=simple\nExecStart=/opt/example/bin/alpha serve\n",
             "Restart=always\nRestartSec=1\n",
             "StandardOutput=append:/var/tmp/example/alpha.log\n",
@@ -32,6 +32,7 @@ fn once_unit_does_not_restart() {
     assert!(rendered.lines().any(|line| line == "Restart=no"));
     assert!(!rendered.contains("RestartSec"));
     assert!(!rendered.contains("Standard"));
+    assert!(!rendered.contains("StartLimitIntervalSec"));
 }
 
 #[test]
@@ -52,7 +53,7 @@ fn optional_fields_render_in_order() {
     assert_eq!(
         render(&service, Platform::Linux),
         Ok(concat!(
-            "[Unit]\nDescription=com.example.alpha\n\n",
+            "[Unit]\nDescription=com.example.alpha\nStartLimitIntervalSec=0\n\n",
             "[Service]\nType=simple\nExecStart=/opt/example/bin/alpha serve\n",
             "Restart=always\nRestartSec=1\n",
             "Environment=\"ALPHA=first\"\nEnvironment=\"ZETA=last\"\n",
@@ -143,5 +144,29 @@ fn linux_refuses_paths_systemd_would_reinterpret() {
         if character == ' ' {
             assert!(render(&service, Platform::MacOs).is_ok());
         }
+    }
+}
+
+#[test]
+fn linux_refuses_values_systemd_would_refuse_or_not_expand() {
+    let mut cases = Vec::new();
+    for argument in ["a\u{1fffe}b", "a\u{fdd0}b"] {
+        let mut service = unit(Run::KeepAlive);
+        service.argv.push(argument.into());
+        cases.push((service, UnitError::Text));
+    }
+    let mut service = unit(Run::KeepAlive);
+    service.env.insert("SAMPLE".into(), "a\u{fdef}b".into());
+    cases.push((service, UnitError::Text));
+    let mut service = unit(Run::KeepAlive);
+    service.nice = Some(20);
+    cases.push((service, UnitError::Nice));
+    let mut service = unit(Run::KeepAlive);
+    service.argv[0] = "/opt/example/$bin/alpha".into();
+    cases.push((service, UnitError::Program));
+
+    for (service, error) in cases {
+        assert_eq!(render(&service, Platform::Linux), Err(error), "{service:?}");
+        assert!(render(&service, Platform::MacOs).is_ok(), "{service:?}");
     }
 }

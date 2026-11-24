@@ -16,7 +16,9 @@ pub enum Platform {
 /// Validates a service unit and renders it in the platform's service file format.
 ///
 /// Linux supports `Run::KeepAlive` and `Run::Once`. Interval and calendar schedules
-/// return `UnitError::Unsupported` because systemd requires a separate timer unit.
+/// return `UnitError::Unsupported` because systemd requires a separate timer unit. Linux also
+/// refuses a nice of 20, Unicode noncharacters, and `$` in the program path, which systemd
+/// would reject or read differently.
 pub fn render(unit: &Unit, platform: Platform) -> Result<String, UnitError> {
     unit.validate()?;
     match platform {

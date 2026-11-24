@@ -864,6 +864,7 @@ fn linux_install_writes_a_service_unit() {
     assert_eq!(mode(&service), 0o600);
     assert!(!units.join("com.example.alpha.plist").exists());
     assert!(manager.calls().contains(&Call::Load(service)));
+    assert_eq!(manager.state_of(LABEL), State::Idle);
 }
 
 #[test]
@@ -917,4 +918,137 @@ fn linux_timer_unit_writes_nothing() {
     );
     assert!(!units.exists());
     assert!(manager.calls().is_empty());
+}
+
+fn linux_units(scratch: &Scratch) -> (PathBuf, PathBuf) {
+    let units = scratch.0.join("units");
+    fs::create_dir(&units).unwrap();
+    let service = units.join("com.example.alpha.service");
+    (units, service)
+}
+
+#[test]
+fn linux_disabled_unit_is_left_disabled() {
+    let scratch = Scratch::new();
+    let manager = scratch
+        .manager()
+        .with_platform(Platform::Linux)
+        .with_disabled(LABEL);
+    let (units, service) = linux_units(&scratch);
+
+    assert_eq!(
+        apply(&manager, &units, &unit(), &policy(), &mut || true),
+        Ok(Applied::LeftDisabled)
+    );
+    assert_eq!(
+        fs::read_to_string(&service).unwrap(),
+        render(&unit(), Platform::Linux).unwrap()
+    );
+    assert!(
+        !manager
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::Load(_)))
+    );
+}
+
+#[test]
+fn linux_mask_link_is_left_disabled() {
+    let scratch = Scratch::new();
+    let manager = scratch.manager().with_platform(Platform::Linux);
+    let (units, service) = linux_units(&scratch);
+    symlink("/dev/null", &service).unwrap();
+
+    assert_eq!(
+        apply(&manager, &units, &unit(), &policy(), &mut || true),
+        Ok(Applied::LeftDisabled)
+    );
+    assert_eq!(manager.calls(), [Call::SessionOk]);
+    assert_eq!(fs::read_link(&service).unwrap(), Path::new("/dev/null"));
+}
+
+#[test]
+fn linux_mask_link_without_keep_disabled_is_unsafe() {
+    let scratch = Scratch::new();
+    let manager = scratch.manager().with_platform(Platform::Linux);
+    let (units, service) = linux_units(&scratch);
+    symlink("/dev/null", &service).unwrap();
+    let mut policy = policy();
+    policy.keep_disabled = false;
+
+    assert_eq!(
+        apply(&manager, &units, &unit(), &policy, &mut || true),
+        Err(ApplyError::Unsafe(service.clone()))
+    );
+    assert_eq!(fs::read_link(&service).unwrap(), Path::new("/dev/null"));
+}
+
+#[test]
+fn linux_remove_keeps_a_mask_link() {
+    let scratch = Scratch::new();
+    let manager = scratch.manager().with_platform(Platform::Linux);
+    let (units, service) = linux_units(&scratch);
+    symlink("/dev/null", &service).unwrap();
+
+    assert_eq!(
+        remove(&manager, &units, LABEL, &policy()),
+        Ok(Removed::NotInstalled)
+    );
+    assert_eq!(fs::read_link(&service).unwrap(), Path::new("/dev/null"));
+    assert_eq!(manager.calls(), [Call::SessionOk]);
+}
+
+#[test]
+fn macos_symlink_to_dev_null_stays_unsafe() {
+    let scratch = Scratch::new();
+    let manager = scratch.manager();
+    fs::create_dir(scratch.agents()).unwrap();
+    symlink("/dev/null", scratch.plist()).unwrap();
+
+    assert_eq!(
+        install(&manager, &scratch),
+        Err(ApplyError::Unsafe(scratch.plist()))
+    );
+    assert_eq!(
+        fs::read_link(scratch.plist()).unwrap(),
+        Path::new("/dev/null")
+    );
+}
+
+#[test]
+fn linux_remove_unloads_a_loaded_unit() {
+    let scratch = Scratch::new();
+    let manager = scratch
+        .manager()
+        .with_platform(Platform::Linux)
+        .with_loaded(LABEL, State::Idle);
+    let (units, service) = linux_units(&scratch);
+    fs::write(&service, render(&unit(), Platform::Linux).unwrap()).unwrap();
+
+    assert_eq!(
+        remove(&manager, &units, LABEL, &policy()),
+        Ok(Removed::Removed)
+    );
+    assert!(manager.calls().contains(&Call::Unload(LABEL.into())));
+    assert!(!service.exists());
+}
+
+#[test]
+fn linux_symlink_elsewhere_stays_unsafe() {
+    let scratch = Scratch::new();
+    let manager = scratch.manager().with_platform(Platform::Linux);
+    let (units, service) = linux_units(&scratch);
+    let target = scratch.0.join("elsewhere.service");
+    fs::write(&target, b"other").unwrap();
+    symlink(&target, &service).unwrap();
+
+    assert_eq!(
+        apply(&manager, &units, &unit(), &policy(), &mut || true),
+        Err(ApplyError::Unsafe(service.clone()))
+    );
+    assert_eq!(
+        remove(&manager, &units, LABEL, &policy()),
+        Ok(Removed::Removed)
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"other");
 }

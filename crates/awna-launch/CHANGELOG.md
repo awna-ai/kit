@@ -8,7 +8,8 @@ This package is versioned on its own. Its releases are tagged `awna-launch-vX.Y.
 - `Manager` gains `platform`, so `apply`, `remove` and `retire` write and remove the platform's own unit file.
 - Add `lingering`, which reports whether a Linux user's services outlive a logout. The kit never enables it.
 - Breaking: `Manager::platform` is a new required method, and `UnitError` gains `Unsupported` and is now `#[non_exhaustive]`.
-- A log file that appears between the check and its creation is accepted when it belongs to the manager's user.
+- A log file that appears between the check and its creation is accepted only when it is a regular file of the manager's user with one link, and a log directory `apply` creates is checked again before use.
+- A Linux `KeepAlive` unit has no start rate limit, a mask link in the units directory counts as disabled and is never deleted, and values systemd would refuse are refused when rendering.
 
 ## 0.1.0
 

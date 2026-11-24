@@ -38,7 +38,8 @@ impl Systemctl {
     /// Uses a nonempty stand-in when supplied and permits systemctl only for the account's own home.
     ///
     /// Obtain `account_home` from the account's password-database entry rather than `$HOME`.
-    /// [Self::new] and [Self::system] bypass this guard.
+    /// [Self::new] and [Self::system] bypass this guard. The guard is advisory: a copy of the
+    /// system program or a wrapper script passes it.
     pub fn resolve(
         stand_in: Option<&OsStr>,
         home: &Path,
@@ -210,17 +211,21 @@ pub const LINGER_DIR: &str = "/var/lib/systemd/linger";
 /// A Linux user unit stops at logout unless its user lingers. This crate never enables
 /// lingering. If it is off, callers can tell the user about `loginctl enable-linger` and carry on.
 pub fn lingering(linger_dir: &Path, user: &str) -> io::Result<bool> {
+    // logind escapes the bytes it cannot use in a file name, so only plain names match its flag file.
     if user.is_empty()
         || user.len() > 256
         || matches!(user, "." | "..")
-        || user.contains(['/', '\0'])
+        || user.bytes().any(|byte| {
+            !(0x20..=0x7e).contains(&byte) || matches!(byte, b'/' | b'\\' | b'"' | b'\'')
+        })
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "The user name is invalid",
         ));
     }
-    match fs::symlink_metadata(linger_dir.join(user)) {
+    // logind checks the flag file with access(), which follows links.
+    match fs::metadata(linger_dir.join(user)) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
@@ -307,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn lingering_checks_the_entry_without_following_it() {
+    fn lingering_follows_links_like_logind() {
         use std::os::unix::fs::symlink;
 
         let dir = std::env::temp_dir().join(format!("awna-launch-linger-{}", std::process::id()));
@@ -322,12 +327,24 @@ mod tests {
             ))
         })();
         fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(result.unwrap(), (true, false, true));
+        assert_eq!(result.unwrap(), (true, false, false));
     }
 
     #[test]
     fn lingering_rejects_invalid_names() {
-        for user in ["", ".", "..", "a/b", "a\0b", &"a".repeat(257)] {
+        for user in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\0b",
+            &"a".repeat(257),
+            "a\\b",
+            "a\"b",
+            "a'b",
+            "\u{e9}",
+            "a\tb",
+        ] {
             assert_eq!(
                 lingering(Path::new("/var/tmp/example/linger"), user).map_err(|error| error.kind()),
                 Err(io::ErrorKind::InvalidInput)

@@ -37,7 +37,8 @@ impl Launchctl {
     /// Uses a nonempty stand-in when supplied and permits system launchctl only for the account's own home.
     ///
     /// Obtain `account_home` from the account's password-database entry rather than `$HOME`.
-    /// [Self::new] and [Self::system] bypass this guard.
+    /// [Self::new] and [Self::system] bypass this guard. The guard is advisory: a copy of the
+    /// system program or a wrapper script passes it.
     pub fn resolve(
         stand_in: Option<&OsStr>,
         home: &Path,

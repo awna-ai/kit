@@ -3,6 +3,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 /// The state of a service in the current session.
@@ -106,6 +107,11 @@ pub(crate) fn resolve_program(
                 (fs::canonicalize(program), fs::canonicalize(system)),
                 (Ok(candidate), Ok(system)) if candidate == system
             )
+            || matches!(
+                (fs::metadata(program), fs::metadata(system)),
+                (Ok(candidate), Ok(system))
+                    if (candidate.dev(), candidate.ino()) == (system.dev(), system.ino())
+            )
         {
             return Err(ResolveError::StandInIsSystem);
         }
@@ -187,6 +193,19 @@ pub fn parse_disabled(output: &str, label: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_refuses_a_hard_link_to_the_system_program() {
+        let dir = std::env::temp_dir().join(format!("awna-launch-resolve-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let system = dir.join("system");
+        let link = dir.join("stand-in");
+        fs::write(&system, "").unwrap();
+        fs::hard_link(&system, &link).unwrap();
+        let result = resolve_program(Some(link.as_os_str()), &dir, &dir, &system);
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(result, Err(ResolveError::StandInIsSystem));
+    }
 
     #[test]
     fn print_requires_a_top_level_state() {

@@ -31,6 +31,9 @@ pub struct Policy {
     /// Skip an already loaded service whose unit file matches.
     pub skip_unchanged: bool,
     /// Preserve the service manager's disabled setting.
+    ///
+    /// On Linux only a masked unit counts as disabled: a unit the user disabled with
+    /// `systemctl --user disable` is loaded again by the next `apply`.
     pub keep_disabled: bool,
     /// Refuse a change that would unload a running service.
     pub never_stop_running: bool,
@@ -244,6 +247,10 @@ fn prepare_logs(missing: &[&Path], uid: u32) -> Result<(), ApplyError> {
     for path in missing {
         if let Some(parent) = path.parent() {
             make_dir(parent, 0o700)?;
+            let entry: PathBuf = parent.components().collect();
+            if !metadata(&entry)?.is_some_and(|metadata| safe_directory(&metadata, uid)) {
+                return Err(ApplyError::Unsafe(parent.into()));
+            }
         }
         let result = OpenOptions::new()
             .write(true)
@@ -254,7 +261,10 @@ fn prepare_logs(missing: &[&Path], uid: u32) -> Result<(), ApplyError> {
             if error.kind() != io::ErrorKind::AlreadyExists {
                 return Err(io_error("create log", path, error));
             }
-            if regular_file(path, uid) != Ok(true) {
+            // Accept only a file of the manager's user that is not a link to another file.
+            if !metadata(path)?.is_some_and(|metadata| {
+                metadata.is_file() && metadata.uid() == uid && metadata.nlink() == 1
+            }) {
                 return Err(ApplyError::Unsafe((*path).into()));
             }
         }
@@ -285,6 +295,17 @@ fn write_unit(path: &Path, bytes: &[u8]) -> Result<(), ApplyError> {
         let _ = fs::remove_file(temporary);
     }
     result
+}
+
+/// Reports whether a Linux unit path is a mask: a symbolic link to `/dev/null`.
+fn masked(path: &Path, platform: Platform) -> Result<bool, ApplyError> {
+    if platform != Platform::Linux
+        || !metadata(path)?.is_some_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Ok(false);
+    }
+    let target = fs::read_link(path).map_err(|error| io_error("read link", path, error))?;
+    Ok(target == Path::new("/dev/null"))
 }
 
 fn delete_unit(path: &Path) -> Result<bool, ApplyError> {
@@ -376,7 +397,9 @@ pub fn plist_path(units_dir: &Path, label: &str) -> PathBuf {
 /// Installs or updates a service and checks its health after loading it.
 ///
 /// `units_dir` is `~/Library/LaunchAgents` for launchd and `~/.config/systemd/user` for systemd user
-/// units.
+/// units. On Linux it must be a directory on the systemd user unit search path, because systemd finds
+/// the unit by name. A unit path there that links to `/dev/null` is a mask: with `keep_disabled` it
+/// counts as disabled and is left as it is, and `remove` never deletes it.
 /// The units directory must be absolute and contain no parent components. Existing
 /// unit files, log files, the units directory, and immediate log parents must belong
 /// to the manager's user. The two kinds of directories must also exclude group
@@ -412,6 +435,9 @@ pub fn apply<M: Manager + ?Sized>(
     }
     let label = &unit.label;
     let path = unit_path(units_dir, label, platform);
+    if policy.keep_disabled && masked(&path, platform)? {
+        return Ok(Applied::LeftDisabled);
+    }
     let current = regular_file(&path, uid)?
         .then(|| fs::read(&path).map_err(|error| io_error("read unit file", &path, error)))
         .transpose()?;
@@ -498,6 +524,9 @@ pub fn remove<M: Manager + ?Sized>(
     }
     require_session(manager)?;
     let path = unit_path(units_dir, label, manager.platform());
+    if masked(&path, manager.platform())? {
+        return Ok(Removed::NotInstalled);
+    }
     if metadata(&path)?.is_some_and(|metadata| metadata.is_dir()) {
         return Err(ApplyError::Unsafe(path));
     }
@@ -533,7 +562,7 @@ mod tests {
     use super::{ApplyError, missing_logs, prepare_logs, regular_file};
     use crate::{Run, Unit};
     use std::fs::{self, DirBuilder, File};
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, symlink};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt, symlink};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -636,5 +665,31 @@ mod tests {
         symlink(&target, &path).unwrap();
 
         assert_eq!(prepare_logs(&[&path], uid), Err(ApplyError::Unsafe(path)));
+    }
+
+    #[test]
+    fn prepare_logs_rejects_a_hard_link_that_appeared() {
+        let scratch = Scratch::new();
+        let target = scratch.0.join("profile");
+        fs::write(&target, b"keep").unwrap();
+        let uid = fs::metadata(&target).unwrap().uid();
+        let path = scratch.0.join("output.log");
+        fs::hard_link(&target, &path).unwrap();
+
+        assert_eq!(prepare_logs(&[&path], uid), Err(ApplyError::Unsafe(path)));
+        assert_eq!(fs::read(&target).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn prepare_logs_rejects_a_parent_that_appeared_unsafe() {
+        let scratch = Scratch::new();
+        let parent = scratch.0.join("logs");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o777)).unwrap();
+        let uid = fs::metadata(&parent).unwrap().uid();
+        let path = parent.join("output.log");
+
+        assert_eq!(prepare_logs(&[&path], uid), Err(ApplyError::Unsafe(parent)));
+        assert!(!path.exists());
     }
 }

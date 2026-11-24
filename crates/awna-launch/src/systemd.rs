@@ -4,13 +4,18 @@ use std::path::Path;
 use crate::unit::{Run, Unit, UnitError};
 
 pub(crate) fn render(unit: &Unit) -> Result<String, UnitError> {
-    let restart = match unit.run {
-        Run::KeepAlive => "Restart=always\nRestartSec=1\n",
-        Run::Once => "Restart=no\n",
+    let (start_limit, restart) = match unit.run {
+        // launchd keeps restarting a service that exits; systemd stops at its start rate limit.
+        Run::KeepAlive => (
+            "StartLimitIntervalSec=0\n",
+            "Restart=always\nRestartSec=1\n",
+        ),
+        Run::Once => ("", "Restart=no\n"),
         Run::Interval(_) | Run::Calendar(_) => return Err(UnitError::Unsupported),
     };
+    check(unit)?;
     let mut text = format!(
-        "[Unit]\nDescription={}\n\n[Service]\nType=simple\nExecStart=",
+        "[Unit]\nDescription={}\n{start_limit}\n[Service]\nType=simple\nExecStart=",
         unit.label,
     );
     for (index, arg) in unit.argv.iter().enumerate() {
@@ -58,6 +63,37 @@ pub(crate) fn render(unit: &Unit) -> Result<String, UnitError> {
     }
     text.push_str("\n[Install]\nWantedBy=default.target\n");
     Ok(text)
+}
+
+/// Refuses values that pass validation but that systemd rejects or reads differently.
+fn check(unit: &Unit) -> Result<(), UnitError> {
+    if unit
+        .argv
+        .first()
+        .is_some_and(|program| program.contains('$'))
+    {
+        // systemd does not expand the program path, so an escaped `$$` would stay literal.
+        return Err(UnitError::Program);
+    }
+    if unit
+        .argv
+        .iter()
+        .chain(unit.env.iter().flat_map(|(key, value)| [key, value]))
+        .any(|text| text.chars().any(noncharacter))
+    {
+        return Err(UnitError::Text);
+    }
+    if unit.nice == Some(20) {
+        // systemd's Nice= takes -20 through 19 and ignores anything else.
+        return Err(UnitError::Nice);
+    }
+    Ok(())
+}
+
+/// Unicode noncharacters, which systemd refuses anywhere in a unit line.
+fn noncharacter(character: char) -> bool {
+    let code = u32::from(character);
+    (0xfdd0..=0xfdef).contains(&code) || code & 0xfffe == 0xfffe
 }
 
 fn escape(text: &mut String, value: &str, expand_dollars: bool) {
