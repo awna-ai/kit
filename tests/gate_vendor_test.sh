@@ -35,6 +35,10 @@ check() {
     shift
     if ! "$@"; then printf 'gate_vendor_test: FAIL %s\n' "$name"; failed=1; fi
 }
+check docs-git-version grep -Fq 'pin check needs git 2.29 or later' "$root/gate/README.md"
+# shellcheck disable=SC2016
+check docs-direct-scanner grep -Fq 'Running a vendored scanner directly (without `gate_run`) checks no pin.' "$root/gate/README.md"
+check docs-rename-race grep -Fq "A concurrent writer in the destination's parent can race the final rename" "$root/gate/README.md"
 expect() {
     local name=$1 wanted=$2 text=$3 actual=0
     shift 3
@@ -45,6 +49,8 @@ expect() {
 vendor() {
     bash "$source_repo/gate/vendor.sh" "$@"
 }
+git init -q "$tmp/other"
+expect inherited-common-dir 0 'vendor: copied awna-gate-v0.1.0' env GIT_COMMON_DIR="$tmp/other/.git" bash "$source_repo/gate/vendor.sh" awna-gate-v0.1.0 "$tmp/isolated-copy"
 expect initial-copy 0 "vendor: copied awna-gate-v0.1.0 (tree $tree) to $destination" vendor awna-gate-v0.1.0 "$destination"
 # A missing implementation cannot exercise the consumer yet.
 if [ ! -f "$destination/lib.sh" ]; then exit 1; fi
@@ -70,6 +76,49 @@ reset_copy() {
 }
 run_consumer() {
     TMPDIR="$tmp/logs" "$runner" "$consumer" "$@"
+}
+hash_runtime_cases() {
+    reset_copy
+    mkdir -p "$tmp/hash-bin" "$tmp/hash-logs"
+    TREE_TEST_GIT=$(type -P git)
+    export TREE_TEST_GIT
+    cat > "$tmp/hash-bin/git" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = init ]; then
+    GIT_DEFAULT_HASH=sha256 "$TREE_TEST_GIT" "$@"
+else
+    exec "$TREE_TEST_GIT" "$@"
+fi
+SH
+    chmod +x "$tmp/hash-bin/git"
+    # shellcheck disable=SC2016
+    expect sha1-default 0 "$tree" env PATH="$tmp/hash-bin:$PATH" "$runner" -c '. "$1/lib.sh"; _gate_tree_hash "$2"' bash "$root/gate" "$destination"
+    # Exit the hashing subshell during init; its EXIT trap must still clean up.
+    # shellcheck disable=SC2016
+    expect hash-exit-cleanup 1 'hash-status=1' env TMPDIR="$tmp/hash-logs" "$runner" -c '. "$1/lib.sh"; git() { exit 1; }; _gate_tree_hash "$2"; status=$?; printf "hash-status=%s\n" "$status"; exit "$status"' bash "$root/gate" "$destination"
+    check hash-no-temporary test -z "$(ls -A "$tmp/hash-logs")"
+}
+owner_mode_cases() {
+    mkdir -p "$tmp/modes"
+    printf 'fixture\n' > "$tmp/modes/run"
+    chmod 744 "$tmp/modes/run"
+    blob=$(git -C "$source_repo" hash-object -w "$tmp/modes/run")
+    mode_tree=$(printf '100755 blob %s\trun\n' "$blob" | git -C "$source_repo" mktree)
+    # Simulate execute access denied independently of the recorded owner bit.
+    # shellcheck disable=SC2016
+    expect owner-mode 0 "$mode_tree" "$runner" -c '. "$1/lib.sh"; function [() { if builtin [ "$#" -eq 3 ] && builtin [ "$1" = -x ]; then return 1; fi; builtin [ "$@"; }; _gate_tree_hash "$2"' bash "$root/gate" "$tmp/modes"
+}
+directory_cases() {
+    local style=strict
+    make_consumer
+    reset_copy
+    printf '\n# drift\n' >> "$destination/lib.sh"
+    # Source a relative path so an inherited CDPATH could pollute the saved path.
+    # shellcheck disable=SC2016
+    expect cdpath-drift 1 'differs from its pin awna-gate-v0.1.0' env CDPATH=. TMPDIR="$tmp/logs" "$runner" -c 'cd -- "$1"; . copy/lib.sh; gate_init --name t --; gate_step one '\''printf ran > marker'\''; gate_run' bash "$tmp"
+    check cdpath-no-marker test ! -e "$tmp/marker"
+    # shellcheck disable=SC2016
+    expect newline-library-source 2 "t: gate_run: cannot find the library's directory" "$runner" -c '. "$1/lib.sh"; _GATE_LIBRARY_SOURCE=$'\''bad\npath'\''; gate_init --name t --; gate_step one :; gate_run' bash "$destination"
 }
 consumer_cases() {
     local style change
@@ -176,10 +225,16 @@ run_map() { (cd "$tmp/consumer-repo" && run_consumer --check-map); }
 run_touched() { (cd "$tmp/consumer-repo" && run_consumer --tier touched); }
 mkdir "$tmp/bin"
 for tool in bash mktemp rm tail; do ln -s "$(type -P "$tool")" "$tmp/bin/$tool"; done
+hash_runtime_cases
+owner_mode_cases
+directory_cases
 consumer_cases
 # shellcheck disable=SC2016
 if [ -x /bin/bash ] && [ "$(/bin/bash -c 'printf %s "${BASH_VERSINFO[0]}"')" != "$("$runner" -c 'printf %s "${BASH_VERSINFO[0]}"')" ]; then
     runner=/bin/bash
+    hash_runtime_cases
+    owner_mode_cases
+    directory_cases
     consumer_cases
 fi
 reset_copy
@@ -194,6 +249,8 @@ refuse() {
 refuse arguments 'usage: vendor.sh <tag> <destination>'
 for tag in v0.1.0 awna-gate-v01.0.0; do refuse invalid-tag 'vendor: not a release tag' "$tag" "$destination"; done
 refuse unknown 'vendor: no such tag: awna-gate-v9.0.0' awna-gate-v9.0.0 "$destination"
+git -C "$source_repo" branch refs/tags/awna-gate-v9.0.0
+refuse branch-not-tag 'vendor: no such tag: awna-gate-v9.0.0' awna-gate-v9.0.0 "$destination"
 for change in absent link pin attributes version nul-version missing-lib bad-path; do
     rm -rf "$source_repo/gate"
     git -C "$source_repo" restore --source=awna-gate-v0.1.0 -- gate
@@ -230,6 +287,15 @@ mkdir "$tmp/plain"
 printf keep > "$tmp/plain/file"
 refuse destination-plain 'exists and is not a vendored copy' awna-gate-v0.1.0 "$tmp/plain"
 check preserved test "$(cat "$tmp/plain/file")" = keep
+# A PIN filename alone does not authorize replacing a directory.
+mkdir -p "$tmp/plain/src"
+printf 'keep\n' > "$tmp/plain/src/keep.txt"
+printf 'x\n' > "$tmp/plain/PIN"
+expect destination-fake-pin 2 "$tmp/plain exists and is not a vendored copy" vendor awna-gate-v0.1.0 "$tmp/plain"
+check fake-pin-preserved test -f "$tmp/plain/src/keep.txt"
+printf 'tag awna-gate-v0.1.0\ntree %s\n' "$tree" > "$tmp/plain/PIN"
+expect destination-unmarked-pin 2 "$tmp/plain exists and is not a vendored copy" vendor awna-gate-v0.1.0 "$tmp/plain"
+check unmarked-pin-preserved test -f "$tmp/plain/src/keep.txt"
 printf '0.1.1\n' > "$source_repo/gate/VERSION"
 printf ':\n' > "$source_repo/gate/executable.sh"
 chmod +x "$source_repo/gate/executable.sh"

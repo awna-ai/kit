@@ -2,7 +2,7 @@
 set -euo pipefail
 export LC_ALL=C
 export GIT_NO_REPLACE_OBJECTS=1
-unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR
 usage() {
     printf '%s\n' 'usage: vendor.sh <tag> <destination>' >&2
     exit 2
@@ -16,8 +16,9 @@ tag=$1 destination=$2
 if [[ ! "$tag" =~ ^awna-gate-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
     fail 'not a release tag'
 fi
-library=$(cd "$(dirname "$0")" && pwd) || fail 'cannot find the source directory'
+library=$(CDPATH='' cd -- "$(dirname "$0")" && pwd) || fail 'cannot find the source directory'
 source_repo=$(git -C "$library" rev-parse --show-toplevel 2> /dev/null) || fail 'cannot find the source repository'
+git -C "$source_repo" show-ref --verify --quiet "refs/tags/$tag" || fail "no such tag: $tag"
 commit=$(git -C "$source_repo" rev-parse --verify --quiet "refs/tags/$tag^{commit}") || fail "no such tag: $tag"
 tree=$(git -C "$source_repo" rev-parse --verify --quiet "$commit:gate") || fail "$tag has no gate directory"
 [ "$(git -C "$source_repo" cat-file -t "$tree")" = tree ] || fail "$tag has no gate directory"
@@ -74,8 +75,13 @@ case "$destination" in
     *) parent=.; base=$destination ;;
 esac
 [ -d "$parent" ] || fail "the parent of $destination does not exist"
-if [ -L "$destination" ] || { [ -e "$destination" ] && { [ ! -d "$destination" ] || [ ! -f "$destination/PIN" ] || [ -L "$destination/PIN" ]; }; }; then
-    fail "$destination exists and is not a vendored copy"
+pin_marker="# Written by vendor.sh. The gate fails when this directory differs from this tag's tree."
+if [ -L "$destination" ]; then fail "$destination exists and is not a vendored copy"; fi
+if [ -e "$destination" ]; then
+    if [ ! -d "$destination" ] || ! _gate_read_pin "$destination/PIN" ||
+        ! IFS= read -r first_line < "$destination/PIN" || [ "$first_line" != "$pin_marker" ]; then
+        fail "$destination exists and is not a vendored copy"
+    fi
 fi
 working=$(mktemp -d "$parent/.$base.XXXXXX") || fail 'cannot create a temporary directory'
 while IFS= read -r -d '' entry; do
@@ -86,7 +92,7 @@ while IFS= read -r -d '' entry; do
     chmod "${mode#100}" "$working/$path" || fail 'cannot set the copy modes'
 done < "$entries"
 find "$working" -type d -exec chmod 755 {} + || fail 'cannot set the directory modes'
-printf '# Written by vendor.sh. The gate fails when this directory differs from this tag'"'"'s tree.\ntag %s\ntree %s\n' "$tag" "$tree" > "$working/PIN" || fail 'cannot write the pin'
+printf '%s\ntag %s\ntree %s\n' "$pin_marker" "$tag" "$tree" > "$working/PIN" || fail 'cannot write the pin'
 chmod 644 "$working/PIN" || fail 'cannot set the pin mode'
 found=$(_gate_tree_hash "$working") || fail "the copy does not match $tag"
 [ "$found" = "$tree" ] || fail "the copy does not match $tag"

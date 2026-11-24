@@ -1,7 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Read the exported setting before any scanner variable can replace its value.
+strict_value=$(
+    while [ "$#" -ge 2 ]; do
+        if [ "$1" = --strict-var ]; then
+            printenv -- "$2" || true
+            break
+        fi
+        shift 2
+    done
+)
 export LC_ALL=C
 export GIT_NO_REPLACE_OBJECTS=1
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR
 
 usage() {
     printf '%s\n' 'usage: term-check.sh --terms <file> [--strict-var <VAR>] (--root <dir> | --message <file>)' >&2
@@ -38,11 +49,16 @@ while [ "$#" -gt 0 ]; do
 done
 if [ "$strict_seen" -eq 1 ] && [[ ! "$strict_var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then usage; fi
 strict=0
-if [ -n "$strict_var" ] && [ "${!strict_var:-}" = 1 ]; then strict=1; fi
+if [ -n "$strict_var" ] && [ "$strict_value" = 1 ]; then strict=1; fi
 [ "$terms_seen" -eq 1 ] && [ -n "$terms" ] && [ "$((root_seen + message_seen))" -eq 1 ] || usage
 if [ "$root_seen" -eq 1 ]; then
     [ -d "$root" ] || usage
-    root=$(cd "$root" && pwd) || usage
+    root=$(CDPATH='' cd -- "$root" && pwd -P) || usage
+    if ! top=$(git -C "$root" rev-parse --show-toplevel 2> /dev/null) ||
+        ! top=$(CDPATH='' cd -- "$top" && pwd -P) || [ "$top" != "$root" ]; then
+        printf 'term-check: %s is not the top of a git repository\n' "$root" >&2
+        exit 2
+    fi
 fi
 if [ ! -f "$terms" ] || [ ! -r "$terms" ]; then
     if [ "$strict" -eq 1 ]; then
@@ -72,7 +88,7 @@ if [ ! -s "$list" ]; then
 fi
 
 normalize() {
-    sed -E 's/_/ /g; s/([a-z0-9])([A-Z])/\1 \2/g; s/([A-Z])([A-Z][a-z])/\1 \2/g; s/([A-Za-z])([0-9])/\1 \2/g; s/([0-9])([A-Za-z])/\1 \2/g' "$@"
+    sed -E -e 's/_/ /g; s/([a-z0-9])([A-Z])/\1 \2/g; s/([A-Z])([A-Z][a-z])/\1 \2/g; s/([A-Za-z])([0-9])/\1 \2/g; s/([0-9])([A-Za-z])/\1 \2/g' -- "$@"
 }
 
 # hits <file>: 0 on a hit, 1 on none; any grep error exits 2.

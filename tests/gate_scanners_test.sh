@@ -22,6 +22,10 @@ expect() {
         failed=1
     fi
 }
+if ! grep -Fq 'A path or link target that itself holds a term is printed as it is.' "$root/gate/README.md"; then
+    printf 'gate_scanners_test: FAIL docs-diagnostic-paths\n'
+    failed=1
+fi
 term_scan="$root/gate/term-check.sh"
 secret_scan="$root/gate/secret-scan.sh"
 term_usage='usage: term-check.sh --terms <file> [--strict-var <VAR>] (--root <dir> | --message <file>)'
@@ -39,6 +43,7 @@ done
 for option in --root --message --strict-var; do
     expect "repeated-$option" 2 "$term_usage" bash "$term_scan" --terms x "$option" x "$option" x
 done
+expect strict-message-name 75 'term-check: no term list at' env message=1 bash "$term_scan" --terms "$tmp/absent" --strict-var message --root "$tmp/target"
 expect strict-list 75 'term-check: no term list at' env OTHER=1 bash "$term_scan" --terms "$tmp/absent" --strict-var OTHER --root "$tmp/target"
 unset OTHER
 export KIT_STRICT=1
@@ -55,6 +60,21 @@ expect empty-message-missing-list 0 ', skipped' bash "$term_scan" --terms "$tmp/
 expect dirty-message 1 'the message names a private term' bash "$term_scan" --terms "$tmp/terms" --message text
 printf 'clean\n' > "$tmp/message"
 expect clean-message 0 'the message is clean' bash "$term_scan" --terms "$tmp/terms" --message "$tmp/message"
+printf '%sHelper\n' "$term" > ./-note
+mkdir "$tmp/sed-bin"
+SCANNER_TEST_SED=$(type -P sed)
+export SCANNER_TEST_SED
+# Model option parsing on hosts that still interpret options after the script.
+cat > "$tmp/sed-bin/sed" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = -E ]; then
+    if [ "${2:-}" = -e ]; then filename=${4:-}; else filename=${3:-}; fi
+    if [ "$filename" != -- ] && [[ "$filename" = -* ]]; then exit 2; fi
+fi
+exec "$SCANNER_TEST_SED" "$@"
+SH
+chmod +x "$tmp/sed-bin/sed"
+expect option-like-message 1 'the message names a private term' env PATH="$tmp/sed-bin:$PATH" bash "$term_scan" --terms "$tmp/terms" --message -note
 expect missing-root 2 "$secret_usage" bash "$secret_scan"
 expect unknown-secret 2 "$secret_usage" bash "$secret_scan" --unknown
 expect invalid-secret-var 2 "$secret_usage" bash "$secret_scan" --root "$tmp/target" --strict-var 1bad
@@ -64,7 +84,39 @@ expect invalid-secret-root 2 "$secret_usage" bash "$secret_scan" --root "$tmp/ab
 for option in --root --strict-var; do
     expect "missing-secret-$option" 2 "$secret_usage" bash "$secret_scan" "$option"
 done
+mkdir "$tmp/target/sub" "$tmp/outside" -- -L
+for scanner in "$term_scan" "$secret_scan"; do
+    options=()
+    if [ "$scanner" = "$term_scan" ]; then options=(--terms "$tmp/terms"); fi
+    for bad_root in "$tmp/target/sub" "$tmp/outside" -L; do
+        expected_root=$(CDPATH='' cd -- "$bad_root" && pwd -P)
+        scanner_name=${scanner##*/}
+        expect "not-top-$scanner_name-$bad_root" 2 "${scanner_name%.sh}: $expected_root is not the top of a git repository" bash "$scanner" "${options[@]+"${options[@]}"}" --root "$bad_root"
+    done
+done
+# The explicit root wins over Git settings inherited from another repository.
+git init -q "$tmp/empty"
+for scanner in "$term_scan" "$secret_scan"; do
+    git init -q "$tmp/history"
+    options=()
+    if [ "$scanner" = "$term_scan" ]; then
+        options=(--terms "$tmp/terms")
+        printf '%s\n' "$term" > "$tmp/history/text"
+        diagnostic='the history holds a file naming a private term'
+    else
+        if ! command -v gitleaks > /dev/null 2>&1; then continue; fi
+        printf '%s\n' 'gh''p_''r7K9mQ2vX8nB4sD6fG1hJ3kL5pZ0cVwY9aE2' > "$tmp/history/text"
+        diagnostic='leaks found'
+    fi
+    git -C "$tmp/history" add text
+    git -C "$tmp/history" -c user.name=Test -c user.email=test@example.invalid -c commit.gpgsign=false commit -qm 'Record a fixture.'
+    rm "$tmp/history/text"
+    expect "inherited-git-${scanner##*/}" 1 "$diagnostic" env GIT_DIR="$tmp/empty/.git" GIT_WORK_TREE="$tmp/empty" GIT_INDEX_FILE="$tmp/empty/.git/index" GIT_OBJECT_DIRECTORY="$tmp/empty/.git/objects" GIT_ALTERNATE_OBJECT_DIRECTORIES="$tmp/empty/.git/objects" GIT_COMMON_DIR="$tmp/empty/.git" bash "$scanner" "${options[@]+"${options[@]}"}" --root "$tmp/history"
+    rm -rf "$tmp/history"
+done
 mkdir "$tmp/bin"
+for tool in git printenv; do ln -s "$(type -P "$tool")" "$tmp/bin/$tool"; done
+expect strict-secret-name 75 'secret-scan: gitleaks is missing on this host (strict=1)' env strict=1 PATH="$tmp/bin" "$BASH" "$secret_scan" --strict-var strict --root "$tmp/target"
 expect named-strict 75 'secret-scan: gitleaks is missing on this host (OTHER=1)' env PATH="$tmp/bin" OTHER=1 "$BASH" "$secret_scan" --strict-var OTHER --root "$tmp/target"
 expect independent-secret 0 ', skipped' env PATH="$tmp/bin" KIT_STRICT=1 "$BASH" "$secret_scan" --strict-var OTHER --root "$tmp/target"
 if command -v gitleaks > /dev/null 2>&1; then

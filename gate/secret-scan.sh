@@ -1,7 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Read the exported setting before any scanner variable can replace its value.
+strict_value=$(
+    while [ "$#" -ge 2 ]; do
+        if [ "$1" = --strict-var ]; then
+            printenv -- "$2" || true
+            break
+        fi
+        shift 2
+    done
+)
 export LC_ALL=C
 export GIT_NO_REPLACE_OBJECTS=1
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR
 trap 'printf "%s\n" "secret-scan: internal error" >&2; exit 2' ERR
 usage() {
     printf '%s\n' 'usage: secret-scan.sh [--strict-var <VAR>] --root <dir>' >&2
@@ -27,11 +38,16 @@ while [ "$#" -gt 0 ]; do
 done
 if [ "$strict_seen" -eq 1 ] && [[ ! "$strict_var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then usage; fi
 strict=0
-if [ -n "$strict_var" ] && [ "${!strict_var:-}" = 1 ]; then strict=1; fi
+if [ -n "$strict_var" ] && [ "$strict_value" = 1 ]; then strict=1; fi
 [ "$root_seen" -eq 1 ] || usage
 [ -d "$root" ] || usage
-root=$(cd "$root" && pwd) || usage
-cd "$root" || usage
+root=$(CDPATH='' cd -- "$root" && pwd -P) || usage
+if ! top=$(git -C "$root" rev-parse --show-toplevel 2> /dev/null) ||
+    ! top=$(CDPATH='' cd -- "$top" && pwd -P) || [ "$top" != "$root" ]; then
+    printf 'secret-scan: %s is not the top of a git repository\n' "$root" >&2
+    exit 2
+fi
+CDPATH='' cd -- "$root" || usage
 if ! command -v gitleaks > /dev/null 2>&1; then
     if [ "$strict" -eq 1 ]; then
         printf 'secret-scan: gitleaks is missing on this host (%s=1)\n' "$strict_var" >&2
