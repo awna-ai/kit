@@ -1,0 +1,7 @@
+{"type":"thread.started","thread_id":"3f6c1b2e-8d4a-4f0e-9b7c-2a5d6e8f1c3b"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Read the total."}}
+{"type":"turn.completed","usage":{"input_tokens":8,"cached_input_tokens":3,"cache_write_input_tokens":2,"output_tokens":4,"reasoning_output_tokens":9}}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"Recorded 7."}}
+{"type":"turn.completed","usage":{"input_tokens":8,"cached_input_tokens":3,"cache_write_input_tokens":2,"output_tokens":4,"reasoning_output_tokens":9}}

@@ -1,0 +1,4 @@
+{"type":"system","subtype":"init","cwd":"/work","session_id":"3f6c1b2e-8d4a-4f0e-9b7c-2a5d6e8f1c3b","permissionMode":"auto"}
+{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"seven_day","resetsAt":1791504000,"overageStatus":"rejected"},"session_id":"3f6c1b2e-8d4a-4f0e-9b7c-2a5d6e8f1c3b"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Weekly limit reached."}]},"error":"rate_limit","is_api_error_message":true,"api_error_status":429,"session_id":"3f6c1b2e-8d4a-4f0e-9b7c-2a5d6e8f1c3b"}
+{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"result":"Weekly limit reached.","session_id":"3f6c1b2e-8d4a-4f0e-9b7c-2a5d6e8f1c3b","total_cost_usd":5.14667275,"num_turns":1,"modelUsage":{"opus-5-5":{"inputTokens":902,"cacheCreationInputTokens":220612,"cacheReadInputTokens":6793258,"outputTokens":38453}}}
