@@ -501,9 +501,15 @@ case_docs() {
     done
     # shellcheck disable=SC2016
     check grep -Fq 'env -i PATH="$PATH" HOME="$HOME" SSH_AUTH_SOCK="$SSH_AUTH_SOCK" bash gate/verify-main.sh' "$root/gate/README.md"
-    for phrase in 'git commands inside the check' "root's configuration, refs or hooks" 'can read and write anything the caller can' 'every object' 'alternates' 'Only run it on a'; do
+    for phrase in 'git commands inside the check' "root's configuration, refs or hooks" 'can read and write anything the caller can' 'every object' 'alternates' 'only run it on a'; do
         check grep -Fq "$phrase" "$root/.ai/SECURITY.md"
     done
+    # shellcheck disable=SC2016
+    for phrase in 'common `config` and `config.worktree`' "root's own \`config.worktree\` and \`.git\` file" '$common/hooks' 'active hooks directory' 'include.path' 'anything else the check can write as the caller'; do
+        check grep -Fq "$phrase" "$root/gate/README.md"
+        check grep -Fq "$phrase" "$root/.ai/SECURITY.md"
+    done
+    check grep -Eq '^\| 1 \| .*tripwire.*check could not start.*shallow root' "$root/gate/README.md"
     for phrase in 'fresh scratch clone per attempt' 'best-effort lock per local clone' 'configuration or hooks' 'missing host commands' 'shallow roots' 'shadowing refs'; do
         check grep -Fq "$phrase" "$root/gate/CHANGELOG.md"
     done
@@ -604,6 +610,79 @@ case_scratch_config() {
     want_green=$head
     expect 0 "green $head"
     check test "$(git -C "$repo" config --local --list)" = "$before"
+}
+case_detached_root() {
+    for branch in missing behind; do
+        setup
+        commit
+        git -C "$repo" checkout -q --detach "$head"
+        if [ "$branch" = missing ]; then
+            git -C "$repo" branch -D main >/dev/null
+        else
+            git -C "$repo" branch -f main "$base"
+        fi
+        printf 'git for-each-ref --format="%%(refname)" > "%s/refs"\n' "$tmp" > "$tmp/hook"
+        run
+        want_green=$head
+        expect 0 "green $head"
+        check test "$(cat "$tmp/refs")" = refs/remotes/origin/main
+    done
+}
+case_linked_tripwire() {
+    for mutation in worktree gitfile; do
+        setup
+        common="$repo/.git"
+        git -C "$repo" config extensions.worktreeConfig true
+        git -C "$repo" worktree add -q --detach "$tmp/linked" HEAD
+        repo="$tmp/linked"
+        git_dir=$(git -C "$repo" rev-parse --absolute-git-dir)
+        cp "$repo/.git" "$tmp/gitfile"
+        printf '#!/bin/sh\ntouch "%s/payload-ran"\n' "$tmp" > "$tmp/payload"
+        chmod +x "$tmp/payload"
+        mkdir "$tmp/hooks"
+        cp "$tmp/payload" "$tmp/hooks/reference-transaction"
+        if [ "$mutation" = worktree ]; then
+            printf 'git -C "%s" config --worktree core.hooksPath "%s/hooks"\n' "$repo" "$tmp" > "$tmp/hook"
+        else
+            # A different byte representation still points to the same git directory.
+            printf 'printf "gitdir: %s/./\\n" > "%s/.git"\n' "$git_dir" "$repo" > "$tmp/hook"
+        fi
+        run
+        check test "$actual" -eq 1
+        check test "$output" = "verify-main: the check changed $common's git configuration or hooks; nothing changed, inspect it"
+        check test ! -e "$tmp/payload-ran"
+        cp "$tmp/gitfile" "$repo/.git"
+        rm -f "$git_dir/config.worktree"
+        expect 1 "verify-main: the check changed $common's git configuration or hooks; nothing changed, inspect it"
+        check test ! -e "$common/verify-main.lock"
+    done
+}
+case_active_hooks_tripwire() {
+    mkdir "$repo/.githooks"
+    git -C "$repo" config core.hooksPath .githooks
+    printf '#!/bin/sh\ntouch "%s/payload-ran"\n' "$tmp" > "$tmp/payload"
+    chmod +x "$tmp/payload"
+    printf 'cp "%s/payload" "%s/.githooks/reference-transaction"\n' "$tmp" "$repo" > "$tmp/hook"
+    run
+    check test ! -e "$tmp/payload-ran"
+    git -C "$repo" config --unset core.hooksPath
+    expect 1 "verify-main: the check changed $repo/.git's git configuration or hooks; nothing changed, inspect it"
+}
+case_relative_path_command() {
+    mkdir "$tmp/hostbin"
+    printf '#!/bin/sh\nexit 0\n' > "$tmp/hostbin/mycheck"
+    chmod +x "$tmp/hostbin/mycheck"
+    actual=0
+    output=$(cd "$tmp"; PATH="hostbin:$PATH" TMPDIR="$tmp/scratch" "$runner" "$root/gate/verify-main.sh" --root "$repo" -- mycheck 2>"$tmp/err") || actual=$?
+    want_green=$head
+    expect 0 "green $head"
+}
+case_relative_remote() {
+    git -C "$repo" remote set-url origin ../remote.git
+    invoke --root "$repo" -- git ls-remote origin main
+    want_green=$head
+    expect 0 "green $head"
+    check grep -Fq "$head" "$tmp/err"
 }
 case_fresh_rerun() {
     invoke --root "$repo" -- sh -c '[ -f marker ] || { touch marker; exit 1; }'
@@ -781,17 +860,19 @@ WRAP
     done
 }
 case_readonly_red() {
-    for target in nested root; do
+    for target in nested root inaccessible; do
         setup
         if [ "$target" = nested ]; then
             invoke --root "$repo" -- sh -c 'mkdir -p fx/ro && touch fx/ro/f && chmod 555 fx/ro; exit 1'
+        elif [ "$target" = inaccessible ]; then
+            invoke --root "$repo" -- sh -c 'mkdir -p fx/d && touch fx/d/f && chmod 000 fx/d; exit 1'
         else
             invoke --root "$repo" -- sh -c 'chmod 555 .; exit 1'
         fi
         want_frozen=$head
         expect 5 "red $head culprit $head"
         # Restore fixture permissions even on red, so the suite can clean up.
-        chmod -R u+w "$tmp/scratch"
+        chmod -R u+rwX "$tmp/scratch"
     done
 }
 case_cleanup_status() {
@@ -980,7 +1061,7 @@ case_repeat_red() {
     expect 5 "red $head culprit $head"
 }
 cases='repeat_red equal_freeze_advance rerun_unavailable_empty red_covered off_main_advance stolen_lock check_stdout merge_suspects remote_green_object lease_races missing_tools cleanup_status shallow green_push_failure lock_identity bad_lock check_environment relative_tmp inside_tmp cannot_start shadow follow_tags fresh_rerun noncommit_ref docs signals red_push_failure push_races failures environment scratch_config live_lock stale_lock freeze_race green_race covered main_moved rewritten unavailable fixed flaky no_green_red red_many red_one advance current_off_main current_ancestor_frozen current_frozen current first_green usage'
-cases="ps_failure deleted_freeze tree_check check_exit_codes root_tripwire readonly_red dash_tmp fetch_tags lock_directory_link lock_timezone scratch_refs $cases"
+cases="detached_root linked_tripwire active_hooks_tripwire relative_path_command relative_remote ps_failure deleted_freeze tree_check check_exit_codes root_tripwire readonly_red dash_tmp fetch_tags lock_directory_link lock_timezone scratch_refs $cases"
 selected=0
 for name in $cases; do
     if [ "$#" -gt 0 ] && [ "$1" != "$name" ]; then continue; fi

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+caller_pwd=$PWD
 caller_lc_set=${LC_ALL+x} caller_lc=${LC_ALL-}
 caller_replace_set=${GIT_NO_REPLACE_OBJECTS+x} caller_replace=${GIT_NO_REPLACE_OBJECTS-}
 export LC_ALL=C GIT_NO_REPLACE_OBJECTS=1
@@ -36,6 +37,7 @@ top=$(git -C "$root" rev-parse --show-toplevel 2>/dev/null) || usage
 top=$(CDPATH='' cd -- "$top" && pwd -P) || usage
 [ "$root" = "$top" ] || usage
 remote_url=$(git -C "$root" remote get-url -- "$remote" 2>/dev/null) || usage
+case "$remote_url" in /*|*:*) ;; *) remote_url="$root/$remote_url" ;; esac
 shallow=$(git -C "$root" rev-parse --is-shallow-repository) || fail 'cannot inspect history'
 [ "$shallow" != true ] || fail 'a shallow clone cannot name a culprit; fetch the full history'
 common=$(git -C "$root" rev-parse --git-common-dir) || fail 'cannot find the common directory'
@@ -67,7 +69,7 @@ owned=1
 cleanup() {
     local status=$?
     if [ -n "$working" ]; then
-        chmod -R u+w "$working" 2>/dev/null || :
+        chmod -R u+rwX "$working" 2>/dev/null || :
         rm -rf "$working" || printf 'verify-main: warning: cannot remove scratch directory %s\n' "$working" >&2
     fi
     if [ "$owned" -eq 1 ] && [ "$(readlink "$lock" 2>/dev/null)" = "$identity" ]; then
@@ -160,34 +162,43 @@ esac
 if [ "$tree_command" -eq 0 ]; then
     check_program=$(type -P -- "$1") || check_program=''
     [ -n "$check_program" ] || fail "the check could not start ($1 not found); nothing changed"
+    case "$check_program" in /*) ;; *) check_program="$caller_pwd/$check_program" ;; esac
     shift
     set -- "$check_program" "$@"
 fi
 working=$(mktemp -d -- "${TMPDIR:-/tmp}/verify-main.XXXXXX") || fail 'cannot create a scratch directory'
 working=$(CDPATH='' cd -- "$working" && pwd -P) || fail 'cannot resolve the scratch directory'
 case "$working/" in "$root/"*) fail 'the scratch directory must be outside the root' ;; esac
+git_dir=$(git -C "$root" rev-parse --absolute-git-dir) || fail 'cannot find the git directory'
+hooks_dir=$(git -C "$root" rev-parse --git-path hooks) || fail 'cannot find the hooks directory'
+case "$hooks_dir" in /*) ;; *) hooks_dir="$root/$hooks_dir" ;; esac
+git_file=''
+if [ -f "$root/.git" ]; then git_file="$root/.git"; fi
 configuration_fingerprint() {
-    local file entries
-    for file in "$common/config" "$common/config.worktree"; do
+    local file directory entries
+    for file in "$common/config" "$common/config.worktree" "$git_dir/config.worktree" "$git_file"; do
+        [ -n "$file" ] || continue
         if [ -e "$file" ]; then
             cksum "$file" || return 1
         else
             printf 'missing %s\n' "$file"
         fi
     done
-    if [ -d "$common/hooks" ]; then
-        entries=$(find "$common/hooks" -print | sort) || return 1
-        printf '%s\n' "$entries"
-        while IFS= read -r file; do
-            if [ -L "$file" ]; then
-                readlink "$file" || return 1
-            elif [ -f "$file" ]; then
-                cksum "$file" || return 1
-            fi
-        done <<< "$entries"
-    else
-        printf 'missing %s/hooks\n' "$common"
-    fi
+    for directory in "$common/hooks" "$hooks_dir"; do
+        if [ -d "$directory" ]; then
+            entries=$(find "$directory" -print | sort) || return 1
+            printf '%s\n' "$entries"
+            while IFS= read -r file; do
+                if [ -L "$file" ]; then
+                    readlink "$file" || return 1
+                elif [ -f "$file" ]; then
+                    cksum "$file" || return 1
+                fi
+            done <<< "$entries"
+        else
+            printf 'missing %s\n' "$directory"
+        fi
+    done
 }
 configuration=$(configuration_fingerprint) || fail 'cannot inspect git configuration or hooks'
 check_configuration() {
@@ -203,9 +214,11 @@ fresh_clone() {
     git clone --quiet --shared --no-tags --no-checkout -- "$root" "$tree" || fail 'cannot create a scratch clone'
     git -C "$tree" remote remove origin || fail 'cannot remove the scratch remote'
     local copied_branch
-    copied_branch=$(git -C "$tree" symbolic-ref HEAD) || fail 'cannot read the scratch branch'
+    copied_branch=$(git -C "$tree" symbolic-ref -q HEAD) || copied_branch=''
     git -C "$tree" checkout --quiet --detach "$head" || fail 'cannot check out main'
-    git -C "$tree" update-ref -d "$copied_branch" || fail 'cannot remove the scratch branch'
+    if [ -n "$copied_branch" ]; then
+        git -C "$tree" update-ref -d "$copied_branch" || fail 'cannot remove the scratch branch'
+    fi
     git -C "$tree" remote add origin "$remote_url" || fail 'cannot set the scratch remote'
     git -C "$tree" update-ref refs/remotes/origin/main "$head" || fail 'cannot set the scratch main'
 }

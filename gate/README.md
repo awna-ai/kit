@@ -668,12 +668,15 @@ resolved to a program on the host (never a function or builtin); a word not foun
 exits 1 before any attempt, with no ref changes. Shallow roots are refused; fetch
 the full history before running.
 
-Before the first attempt the script fingerprints the root common directory's
-`config`, `config.worktree` when present, and all files under `hooks`, including
-missing files. Immediately after each check, before any further git command,
+Before the first attempt the script fingerprints the common `config` and `config.worktree`,
+the root's own `config.worktree` and `.git` file (when it is a regular file),
+`$common/hooks` and the active hooks directory resolved by Git. Missing configuration
+files and hooks directories are recorded; every hooks entry is listed, with checksums
+for files and targets for symlinks. Immediately after each check, before any further git command,
 a changed fingerprint exits 1 with no push and asks you to inspect the root's
-configuration or hooks. This tripwire does not prevent deliberate code from
-writing the root or restoring a change before the comparison.
+configuration or hooks. This tripwire does not cover files pulled in by `include.path`
+or anything else the check can write as the caller. It does not prevent deliberate
+code from writing the root or restoring a change before the comparison.
 
 The symlink lock provides one run at a time per repository on this host, best effort;
 the leased pushes keep two runs from overwriting each other's refs. The lock is
@@ -693,7 +696,7 @@ A cleanup failure warns on stderr and preserves the result's exit code.
 | 0 | Green already equals the fetched head. | `green is current: <oid>` |
 | 0 | Another writer published this head or a descendant. | `covered: green is <oid>` |
 | 0 | Another run holds the lock; this head was not checked. | `verify-main: already running (pid <pid>)` |
-| 1 | Nothing judged: a git operation failed, green is off `main`, or a checked ref moved. | `verify-main: <reason>` |
+| 1 | Nothing judged: a git operation failed, green is off `main`, a checked ref moved, the tripwire detected a change, the check could not start, or a shallow root was refused. | `verify-main: <reason>` |
 | 2 | Invalid arguments. | The usage line is on stderr. |
 | 5 | Red, with one first-parent suspect. | `red <head> culprit <oid>` |
 | 6 | Red, with several first-parent suspects. | `red <head> across <n> commits from <first> to <head>` |
