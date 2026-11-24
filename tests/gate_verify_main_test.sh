@@ -5,8 +5,21 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OB
 root=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd -P)
 runner=$BASH
 suite=$(mktemp -d)
+suite=$(CDPATH='' cd -- "$suite" && pwd -P)
 trap 'rm -rf "$suite"' EXIT
 failed=0
+if ! ps -o lstart= -p "$$" >/dev/null 2>&1; then
+    mkdir "$suite/bin"
+    cat > "$suite/bin/ps" <<'PS'
+#!/bin/sh
+[ "$1" = -o ] && [ "$2" = lstart= ] && [ "$3" = -p ] || exit 1
+kill -0 "$4" 2>/dev/null || exit 1
+printf 'Mon Jan  1 00:00:00 2024\n'
+PS
+    chmod +x "$suite/bin/ps"
+    export PATH="$suite/bin:$PATH"
+    printf 'process start times modeled: host denies ps\n'
+fi
 check() {
     if ! "$@"; then printf 'FAIL %s: %s\n' "$name" "$*"; failed=1; fi
 }
@@ -26,8 +39,9 @@ setup() {
 #!/usr/bin/env bash
 set -eu
 work=$1
-[ -z "${GIT_DIR+x}${GIT_WORK_TREE+x}${GIT_INDEX_FILE+x}${GIT_OBJECT_DIRECTORY+x}${GIT_ALTERNATE_OBJECT_DIRECTORIES+x}${GIT_COMMON_DIR+x}${GREP_OPTIONS+x}${GREP_COLOR+x}${GREP_COLORS+x}" ] || exit 98
+[ -z "${GIT_DIR+x}${GIT_WORK_TREE+x}${GIT_INDEX_FILE+x}${GIT_OBJECT_DIRECTORY+x}${GIT_ALTERNATE_OBJECT_DIRECTORIES+x}${GIT_COMMON_DIR+x}${GIT_NAMESPACE+x}${GREP_OPTIONS+x}${GREP_COLOR+x}${GREP_COLORS+x}" ] || exit 98
 printf 'ran\n' >> "$work/runs"
+printf 'fixture check output\n'
 [ "$(git rev-parse HEAD)" = "$(cat "$work/head")" ]
 [ "$PWD" != "$(cat "$work/repo-path")" ]
 [ "$#" -eq 2 ] && [ "$2" = 'one word; $(false)' ]
@@ -47,7 +61,7 @@ commit() {
     head=$(git -C "$repo" rev-parse HEAD)
     printf '%s\n' "$head" > "$tmp/head"
 }
-ref() { git -C "$repo" ls-remote -- origin "$1" | cut -f1; }
+ref() { git -C "$repo" ls-remote -- origin "$1" | awk -v ref="$1" '$2 == ref {print $1}'; }
 seed_green() { git -C "$repo" push -q origin "$1:refs/green/main"; want_green=$1; }
 seed_frozen() { git -C "$repo" push -q --force origin "$1:refs/green/frozen"; want_frozen=$1; }
 invoke() {
@@ -89,6 +103,7 @@ case_first_green() {
     want_green=$head
     expect 0 "green $head"
     check test "$(wc -l < "$tmp/runs" | tr -d ' ')" = 1
+    check grep -Fxq 'fixture check output' "$tmp/err"
 
 }
 case_current() {
@@ -102,10 +117,19 @@ case_current_frozen() {
     seed_green "$head"
     seed_frozen "$head"
     run
+    short=$(git -C "$repo" rev-parse --short "$head")
+    expect 1 "verify-main: refs/green/main and refs/green/frozen both name $short; delete one and run this again"
+    check test ! -e "$tmp/runs"
+}
+case_current_ancestor_frozen() {
+    seed_frozen "$head"
+    frozen_head=$head
+    commit
+    seed_green "$head"
+    run
     want_frozen=''
     expect 0 "green is current: $head"
-    check test "${output%%$'\n'*}" = "releases unfrozen (freeze at $head cleared)"
-
+    check test "${output%%$'\n'*}" = "releases unfrozen (freeze at $frozen_head cleared)"
 }
 case_current_off_main() {
     seed_green "$head"
@@ -257,68 +281,58 @@ case_freeze_race() {
 
 }
 case_stale_lock() {
-    ln -s 99999999 "$repo/.git/verify-main.lock"
+    ln -s '99999999 Mon Jan  1 00:00:00 2024' "$repo/.git/verify-main.lock"
     run
     want_green=$head
     expect 0 "green $head"
 
 }
 case_live_lock() {
-    cat > "$tmp/verify-main.sh" <<'LOCK'
-#!/usr/bin/env bash
-sleep 30 &
-child=$!
-trap 'kill "$child" 2>/dev/null || :' EXIT
-trap 'exit 0' TERM INT HUP
-wait
-LOCK
-    "$runner" "$tmp/verify-main.sh" &
+    sleep 30 &
     pid=$!
-    ln -s "$pid" "$repo/.git/verify-main.lock"
-    # Some sandboxes deny ps. Model only its command-line response there;
-    # the lock still names a real live process, checked by kill -0.
-    if ! ps -p "$pid" -o args= >/dev/null 2>&1; then
-        mkdir "$tmp/bin"
-        printf '#!/bin/sh\nprintf "bash verify-main.sh\\n"\n' > "$tmp/bin/ps"
-        chmod +x "$tmp/bin/ps"
-        saved_path=$PATH
-        PATH="$tmp/bin:$PATH"
-        printf 'live_lock: ps response modeled (host denies ps)\n'
-    fi
+    start=$(ps -o lstart= -p "$pid")
+    ln -s "$pid $start" "$repo/.git/verify-main.lock"
     run
     check test "$actual" -eq 0
     check test "$output" = "verify-main: already running (pid $pid)"
     check test "$(ref refs/green/main)" = ''
     check test "$(ref refs/green/frozen)" = ''
-    check test "$(readlink "$repo/.git/verify-main.lock")" = "$pid"
+    check test "$(readlink "$repo/.git/verify-main.lock")" = "$pid $start"
     kill "$pid"
     wait "$pid" 2>/dev/null || :
     rm -f "$repo/.git/verify-main.lock"
-    if [ -n "${saved_path:-}" ]; then PATH=$saved_path; fi
     expect 0 "verify-main: already running (pid $pid)"
-
 }
-case_leftovers() {
-    old="$tmp/scratch/verify-main.A1b2C3"
-    mkdir "$old"
-    git -C "$repo" worktree add -q --detach "$old/wt" "$head"
-    mkdir "$tmp/kept"
-    git -C "$repo" worktree add -q --detach "$tmp/kept/wt" "$head"
-    link="$tmp/scratch/verify-main.Z9y8X7"
-    ln -s "$tmp/kept" "$link"
-    # Register the linked spelling without allowing git to canonicalize it.
-    entry=$(git -C "$repo" rev-parse --git-path worktrees/wt1/gitdir)
-    case "$entry" in /*) ;; *) entry="$repo/$entry" ;; esac
-    printf '%s/wt/.git\n' "$link" > "$entry"
+case_lock_identity() {
+    # The child shell supplies its own pid, exactly matching the script after exec.
+    actual=0
+    # shellcheck disable=SC2016
+    output=$(TMPDIR="$tmp/scratch" "$runner" -c '
+        ln -s "$$ $(ps -o lstart= -p "$$")" "$1/.git/verify-main.lock"
+        exec "$2" "$3" --root "$1" -- true
+    ' fixture "$repo" "$runner" "$root/gate/verify-main.sh" 2>"$tmp/err") || actual=$?
+    want_green=$head
+    expect 0 "green $head"
+    setup
+    sleep 30 &
+    pid=$!
+    ln -s "$pid wrong start" "$repo/.git/verify-main.lock"
     run
     want_green=$head
-    # The look-alike is deliberately retained, then removed by the fixture.
-    check test ! -e "$old"
-    check test -L "$link"
-    check test -f "$tmp/kept/wt/.git"
-    rm "$link"
     expect 0 "green $head"
-
+    kill "$pid"
+    wait "$pid" 2>/dev/null || :
+}
+case_bad_lock() {
+    for type in directory file; do
+        if [ "$type" = directory ]; then mkdir "$repo/.git/verify-main.lock";
+        else : > "$repo/.git/verify-main.lock"; fi
+        run
+        check test "$actual" -eq 1
+        check test "$output" = "verify-main: $repo/.git/verify-main.lock is not a lock; remove it"
+        check test "$(ref refs/green/main)$(ref refs/green/frozen)" = ''
+        rm -rf "$repo/.git/verify-main.lock"
+    done
 }
 case_environment() {
     for variable in GIT_DIR CDPATH GREP_OPTIONS GIT_COMMON_DIR; do
@@ -352,12 +366,12 @@ exec "$REAL_GIT" "$@"
 WRAP
     chmod +x "$tmp/bin/git"
     saved_path=$PATH
-    for operation in fetch ls-remote 'worktree add' push; do
+    for operation in fetch ls-remote clone push; do
         case "$operation" in
             fetch) reason='cannot fetch main' ;;
             ls-remote) reason='cannot read green refs' ;;
-            'worktree add') reason='cannot create a scratch worktree' ;;
-            push) reason='green moved during the check' ;;
+            clone) reason='cannot create a scratch clone' ;;
+            push) reason='the remote refused the push; nothing changed' ;;
         esac
         PATH="$tmp/bin:$saved_path" REAL_GIT="$real_git" FAIL_COMMAND="$operation" run
         expect 1 "verify-main: $reason"
@@ -392,10 +406,22 @@ WRAP
     want_frozen=$other
     expect 1 'verify-main: the freeze moved during the check'
     seed_frozen "$old_frozen"
+    PATH="$tmp/bin:$PATH" REAL_GIT="$real_git" TEST_REPO="$repo" RACE_OID='' RACE_REF=refs/green/frozen run
+    want_frozen=''
+    expect 1 'verify-main: the freeze moved during the check'
+    seed_frozen "$old_frozen"
     PATH="$tmp/bin:$PATH" REAL_GIT="$real_git" TEST_REPO="$repo" RACE_OID="$head" RACE_REF=refs/green/main run
     want_green=$head want_frozen=''
     expect 0 "covered: green is $head"
+    check grep -Fq "releases unfrozen (freeze at $old_frozen cleared)" <<< "$output"
 
+}
+case_green_push_failure() {
+    printf '#!/bin/sh\nprintf "fixture refusal\\n" >&2\nexit 1\n' > "$remote/hooks/pre-receive"
+    chmod +x "$remote/hooks/pre-receive"
+    run
+    expect 1 'verify-main: the remote refused the push; nothing changed'
+    check grep -Fq 'fixture refusal' "$tmp/err"
 }
 case_red_push_failure() {
     seed_green "$head"
@@ -404,8 +430,7 @@ case_red_push_failure() {
     printf '#!/bin/sh\nexit 1\n' > "$remote/hooks/pre-receive"
     chmod +x "$remote/hooks/pre-receive"
     run
-    short=$(git -C "$repo" rev-parse --short "$head")
-    expect 1 "verify-main: $short is red, and the freeze could not be pushed"
+    expect 1 'verify-main: the remote refused the push; nothing changed'
     check test "${output%%$'\n'*}" = "red $head culprit $head"
 
 }
@@ -413,7 +438,7 @@ case_signals() {
     for signal in TERM HUP INT; do
         setup
         # shellcheck disable=SC2016
-        printf 'kill -%s "$(readlink "%s/.git/verify-main.lock")"\n' "$signal" "$repo" > "$tmp/hook"
+        printf 'holder=$(readlink "%s/.git/verify-main.lock"); kill -%s "${holder%%%% *}"\n' "$repo" "$signal" > "$tmp/hook"
         run
         case "$signal" in TERM) code=143 ;; HUP) code=129 ;; INT) code=130 ;; esac
         expect "$code" ''
@@ -425,7 +450,13 @@ case_docs() {
     check grep -Fq 'rewind' "$root/gate/README.md"
     check grep -Fq 'refs/green/*' "$root/gate/README.md"
     check grep -Fq 'verify-main.sh' "$root/scripts/ci-touched.map"
-    check test "$(cat "$root/gate/VERSION")" = 0.2.0
+    version=$(cat "$root/gate/VERSION")
+    check grep -Fq "## $version" "$root/gate/CHANGELOG.md"
+    for phrase in 'scratch clone' 'not a sandbox' 'env -i PATH=' 'best effort' 'exit 0 does not mean' 'shadows refs/green/' 'off-main freeze' 'two clones'; do
+        check grep -Fq "$phrase" "$root/gate/README.md"
+    done
+    check grep -Fq "the check runs the remote's code with the caller's environment" "$root/.ai/SECURITY.md"
+    check grep -Fq 'best effort' "$root/.ai/SECURITY.md"
 
 }
 case_noncommit_ref() {
@@ -449,12 +480,292 @@ WRAP
     check test ! -e "$tmp/fetched"
 
 }
-cases='noncommit_ref docs signals red_push_failure push_races failures environment leftovers live_lock stale_lock freeze_race green_race covered main_moved rewritten unavailable fixed flaky no_green_red red_many red_one advance current_off_main current_frozen current first_green usage'
+case_scratch_config() {
+    printf 'git config core.hooksPath /nonexistent-x\ngit remote set-url origin /nonexistent-y\n' > "$tmp/hook"
+    before=$(git -C "$repo" config --local --list)
+    run
+    want_green=$head
+    expect 0 "green $head"
+    check test "$(git -C "$repo" config --local --list)" = "$before"
+}
+case_fresh_rerun() {
+    invoke --root "$repo" -- sh -c '[ -f marker ] || { touch marker; exit 1; }'
+    want_frozen=$head
+    expect 5 "red $head culprit $head"
+}
+case_follow_tags() {
+    for status in 0 1; do
+        setup
+        git -C "$repo" config push.followTags true
+        git -C "$repo" tag -a fixture -m 'Record a fixture tag.'
+        printf '%s\n' "$status" > "$tmp/status"
+        run
+        if [ "$status" -eq 0 ]; then want_green=$head; expect 0 "green $head";
+        else want_frozen=$head; expect 5 "red $head culprit $head"; fi
+        check test -z "$(git -C "$repo" ls-remote --tags origin)"
+    done
+}
+case_shadow() {
+    for target in main frozen; do
+        setup
+        shadow="refs/heads/refs/green/$target"
+        git -C "$repo" push -q origin "$head:$shadow"
+        run
+        expect 1 "verify-main: origin has $shadow, which shadows refs/green/$target; delete it"
+        check test "$(ref "$shadow")" = "$head"
+    done
+}
+case_cannot_start() {
+    for program in no-such-command-xyz usage; do
+        invoke --root "$repo" -- "$program"
+        expect 1 'verify-main: the check could not start (exit 127); nothing changed'
+    done
+    printf '#!/bin/sh\nexit 0\n' > "$tmp/not-executable"
+    invoke --root "$repo" -- "$tmp/not-executable"
+    expect 1 'verify-main: the check could not start (exit 126); nothing changed'
+    for status in 126 127; do
+        printf '%s\n' "$status" > "$tmp/status"
+        rm -f "$tmp/runs"
+        run
+        expect 1 "verify-main: the check could not start (exit $status); nothing changed"
+        check test "$(wc -l < "$tmp/runs" | tr -d ' ')" = 1
+    done
+}
+case_relative_tmp() {
+    mkdir -p "$tmp/elsewhere/rel" "$tmp/bin"
+    real_git=$(command -v git)
+    cat > "$tmp/bin/git" <<'WRAP'
+#!/usr/bin/env bash
+if [ "$1" = clone ]; then
+    for last in "$@"; do :; done
+    case "$last" in /*) ;; *) printf 'relative clone path\n' >&2; exit 1 ;; esac
+fi
+exec "$REAL_GIT" "$@"
+WRAP
+    chmod +x "$tmp/bin/git"
+    actual=0
+    output=$(CDPATH=rel; export CDPATH; cd "$tmp/elsewhere"; PATH="$tmp/bin:$PATH" REAL_GIT="$real_git" TMPDIR=rel "$runner" "$root/gate/verify-main.sh" --root "$repo" -- true 2>"$tmp/err") || actual=$?
+    want_green=$head
+    expect 0 "green $head"
+    check test -z "$(find "$tmp/elsewhere/rel" "$repo" -name 'verify-main.*' -print)"
+}
+case_inside_tmp() {
+    mkdir "$repo/scratch"
+    actual=0
+    output=$(TMPDIR="$repo/scratch" "$runner" "$root/gate/verify-main.sh" --root "$repo" -- true 2>"$tmp/err") || actual=$?
+    expect 1 'verify-main: the scratch directory must be outside the root'
+    check test -z "$(find "$repo/scratch" -mindepth 1 -print)"
+}
+case_check_environment() {
+    for value in C POSIX; do
+        setup
+        # shellcheck disable=SC2016
+        printf 'printf "%%s %%s\\n" "${LC_ALL-unset}" "${GIT_NO_REPLACE_OBJECTS-unset}" > "%s/environment"\n' "$tmp" > "$tmp/hook"
+        LC_ALL="$value" GIT_NO_REPLACE_OBJECTS=0 GIT_NAMESPACE=fixture run
+        want_green=$head
+        expect 0 "green $head"
+        check test "$(cat "$tmp/environment")" = "$value 0"
+    done
+    setup
+    # shellcheck disable=SC2016
+    printf 'test -z "${LC_ALL+x}${GIT_NO_REPLACE_OBJECTS+x}"\n' > "$tmp/hook"
+    (unset LC_ALL GIT_NO_REPLACE_OBJECTS; run; want_green=$head; expect 0 "green $head")
+}
+case_cleanup_status() {
+    for result in 0 5 6 75; do
+        setup
+        mkdir "$tmp/bin"
+        real_rm=$(command -v rm)
+        cat > "$tmp/bin/rm" <<'WRAP'
+#!/bin/sh
+case "$*" in *'/wt'|*'/verify-main.lock') ;; *'/verify-main.'*) exit 1 ;; esac
+exec "$REAL_RM" "$@"
+WRAP
+        chmod +x "$tmp/bin/rm"
+        status=1
+        case "$result" in
+            0) status=0; want_green=$head; last="green $head" ;;
+            5) want_frozen=$head; last="red $head culprit $head" ;;
+            6) commit; commit; want_frozen=$head; last="red $head across 3 commits from $base to $head" ;;
+            75) status=75; last='verify-main: the check cannot run on this host (exit 75); nothing changed' ;;
+        esac
+        # shellcheck disable=SC2016
+        PATH="$tmp/bin:$PATH" REAL_RM="$real_rm" invoke --root "$repo" -- sh -c 'if [ "$1" = 0 ]; then chmod 555 .; fi; exit "$1"' fixture "$status"
+        check test "$actual" -eq "$result"
+        check test "${output##*$'\n'}" = "$last"
+        check grep -Fq 'verify-main: warning: cannot remove scratch directory' "$tmp/err"
+        chmod -R u+w "$tmp/scratch"
+        "$real_rm" -rf "$tmp/scratch/"*
+        expect "$result" "$last"
+    done
+}
+case_shallow() {
+    git clone -q --depth=1 "file://$remote" "$tmp/shallow"
+    repo="$tmp/shallow"
+    run
+    expect 1 'verify-main: a shallow clone cannot name a culprit; fetch the full history'
+}
+case_missing_tools() {
+    saved_path=$PATH
+    mkdir "$tmp/tools"
+    real_git=$(command -v git)
+    real_ps=$(command -v ps)
+    real_readlink=$(command -v readlink)
+    real_mktemp=$(command -v mktemp)
+    for missing in ps readlink mktemp; do
+        for tool in git ps readlink mktemp; do
+            rm -f "$tmp/tools/$tool"
+            [ "$tool" = "$missing" ] && continue
+            case "$tool" in git) executable=$real_git ;; ps) executable=$real_ps ;; readlink) executable=$real_readlink ;; mktemp) executable=$real_mktemp ;; esac
+            ln -s "$executable" "$tmp/tools/$tool"
+        done
+        PATH="$tmp/tools" invoke --root "$repo" -- true
+        expect 75 "verify-main: $missing is missing"
+    done
+}
+case_rerun_unavailable_empty() {
+    printf '1\n75\n' > "$tmp/status"
+    run
+    expect 75 'verify-main: the check cannot run on this host (exit 75); nothing changed'
+    check test "$(wc -l < "$tmp/runs" | tr -d ' ')" = 2
+}
+case_red_covered() {
+    checked=$head
+    commit
+    descendant=$head
+    git -C "$repo" push -q --force origin "$checked:main"
+    head=$checked
+    printf '%s\n' "$head" > "$tmp/head"
+    printf 'git -C "%s" push -q origin "%s:refs/green/main"\n' "$repo" "$descendant" > "$tmp/hook"
+    printf '1\n' > "$tmp/status"
+    run
+    want_green=$descendant
+    expect 1 'verify-main: green moved during the check'
+}
+case_off_main_advance() {
+    seed_green "$head"
+    other=$(printf 'Record another fixture.\n' | git -C "$repo" commit-tree 'HEAD^{tree}')
+    seed_frozen "$other"
+    commit
+    run
+    want_green=$head
+    expect 0 "green $head"
+}
+case_stolen_lock() {
+    printf 'rm "%s/.git/verify-main.lock"\nln -s "99999999 another start" "%s/.git/verify-main.lock"\n' "$repo" "$repo" > "$tmp/hook"
+    run
+    check test "$(readlink "$repo/.git/verify-main.lock")" = '99999999 another start'
+    rm -f "$repo/.git/verify-main.lock"
+    want_green=$head
+    expect 0 "green $head"
+}
+case_check_stdout() {
+    printf 'printf "fixture stdout\\n"\n' > "$tmp/hook"
+    run
+    want_green=$head
+    expect 0 "green $head"
+    check test "$output" = "green $head"
+    check grep -Fxq 'fixture stdout' "$tmp/err"
+}
+case_merge_suspects() {
+    seed_green "$head"
+    git -C "$repo" checkout -qb side
+    printf 'fixture\n' > "$repo/side-file"
+    git -C "$repo" add side-file
+    commit
+    side=$head
+    git -C "$repo" checkout -q main
+    # Restore main: commit() pushed the side commit to remote main.
+    git -C "$repo" push -q --force origin HEAD:main
+    commit
+    first=$head
+    git -C "$repo" merge -q --no-ff -m 'Merge a fixture.' "$side"
+    head=$(git -C "$repo" rev-parse HEAD)
+    git -C "$repo" push -q origin HEAD:main
+    printf '%s\n' "$head" > "$tmp/head"
+    printf '1\n' > "$tmp/status"
+    run
+    want_frozen=$head
+    expect 6 "red $head across 2 commits from $first to $head"
+}
+case_remote_green_object() {
+    git clone -q "$remote" "$tmp/writer"
+    other=$(printf 'Record another fixture.\n' | git -C "$tmp/writer" -c user.name=Fixture -c user.email=fixture@example.invalid commit-tree 'HEAD^{tree}')
+    git -C "$tmp/writer" push -q origin "$other:refs/green/main"
+    check test "$(git -C "$repo" cat-file -t "$other" 2>/dev/null || :)" = ''
+    want_green=$other
+    run
+    short=$(git -C "$repo" rev-parse --short "$other")
+    expect 1 "verify-main: green $short is not on origin/main; nothing changed"
+    check git -C "$repo" cat-file -e "$other^{commit}"
+}
+case_lease_races() {
+    for mode in green red red-same red-fast; do
+        setup
+        seed_green "$head"
+        commit
+        race_head=$head
+        seed_frozen "$head"
+        commit
+        if [ "$mode" != green ]; then printf '1\n' > "$tmp/status"; fi
+        mkdir "$tmp/bin"
+        real_git=$(command -v git)
+        cat > "$tmp/bin/git" <<'WRAP'
+#!/usr/bin/env bash
+set -eu
+case " $* " in
+    *' push '*)
+        if [ ! -e "$RACE_MARKER" ]; then
+            : > "$RACE_MARKER"
+            "$REAL_GIT" -C "$TEST_REPO" push -q --force origin "$RACE_OID:$RACE_REF"
+        fi ;;
+esac
+exec "$REAL_GIT" "$@"
+WRAP
+        chmod +x "$tmp/bin/git"
+        if [ "$mode" = green ]; then
+            race_ref=refs/green/main
+            reason='green moved during the check'
+        else
+            race_head=$(printf 'Record another fixture.\n' | git -C "$repo" commit-tree 'HEAD^{tree}')
+            if [ "$mode" = red-same ]; then race_head=$head; fi
+            if [ "$mode" = red-fast ]; then race_head=$base; fi
+            race_ref=refs/green/frozen
+            reason='the freeze moved during the check'
+        fi
+        PATH="$tmp/bin:$PATH" REAL_GIT="$real_git" TEST_REPO="$repo" RACE_OID="$race_head" RACE_REF="$race_ref" RACE_MARKER="$tmp/raced" run
+        if [ "$mode" = green ]; then want_green=$race_head; else want_frozen=$race_head; fi
+        expect 1 "verify-main: $reason"
+    done
+}
+case_equal_freeze_advance() {
+    seed_green "$head"
+    commit
+    seed_frozen "$head"
+    run
+    want_green=$head
+    expect 0 "green $head"
+    check test "$output" = "green $head"
+    run
+    short=$(git -C "$repo" rev-parse --short "$head")
+    expect 1 "verify-main: refs/green/main and refs/green/frozen both name $short; delete one and run this again"
+}
+case_repeat_red() {
+    seed_frozen "$head"
+    printf '1\n' > "$tmp/status"
+    run
+    expect 5 "red $head culprit $head"
+}
+cases='repeat_red equal_freeze_advance rerun_unavailable_empty red_covered off_main_advance stolen_lock check_stdout merge_suspects remote_green_object lease_races missing_tools cleanup_status shallow green_push_failure lock_identity bad_lock check_environment relative_tmp inside_tmp cannot_start shadow follow_tags fresh_rerun noncommit_ref docs signals red_push_failure push_races failures environment scratch_config live_lock stale_lock freeze_race green_race covered main_moved rewritten unavailable fixed flaky no_green_red red_many red_one advance current_off_main current_ancestor_frozen current_frozen current first_green usage'
+selected=0
 for name in $cases; do
     if [ "$#" -gt 0 ] && [ "$1" != "$name" ]; then continue; fi
+    selected=$((selected + 1))
+    declare -F "case_$name" >/dev/null || { printf 'missing case: %s\n' "$name"; exit 1; }
     setup
     "case_$name"
     printf '%s: checked\n' "$name"
 done
+[ "$selected" -gt 0 ] || { printf 'no case selected\n'; exit 1; }
 [ "$failed" -eq 0 ] || exit 1
 printf 'gate_verify_main_test: all passed (%s)\n' "$BASH_VERSION"
