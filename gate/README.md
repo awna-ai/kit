@@ -353,7 +353,12 @@ with `"` must match `^"[^"\\]*"$`; one starting with `'` must match `^'[^']*'$`.
 A value starting with `[` must match `^\[[^][{}"']*\]$`; one starting with `{`
 must match `^\{[^][{}"']*\}$`. These checks apply after comment removal, including
 to ignored inline names, ids, timeouts, setup arguments and replaced env values.
-Ignored nested blocks also receive this scalar check.
+Ignored nested blocks also receive this scalar check. The gate checks the whole
+line, including keys and standalone list items, after stripping leading sequence
+markers (`- `). Explicit YAML keys and values (`?` or `:` followed by a space,
+or alone) are refused. Plain keys cannot contain any of `" ' [ ] { } # & * ! | > , ?`
+or a backtick. Plain scalar list items and continuations cannot contain
+`" ' [ ] { }`. Keyless block scalars (`|` or `>`) are refused.
 Thus `name: "a # b"` is refused because comment removal leaves `"a`. A plain
 `run:` keeps its stricter rules below. Duplicate top-level keys, job ids, job keys,
 step keys, env names and service names are refused within their respective scopes.
@@ -478,7 +483,8 @@ start at 1. Hook stderr can print additional lines of the consumer's own.
 | NUL byte anywhere | `a NUL byte` (file-level) |
 | Other non-printable or non-ASCII byte | `line <n>: a byte outside printable ASCII` (file-level) |
 | Anchor, alias or tag prefix in an inline value | `line <n>: anchors, aliases and tags are not mirrored` |
-| Quoted or flow value that fails the single-line pattern | `line <n>: a quoted or flow value must close on its own line` |
+| Explicit YAML key or value | `line <n>: explicit keys are not mirrored` |
+| Quoted or flow value that fails the single-line pattern, unsafe key characters, or quotes/brackets/braces in a plain scalar list item or continuation | `line <n>: a quoted or flow value must close on its own line` |
 | Duplicate key, job id, env name or service name | `line <n>: duplicate key '<key>'` (job-level inside a job) |
 | Document marker after other content or another marker | `line <n>: a second YAML document` |
 | Caller has case-insensitive matching enabled | `nocasematch is set` (`gate_workflow` call error) |

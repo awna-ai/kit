@@ -23,6 +23,8 @@
 
 ### Fixed
 
+- Check whole workflow lines, including ignored keys and nested list items, and refuse explicit YAML keys.
+- Keep workflow parsing in the C locale inside each parser function, including on bash 3.2.
 - Keep every step of a workflow job selected when the touched tier selects any command of that job.
 - Refuse unsafe workflow bytes, continued quoted or flow values, anchors, aliases and tags before running steps.
 - Refuse duplicate workflow keys, later document markers, empty job blocks and symbolic-link workflow files.

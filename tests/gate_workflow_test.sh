@@ -774,9 +774,67 @@ CASE
     check linked-no-run test ! -e "$case_dir/marker"
 }
 
+line_guard_cases() {
+    local reason='a quoted or flow value must close on its own line'
+    local steps=$'jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n      - uses: org/setup@v1\n        with:'
+    local later=$'\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: touch marker'
+    local hooks='gate_workflow_uses() { :; }; gate_workflow_job_key() { :; }'
+    refuse key-quote-with "t: ci.yml, job build: line 8: $reason" "$steps"$'\n          a"b: 1'"$later" "$hooks"
+    refuse key-bracket-on "t: ci.yml: line 2: $reason" $'on:\n  a[b: 1\n'"$steps" "$hooks"
+    refuse explicit-top 't: ci.yml: line 1: explicit keys are not mirrored' $'? a\n'"$steps" "$hooks"
+    refuse explicit-job-id 't: ci.yml: line 2: explicit keys are not mirrored' $'jobs:\n  ? build\n    runs-on: ubuntu-latest\n    steps:\n      - run: touch marker' "$hooks"
+    refuse explicit-job-key 't: ci.yml, job build: line 4: explicit keys are not mirrored' $'jobs:\n  build:\n    runs-on: ubuntu-latest\n    ? needs\n    steps:\n      - run: touch marker' "$hooks"
+    refuse colon-key "t: ci.yml, job build: line 8: $reason" "$steps"$'\n          x:y: "a\n    needs: y"\n      - run: touch marker' "$hooks"
+    refuse explicit-with 't: ci.yml, job build: line 8: explicit keys are not mirrored' "$steps"$'\n          ? "a\n    needs: y"\n          : 1\n      - run: touch marker' "$hooks"
+    refuse top-close "t: ci.yml, job build: line 8: $reason" "$steps"$'\n          x:y: "a\nname: x"'"$later" "$hooks"
+    refuse flow-list "t: ci.yml, job build: line 9: $reason" $'jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n    strategy:\n      matrix:\n        include:\n          - {a: 1,\nname: x}'"$later" "$hooks"
+    refuse quoted-list "t: ci.yml, job build: line 9: $reason" $'jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n    strategy:\n      matrix:\n        include:\n          - "a:\nname: x"'"$later" "$hooks"
+    refuse nested-sequence "t: ci.yml, job build: line 8: $reason" "$steps"$'\n          - - "a\nname: x"'"$later" "$hooks"
+    refuse single-colon-key "t: ci.yml, job build: line 8: $reason" "$steps"$'\n          x:y: \'a\n'"$later" "$hooks"
+    refuse explicit-on 't: ci.yml: line 2: explicit keys are not mirrored' $'on:\n  ? a\n'"$steps" "$hooks"
+    refuse quote-in-plain-list "t: ci.yml: line 2: $reason" $'on:\n  - a"b\n'"$steps" "$hooks"
+
+    new_case
+    cat > "$case_dir/.github/workflows/ci.yml" <<'YAML'
+name: "Build one"
+on:
+  push:
+    branches: [main]
+    paths:
+      - main
+jobs:
+  build:
+    needs: [a, b]
+    strategy:
+      matrix:
+        include:
+          - target: example
+            version: 1
+    services:
+      db:
+        image: example/db:1
+        ports:
+          - 5432:5432
+    runs-on: ubuntu-latest
+    steps:
+      - uses: org/setup@v1
+        with:
+          fetch-depth: 0
+      - uses: org/setup@v1
+        with: {a: 1}
+      - run: touch marker
+YAML
+    printf '%s\n' "$hooks" 'gate_workflow_service() { :; }' >> "$consumer"
+    setup_consumer
+    expect realistic-list 0 'build: touch marker' 'build: touch marker' --list
+    check realistic-exact-list test "$(cat "$case_dir/out")" = 'build: touch marker'
+    check realistic-no-run test ! -e "$case_dir/marker"
+}
+
 consumer_cases() {
     # shellcheck disable=SC2016 # Inspect the actual consumer interpreter.
     printf 'gate_workflow_test: consumer bash %s\n' "$("$runner" -c 'printf %s "${BASH_VERSINFO[0]}"')"
+    line_guard_cases
     byte_cases
     inline_cases
     hook_state_cases
@@ -792,6 +850,7 @@ consumer_cases() {
     touched_cases
     boundary_cases
     mode=strict
+    line_guard_cases
     byte_cases
     inline_cases
     hook_state_cases
@@ -801,12 +860,17 @@ consumer_cases() {
     refuse strict-hook "t: ci.yml: job 'build' is not mirrored; define gate_workflow_job to allow it" $'jobs:\n  build:' 'gate_workflow_job() { return 1; }'
     mode=loose
 }
-consumer_cases
-if [ -x /bin/bash ] && [ "$runner" != /bin/bash ]; then
-    runner=/bin/bash
+for test_locale in C en_US.UTF-8; do
+    export LANG=$test_locale LC_ALL=$test_locale
+    printf 'gate_workflow_test: locale %s\n' "$test_locale"
+    runner=$(type -P bash)
     consumer_cases
-else
-    printf 'gate_workflow_test: alternate shell unavailable, skipped\n'
-fi
+    if [ -x /bin/bash ] && [ "$runner" != /bin/bash ]; then
+        runner=/bin/bash
+        consumer_cases
+    else
+        printf 'gate_workflow_test: alternate shell unavailable, skipped\n'
+    fi
+done
 if [ "$failed" -ne 0 ]; then exit 1; fi
 printf 'gate_workflow_test: all passed\n'
