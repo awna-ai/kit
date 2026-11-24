@@ -9,7 +9,7 @@ runner=$(type -P bash)
 mode=loose
 mkdir "$tmp/bin"
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
-for tool in mktemp rm tail cat git env touch; do
+for tool in mktemp rm tail cat git env touch tr cmp; do
     ln -s "$(type -P "$tool")" "$tmp/bin/$tool"
 done
 cat > "$tmp/bin/uname" <<'STUB'
@@ -45,7 +45,7 @@ check() {
 expect() {
     local name=$1 expected=$2 wanted=$3 last=$4 actual
     shift 4
-    if (cd "$case_dir" && PATH="$tmp/bin" TMPDIR="$case_dir/logs" "$runner" "$consumer" "$@") > "$case_dir/out" 2> "$case_dir/err"; then
+    if (cd "$case_dir" && PATH="$tmp/bin" TMPDIR="$case_dir/logs" "$runner" "$consumer" "$@") <<< 'real input' > "$case_dir/out" 2> "$case_dir/err"; then
         actual=0
     else
         actual=$?
@@ -320,7 +320,7 @@ refusal_cases() {
     refuse step-uses "$prefix step uses 'org/setup@v1' is not mirrored" "$steps"$'\n      - uses: org/setup@v1'
     refuse step-none "$prefix line 5: a step needs exactly one of run: and uses:" "$steps"$'\n      - name: first'
     refuse step-both "$prefix line 5: a step needs exactly one of run: and uses:" "$steps"$'\n      - run: touch marker\n        uses: org/setup@v1' 'gate_workflow_uses() { :; }'
-    refuse no-runs 't: ci.yml: no run: steps found' 'jobs:'
+    refuse no-runs 't: ci.yml: no jobs: block' 'jobs:'
     new_case
     setup_consumer
     expect missing-file 2 't: ci.yml: workflow not found in .github/workflows' 't: ci.yml: workflow not found in .github/workflows'
@@ -421,7 +421,7 @@ data_cases() {
         refuse data-uses "t: ci.yml, job build: step uses '$attack' is not mirrored" "$steps"$'\n      - uses: '"$attack" 'gate_workflow_uses() { printf "%s\n" "$@" >> arguments; return 0; }'
         check data-no-execution test ! -e "$case_dir/pwned"
     done
-    refuse printable "t: ci.yml, job build: step uses 'org/?@v1' is not mirrored" "$steps"$'\n      - uses: org/\033@v1'
+    refuse printable "t: ci.yml: line 5: a byte outside printable ASCII" "$steps"$'\n      - uses: org/\033@v1'
     new_case
     printf '%s\n' "$steps" '      - uses: org/setup@v1' '      - run: touch marker' > "$case_dir/.github/workflows/ci.yml"
     cat >> "$consumer" <<'CASE'
@@ -468,6 +468,37 @@ CASE
     printf x >> "$case_dir/src/apple.sh"
     expect touched-job 0 't: tier touched, 1 paths changed, 1 steps' 't: all passed' --tier touched
     check touched-marker test "$(cat "$case_dir/marker" 2>/dev/null)" = build
+    new_case
+    mkdir "$case_dir/tools"
+    printf 'tools/* -\n* -\n' > "$case_dir/map"
+    printf ':\n' > "$case_dir/tools/check.sh"
+    cat > "$case_dir/.github/workflows/ci.yml" <<'YAML'
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: make generate
+      - run: bash tools/check.sh
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - run: touch unrelated
+YAML
+    cat >> "$consumer" <<'CASE'
+gate_workflow_job() { :; }
+gate_init --name t --map map -- "$@"
+gate_workflow ci.yml
+gate_run
+CASE
+    printf 'logs/\nout\nerr\n' > "$case_dir/.gitignore"
+    git -C "$case_dir" init -q
+    git -C "$case_dir" add .
+    git -C "$case_dir" -c user.name=Test -c user.email=test@example.invalid -c commit.gpgsign=false commit -qm 'Record fixture setup.'
+    git -C "$case_dir" update-ref refs/remotes/origin/main HEAD
+    printf '# change\n' >> "$case_dir/tools/check.sh"
+    expect touched-whole-job 0 't: tier touched, 1 paths changed, 2 steps' '' --tier touched --list
+    check touched-whole-job-list test "$(cat "$case_dir/out")" = "$(printf '%s\n' 'build: make generate' 'build: bash tools/check.sh')"
+    check touched-list-no-run test ! -e "$case_dir/unrelated"
 }
 
 boundary_cases() {
@@ -521,9 +552,235 @@ YAML
     check option-like-job-marker test -e "$case_dir/marker"
 }
 
+byte_cases() {
+    local bytes
+    local steps=$'jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:'
+    for bytes in $'\342\200\250' $'\302\205' $'\342\200\251'; do
+        refuse unicode-name 't: ci.yml: line 6: a byte outside printable ASCII' "$steps"$'\n      - run: touch marker\n        name: first'"$bytes"'      - run: false'
+        refuse unicode-comment 't: ci.yml: line 6: a byte outside printable ASCII' "$steps"$'\n      - run: touch marker\n# hidden'"$bytes"'      - run: false'
+    done
+    refuse escape-byte 't: ci.yml: line 5: a byte outside printable ASCII' "$steps"$'\n      - run: echo \033'
+    refuse value-tab 't: ci.yml: line 5: a carriage return or a tab' "$steps"$'\n      - run: touch marker\t'
+    refuse comment-letter 't: ci.yml: line 6: a byte outside printable ASCII' "$steps"$'\n      - run: touch marker\n# caf\303\251'
+    new_case
+    printf '%s\n      - run: touch marker\000\n' "$steps" > "$case_dir/.github/workflows/ci.yml"
+    setup_consumer
+    expect nul-byte 2 't: ci.yml: a NUL byte' 't: ci.yml: a NUL byte'
+    check nul-no-execution test ! -e "$case_dir/marker"
+}
+
+inline_cases() {
+    local value key
+    local head=$'jobs:\n  build:\n    runs-on: ubuntu-latest'
+    local steps="$head"$'\n    steps:'
+    local reason='a quoted or flow value must close on its own line'
+    refuse continued-name "t: ci.yml, job build: line 6: $reason" "$steps"$'\n      - run: true\n        name: "x\n    needs: y"\n      - run: false'
+    refuse continued-flow "t: ci.yml, job build: line 7: $reason" "$steps"$'\n      - run: true\n      - uses: org/setup@v1\n        with: {a: 1,\n    needs: 2}\n      - run: false' 'gate_workflow_uses() { :; }'
+    refuse continued-top "t: ci.yml, job build: line 6: $reason" "$steps"$'\n      - run: true\n        name: "x\non: y"\n      - run: false'
+    for value in '"x\"' "'it''s'" '"a # b"' '[a,' '{a: 1,'; do
+        refuse quote-close "t: ci.yml, job build: line 6: $reason" "$steps"$'\n      - run: touch marker\n        name: '"$value"
+    done
+    for value in '&a x' '*a' '!tag x'; do
+        refuse scalar-decoration 't: ci.yml, job build: line 6: anchors, aliases and tags are not mirrored' "$steps"$'\n      - run: touch marker\n        name: '"$value"
+    done
+    for key in name run-name on permissions concurrency; do
+        refuse top-inline "t: ci.yml: line 1: $reason" "$key: \"x"$'\n'"$steps"$'\n      - run: touch marker'
+    done
+    for key in name needs permissions timeout-minutes; do
+        refuse job-inline "t: ci.yml, job build: line 4: $reason" "$head"$'\n    '"$key: \"x"$'\n    steps:\n      - run: touch marker'
+    done
+    for key in id with timeout-minutes; do
+        refuse step-inline "t: ci.yml, job build: line 6: $reason" "$steps"$'\n      - run: touch marker\n        '"$key: \"x"
+    done
+    refuse ignored-top-inline "t: ci.yml: line 2: $reason" $'on:\n  push: "x\n'"$steps"$'\n      - run: touch marker'
+    refuse ignored-with-inline "t: ci.yml, job build: line 7: $reason" "$steps"$'\n      - run: touch marker\n        with:\n          option: "x'
+    refuse ignored-service-inline "t: ci.yml, job build: line 6: $reason" "$head"$'\n    services:\n      apple:\n        image: "x' 'gate_workflow_service() { :; }'
+    refuse ignored-job-inline "t: ci.yml, job build: line 5: $reason" "$head"$'\n    strategy:\n      option: "x' 'gate_workflow_job_key() { :; }'
+    refuse env-inline "t: ci.yml, job build: line 5: $reason" "$head"$'\n    env:\n      APPLE: "x' 'gate_workflow_env() { :; }'
+    refuse nested-runner 't: ci.yml, job build: line 4: cannot be mirrored' "$head"$'\n      more\n    steps:\n      - run: touch marker'
+    refuse nested-call 't: ci.yml, job build: line 4: cannot be mirrored' $'jobs:\n  build:\n    uses: ./.github/workflows/shared.yml\n      more'
+    new_case
+    printf '%s\n' "$head" '    needs: [a, b]' '    name: "Build one"' '    steps:' '      - run: touch marker' '        with: {a: 1}' > "$case_dir/.github/workflows/ci.yml"
+    setup_consumer
+    expect closed-values 0 '' 't: all passed'
+    check closed-values-ran test -e "$case_dir/marker"
+}
+
+hook_state_cases() {
+    local globals='name=build key=strategy value=org/setup@v1 file=x job=y command=z runner=macos-1 text=t number=1 index=0'
+    # shellcheck disable=SC2016 # Hook bodies run in the consumer.
+    local hooks='gate_workflow_job() { [ "$2" = "$name" ]; }
+gate_workflow_job_key() { [ "$3" = "$key" ]; }
+gate_workflow_uses() { [ "$3" = "$value" ]; }'
+    refuse consumer-job "t: ci.yml: job 'deploy' is not mirrored; define gate_workflow_job to allow it" $'jobs:\n  deploy:\n    if: false\n    runs-on: ubuntu-latest\n    steps:\n      - uses: other/thing@v9\n      - run: echo deploy' "$globals"$'\n'"$hooks"
+    refuse consumer-key "t: ci.yml, job build: job key 'container' is not mirrored" $'jobs:\n  build:\n    container: ignored' "$globals"$'\n'"$hooks"
+    refuse consumer-uses "t: ci.yml, job build: step uses 'other/thing@v9' is not mirrored" $'jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: other/thing@v9\n      - run: touch marker' "$globals"$'\n'"$hooks"
+    new_case
+    cat > "$case_dir/.github/workflows/ci.yml" <<'YAML'
+jobs:
+  build:
+    strategy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: org/setup@v1
+      - run: touch marker
+YAML
+    printf '%s\n%s\n' "$globals" "$hooks" >> "$consumer"
+    printf 'gate_init --name t\ngate_workflow ci.yml\ngate_run\n' >> "$consumer"
+    expect consumer-globals 0 '' 't: all passed'
+    check consumer-globals-ran test -e "$case_dir/marker"
+    new_case
+    cat > "$case_dir/.github/workflows/ci.yml" <<'YAML'
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: false
+      - run: touch after
+    strategy:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - run: touch marker
+YAML
+    cat >> "$consumer" <<'CASE'
+gate_workflow_job() { :; }
+gate_workflow_job_key() { name=other commands=() job= runner=; _GATE_WF_JOB=other _GATE_WF_COMMANDS=(); }
+gate_init --name t -- "$@"
+gate_workflow ci.yml
+gate_run
+CASE
+    expect mutation-list 0 '' '' --list
+    check mutation-labels test "$(cat "$case_dir/out")" = "$(printf '%s\n' 'build: false' 'build: touch after' 'lint: touch marker')"
+    expect mutation-run 1 'step 2 skipped build: touch after (an earlier step of job build failed)' ''
+    check mutation-skipped test ! -e "$case_dir/after"
+    check mutation-other-job test -e "$case_dir/marker"
+    new_case
+    cat > "$case_dir/.github/workflows/ci.yml" <<'YAML'
+jobs:
+  build:
+    strategy:
+    env:
+      APPLE: ignored
+    services:
+      apple:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: org/setup@v1
+      - run: env > marker
+YAML
+    cat >> "$consumer" <<'CASE'
+export APPLE=passed
+gate_workflow_job() { if read -r _; then return 1; fi; printf job >> hooks; }
+gate_workflow_job_key() { if read -r _; then return 1; fi; printf key >> hooks; }
+gate_workflow_env() { if read -r _; then return 1; fi; printf env >> hooks; printf supplied; }
+gate_workflow_service() { if read -r _; then return 1; fi; printf service >> hooks; }
+gate_workflow_uses() { if read -r _; then return 1; fi; printf uses >> hooks; }
+gate_init --name t
+gate_workflow --pass APPLE ci.yml
+gate_run
+CASE
+    expect hook-stdin 0 '' 't: all passed'
+    check every-hook-called test "$(cat "$case_dir/hooks" 2>/dev/null)" = jobkeyenvserviceuses
+    check assignment-order grep -Fxq APPLE=supplied "$case_dir/marker"
+}
+
+edge_cases() {
+    local label exported
+    local steps=$'jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: touch marker'
+    refuse duplicate-top "t: ci.yml: line 2: duplicate key 'name'" $'name: one\nname: two\n'"$steps"
+    refuse duplicate-jobs "t: ci.yml: line 6: duplicate key 'jobs'" "$steps"$'\njobs:'
+    refuse duplicate-id "t: ci.yml: line 6: duplicate key 'build'" "$steps"$'\n  build:\n    uses: ./.github/workflows/shared.yml'
+    refuse duplicate-job-key "t: ci.yml, job build: line 6: duplicate key 'runs-on'" "$steps"$'\n    runs-on: macos-latest'
+    refuse duplicate-step-key "t: ci.yml, job build: line 7: duplicate key 'name'" "$steps"$'\n        name: first\n        name: second'
+    refuse duplicate-run "t: ci.yml, job build: line 6: duplicate key 'run'" "$steps"$'\n        run: false'
+    refuse duplicate-env "t: ci.yml, job build: line 8: duplicate key 'APPLE'" "$steps"$'\n    env:\n      APPLE: one\n      APPLE: two' 'gate_workflow_env() { :; }'
+    refuse duplicate-service "t: ci.yml, job build: line 8: duplicate key 'apple'" "$steps"$'\n    services:\n      apple:\n      apple:' 'gate_workflow_service() { :; }'
+    refuse second-document 't: ci.yml: line 6: a second YAML document' "$steps"$'\n---'
+    refuse repeated-document 't: ci.yml: line 2: a second YAML document' $'---\n---\n'"$steps"
+    refuse document-after-name 't: ci.yml: line 2: a second YAML document' $'name: first\n---\n'"$steps"
+    refuse no-run-cycle 't: ci.yml: no run: steps found' $'jobs:\n  call:\n    uses: ./.github/workflows/ci.yml'
+    refuse missing-step-start 't: ci.yml, job build: line 5: cannot be mirrored' $'jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n        run: touch marker'
+    new_case
+    printf '# comment\n\n---\n%s\n' "$steps" > "$case_dir/.github/workflows/ci.yml"
+    setup_consumer
+    expect first-document 0 '' 't: all passed'
+    for label in macOS-latest MacOS-14 macos-14; do
+        new_case
+        printf 'jobs:\n  build:\n    runs-on: %s\n    steps:\n      - run: touch marker\n' "$label" > "$case_dir/.github/workflows/ci.yml"
+        setup_consumer
+        export TEST_OS=Linux
+        expect mixed-mac 75 'runs only on macOS' ''
+        check mixed-mac-no-run test ! -e "$case_dir/marker"
+    done
+    new_case
+    printf '%s\n' "$steps" '  call:' '    uses: ./.github/workflows/shared.yml' > "$case_dir/.github/workflows/ci.yml"
+    printf 'jobs:\n' > "$case_dir/.github/workflows/shared.yml"
+    setup_consumer
+    expect empty-called 2 't: shared.yml: no jobs: block' 't: shared.yml: no jobs: block'
+    check empty-called-no-run test ! -e "$case_dir/marker"
+    for exported in no yes; do
+        new_case
+        printf 'jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: env > marker\n' > "$case_dir/.github/workflows/ci.yml"
+        printf 'unset MY_SHELL_ONLY\nMY_SHELL_ONLY=1\nunset LANG\nLANG=C\n' >> "$consumer"
+        if [ "$exported" = yes ]; then printf 'export MY_SHELL_ONLY LANG\n' >> "$consumer"; fi
+        cat >> "$consumer" <<'CASE'
+gate_workflow_job() { :; }
+gate_init --name t
+gate_workflow --pass MY_SHELL_ONLY ci.yml
+gate_run
+CASE
+        expect exported-only 0 '' 't: all passed'
+        if [ "$exported" = yes ]; then
+            check exported-pass grep -Fxq MY_SHELL_ONLY=1 "$case_dir/marker"
+            check exported-base grep -Fxq LANG=C "$case_dir/marker"
+        else
+            check shell-only-pass test "$(grep -c '^MY_SHELL_ONLY=' "$case_dir/marker")" -eq 0
+            check shell-only-base test "$(grep -c '^LANG=' "$case_dir/marker")" -eq 0
+        fi
+    done
+    new_case
+    mkdir "$case_dir/other"
+    printf 'jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: false\n      - run: touch after\n' > "$case_dir/.github/workflows/ci.yml"
+    printf '%s\n' "$steps" > "$case_dir/other/ci.yml"
+    cat >> "$consumer" <<'CASE'
+gate_workflow_job() { :; }
+gate_init --name t
+gate_workflow ci.yml
+gate_workflow --dir other ci.yml
+gate_run
+CASE
+    expect separate-calls 1 'step 2 skipped build: touch after (an earlier step of job build failed)' ''
+    check separate-calls-ran test -e "$case_dir/marker"
+    check separate-calls-skipped test ! -e "$case_dir/after"
+    new_case
+    printf '%s\n' "$steps" > "$case_dir/.github/workflows/ci.yml"
+    cat >> "$consumer" <<'CASE'
+gate_workflow_job() { :; }
+gate_init --name t
+shopt -s nocasematch
+trap 'if shopt -q nocasematch; then printf unchanged > option; fi' EXIT
+gate_workflow ci.yml
+gate_run
+CASE
+    expect nocasematch 2 't: gate_workflow: nocasematch is set' 't: gate_workflow: nocasematch is set'
+    check option-preserved test "$(cat "$case_dir/option" 2>/dev/null)" = unchanged
+    check nocasematch-no-run test ! -e "$case_dir/marker"
+    new_case
+    printf '%s\n' "$steps" > "$case_dir/real.yml"
+    ln -s ../../real.yml "$case_dir/.github/workflows/ci.yml"
+    setup_consumer
+    expect linked-workflow 2 't: ci.yml: workflow is a symbolic link' 't: ci.yml: workflow is a symbolic link'
+    check linked-no-run test ! -e "$case_dir/marker"
+}
+
 consumer_cases() {
     # shellcheck disable=SC2016 # Inspect the actual consumer interpreter.
     printf 'gate_workflow_test: consumer bash %s\n' "$("$runner" -c 'printf %s "${BASH_VERSINFO[0]}"')"
+    byte_cases
+    inline_cases
+    hook_state_cases
+    edge_cases
     basic_cases
     environment_cases
     reusable_cases
@@ -535,6 +792,10 @@ consumer_cases() {
     touched_cases
     boundary_cases
     mode=strict
+    byte_cases
+    inline_cases
+    hook_state_cases
+    edge_cases
     basic_cases
     environment_cases
     refuse strict-hook "t: ci.yml: job 'build' is not mirrored; define gate_workflow_job to allow it" $'jobs:\n  build:' 'gate_workflow_job() { return 1; }'

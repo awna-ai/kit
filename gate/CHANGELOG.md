@@ -23,6 +23,12 @@
 
 ### Fixed
 
+- Keep every step of a workflow job selected when the touched tier selects any command of that job.
+- Refuse unsafe workflow bytes, continued quoted or flow values, anchors, aliases and tags before running steps.
+- Refuse duplicate workflow keys, later document markers, empty job blocks and symbolic-link workflow files.
+- Isolate hook state in subshells and reserve parser locals so hooks read consumer globals safely.
+- Recognize mixed-case macOS labels, require exported passed variables and separate job skip groups across calls.
+- Refuse case-insensitive parser matching without changing the caller's shell options.
 - Record consumer files explicitly with `--own`, independent of relative invocation and directory changes.
 - Silence directory-resolution errors for own paths that cannot be resolved.
 - Require a slash or a dot followed by a letter in both path word rules, so cargo fragments do not map root files.

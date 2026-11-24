@@ -33,7 +33,7 @@ its last part; start such a command with `set -o pipefail` (or `set -e`), or mov
 into a script.
 
 The host supplies `bash`, `mktemp`, `rm` and `tail`; macOS-only steps also need `uname`.
-The touched tier and `--check-map` also need `git`. Workflow steps also need `env`.
+The touched tier and `--check-map` also need `git`. Workflow steps also need `env`, `tr` and `cmp`.
 The library uses the shell's `pwd` builtin and `SECONDS` clock. Logs can contain any
 output the commands produce. Failed runs retain those logs in a temporary directory;
 the consumer is responsible for removing them after inspection.
@@ -325,27 +325,42 @@ are accepted. Repeat `--pass` to name variables matching
 Invalid calls print `<name or gate>: gate_workflow: <reason>` on stderr and exit 2:
 `gate_init has not run`, `invalid workflow file name`, `invalid --dir`,
 `missing or repeated --dir`, `invalid --pass`, `unknown option: <option>`, or
-`expected one workflow file`.
+`expected one workflow file`, or `nocasematch is set`. Case-insensitive matching
+must be disabled by the caller; a refusal leaves the option unchanged.
 
 Files are read breadth-first: the entry file's jobs first, then each called local
 reusable workflow in discovery order. Each file is read once per call, so cycles
 end. A job-level `uses: ./.github/workflows/<name>` reads that name from the same
 `--dir`, even when it is a custom directory. The call itself registers no step.
-Every read workflow is added to the gate's own files using the same root-relative
-physical-directory resolution as `gate_init --own`; a workflow change forces the
+Symbolic-link workflow files are refused. Every read workflow is added to the gate's
+own files using the same root-relative physical-directory resolution as `gate_init --own`; a workflow change forces the
 full tier. Files outside the root are not added to the own-path list.
 
 ### Accepted grammar
 
 Blank lines containing only spaces and comments whose first non-space character
-is `#` are skipped. A carriage return anywhere, or a tab in indentation, is refused.
+is `#` are skipped. Before parsing, any NUL byte refuses the whole file. A carriage
+return or tab anywhere on a line is refused. Every other byte must be printable
+ASCII (0x20 through 0x7E), with parsing local to the C locale. Non-ASCII text in a
+workflow, even in a comment or a `name:`, is refused; comments are not exempt.
 For every value, text from the first space or tab followed by `#` is removed, then
 surrounding spaces are trimmed, without interpreting quotes or escapes.
 Thus `run: echo "a # b"` becomes the command `echo "a`, which fails in Bash.
 
+Every inline value read at any level must close on its own physical line. Values
+starting with `&`, `*` or `!` are refused as anchors, aliases or tags. A value starting
+with `"` must match `^"[^"\\]*"$`; one starting with `'` must match `^'[^']*'$`.
+A value starting with `[` must match `^\[[^][{}"']*\]$`; one starting with `{`
+must match `^\{[^][{}"']*\}$`. These checks apply after comment removal, including
+to ignored inline names, ids, timeouts, setup arguments and replaced env values.
+Ignored nested blocks also receive this scalar check.
+Thus `name: "a # b"` is refused because comment removal leaves `"a`. A plain
+`run:` keeps its stricter rules below. Duplicate top-level keys, job ids, job keys,
+step keys, env names and service names are refused within their respective scopes.
+
 | Indentation | Accepted content |
 | --- | --- |
-| 0 | `---` or `<key>:` with an optional value; keys are `name`, `run-name`, `on`, `permissions`, `concurrency`, `jobs`. Keys match `^[A-Za-z_-]+$`. `jobs:` must have no value. |
+| 0 | `---` only before any other non-blank, non-comment line, or `<key>:` with an optional value; keys are `name`, `run-name`, `on`, `permissions`, `concurrency`, `jobs`. Keys match `^[A-Za-z_-]+$`. `jobs:` must have no value. |
 | Under another top-level key | Nested contents are ignored. Top-level `env` and `defaults` are refused. |
 | 2 under `jobs:` | `<job>:` with no value, matching `^[A-Za-z0-9_-]+$`; jobs keep file order. |
 | 4 | A job key matching `^[A-Za-z0-9_-]+$`, with an optional value. |
@@ -359,17 +374,19 @@ Built-in job keys are `name`, `needs`, `runs-on`, `steps`, `env`, `services`,
 `permissions`, `timeout-minutes`, `uses`. Other keys require the job-key hook.
 Allowing such a key means the gate ignores the key and its whole nested block,
 including a matrix or condition; the hook must ensure ignoring it is appropriate.
-Nested contents of other built-in keys are ignored except for the specific blocks
-above. Odd indentation under `jobs:` is refused except inside an ignored job-key
-block, service settings deeper than 6, or `with:` arguments at 10 or deeper.
+Nested lines under `runs-on` or job-level `uses` are refused because YAML could
+continue their plain values. Nested contents of other built-in keys are ignored
+except for the specific blocks above. Odd indentation under `jobs:` is refused
+except inside an ignored job-key block, service settings deeper than 6, or `with:` arguments at 10 or deeper.
 A top-level line ends the current jobs block.
 
-`runs-on` must match `^[A-Za-z0-9._-]+$`. A `macos-*` label marks every run step
-of the job macOS-only. Only selected steps trigger the existing preflight: off
+`runs-on` must match `^[A-Za-z0-9._-]+$`. A case-insensitive `macos-*`
+label marks every run step of the job macOS-only. Only selected steps trigger the existing preflight: off
 macOS it exits 75 before any step runs, naming the step's label. Other plain labels
 impose no operating-system restriction; the gate does not provision a runner.
 A job with steps must have `runs-on`, and cannot also have job-level `uses`.
-Every job must contain at least one run command or a local reusable call.
+Every job must contain at least one run command or a local reusable call. Every
+file, including a called file, must contain at least one job in its `jobs:` block.
 
 Step keys are only `name`, `id`, `run`, `uses`, `with`, `timeout-minutes`.
 Every step needs exactly one of `run` and `uses`. Allowed `uses` steps register
@@ -389,10 +406,12 @@ service provisioning and dependency scheduling are deliberately not mirrored.
 ### Consumer hooks
 
 Hooks must be shell functions defined before `gate_workflow`; an undefined hook
-allows nothing. Each runs in a condition with stdin from `/dev/null`, so rejection
-works under `set -euo pipefail` and an `ERR` trap. Stderr passes through unchanged.
+allows nothing. Each runs in a subshell in a condition with stdin from `/dev/null`,
+so rejection works under `set -euo pipefail` and an `ERR` trap. Stderr passes through unchanged.
 Only the env hook's stdout is used; other hook stdout is discarded.
-Arguments are validated data, never evaluated as shell code.
+Parser locals use the reserved `_GATE_WF_` prefix so hooks can read their own
+consumer globals. Hook assignments cannot change parser state. Arguments are
+validated data, never evaluated as shell code.
 
 | Function | Arguments | Return 0 to |
 | --- | --- | --- |
@@ -410,8 +429,11 @@ including when `env:` follows `steps:`.
 
 Run steps register as plain steps labelled `<job>: <command>`, with no `--always`
 flag. Lists and touched-map patterns match these labels like any other step; path
-words in labels or commands also select them. Their skip group is `<file>/<job>`,
-so identically named jobs in different workflow files remain independent.
+words in labels or commands also select them. In the touched tier, selecting any
+workflow step selects every step in that same job group, in registration order,
+including its earlier setup. Their skip group is `<call number>/<file>/<job>`, where
+the call number counts `gate_workflow` calls in this run. Jobs from separate files or calls, including
+same-named files in different `--dir` directories, remain independent.
 
 Workflow commands run from the recorded root with stdin `/dev/null`, the same
 private logs and timings as plain steps, using this argv:
@@ -424,12 +446,13 @@ env -i <assignments...> "$BASH" -e -c "<command>"
 unspecified shell on Linux and macOS, `bash -e {0}`; no pipefail is implied.
 Each assignment is one argv word, never a re-parsed string. In order:
 
-1. The caller's set values of `HOME`, `USER`, `LOGNAME`, `PATH`, `TMPDIR`, `LANG`, `TERM`.
+1. The caller's exported values of `HOME`, `USER`, `LOGNAME`, `PATH`, `TMPDIR`, `LANG`, `TERM`.
 2. `CI=true`.
-3. Each set `--pass` variable, in call order.
+3. Each exported `--pass` variable, in call order.
 4. The job env hook's assignments, in workflow order.
 
-Later assignments win. Unset variables are omitted; set empty values remain empty.
+Later assignments win, including env-hook values overriding `--pass` values.
+Unset and unexported variables are omitted; exported empty values remain empty.
 Caller values are taken when `gate_run` starts. Other environment variables and
 exported functions are absent. Plain `gate_step` commands retain their existing
 inherited environment and `bash -c` behavior.
@@ -451,10 +474,18 @@ start at 1. Hook stderr can print additional lines of the consumer's own.
 | Problem | Reason |
 | --- | --- |
 | Missing or unreadable file | `workflow not found in <dir as given>` |
-| Carriage return or tab in indentation | `line <n>: a carriage return or a tab` |
+| Symbolic-link workflow file | `workflow is a symbolic link` (file-level) |
+| NUL byte anywhere | `a NUL byte` (file-level) |
+| Other non-printable or non-ASCII byte | `line <n>: a byte outside printable ASCII` (file-level) |
+| Anchor, alias or tag prefix in an inline value | `line <n>: anchors, aliases and tags are not mirrored` |
+| Quoted or flow value that fails the single-line pattern | `line <n>: a quoted or flow value must close on its own line` |
+| Duplicate key, job id, env name or service name | `line <n>: duplicate key '<key>'` (job-level inside a job) |
+| Document marker after other content or another marker | `line <n>: a second YAML document` |
+| Caller has case-insensitive matching enabled | `nocasematch is set` (`gate_workflow` call error) |
+| Carriage return or tab anywhere on a line | `line <n>: a carriage return or a tab` |
 | Unknown top-level key | `line <n>: top-level key '<key>' is not mirrored` |
-| Invalid top-level line or indentation/shape under jobs | `line <n>: cannot be mirrored` |
-| Missing or inline jobs block | `no jobs: block` |
+| Invalid top-level line, indentation/shape under jobs, or nested runner/call value | `line <n>: cannot be mirrored` |
+| Missing, empty or inline jobs block | `no jobs: block` |
 | Invalid job id or job with an inline value | `line <n>: cannot be mirrored` |
 | Rejected job (file-level) | `job '<job>' is not mirrored; define gate_workflow_job to allow it` |
 | Rejected extra job key | `job key '<key>' is not mirrored` |
