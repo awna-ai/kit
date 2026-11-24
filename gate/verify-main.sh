@@ -194,12 +194,13 @@ configuration_fingerprint() {
     done
     for directory in "$common/hooks" "$hooks_dir"; do
         if [ -d "$directory" ]; then
-            entries=$(find "$directory" -print | sort) || return 1
+            entries=$(find "$directory/" -print | sort) || return 1
             printf '%s\n' "$entries"
             while IFS= read -r file; do
                 if [ -L "$file" ]; then
                     readlink "$file" || return 1
-                elif [ -f "$file" ]; then
+                fi
+                if [ -f "$file" ]; then
                     cksum "$file" || return 1
                     if [ -x "$file" ]; then printf 'executable\n'; else printf 'not executable\n'; fi
                 fi

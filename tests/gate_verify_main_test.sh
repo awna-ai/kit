@@ -701,6 +701,33 @@ case_hook_mode_tripwire() {
     check test ! -e "$tmp/payload-ran"
     expect 1 "verify-main: the check changed the git configuration or hooks of $repo; nothing changed, inspect it"
 }
+case_hook_symlink_target_tripwire() {
+    for mutation in mode content; do
+        setup
+        printf '#!/bin/sh\ntouch "%s/payload-ran"\n' "$tmp" > "$tmp/payload"
+        ln -s "$tmp/payload" "$repo/.git/hooks/pre-push"
+        if [ "$mutation" = mode ]; then
+            chmod -x "$tmp/payload"
+            printf 'chmod +x "%s/payload"\n' "$tmp" > "$tmp/hook"
+        else
+            chmod +x "$tmp/payload"
+            printf 'printf "# changed\\n" >> "%s/payload"\n' "$tmp" > "$tmp/hook"
+        fi
+        run
+        check test ! -e "$tmp/payload-ran"
+        expect 1 "verify-main: the check changed the git configuration or hooks of $repo; nothing changed, inspect it"
+    done
+}
+case_hooks_dir_symlink_tripwire() {
+    mv "$repo/.git/hooks" "$tmp/hooks"
+    ln -s "$tmp/hooks" "$repo/.git/hooks"
+    printf '#!/bin/sh\ntouch "%s/payload-ran"\n' "$tmp" > "$tmp/payload"
+    chmod +x "$tmp/payload"
+    printf 'cp "%s/payload" "%s/hooks/pre-push"\n' "$tmp" "$tmp" > "$tmp/hook"
+    run
+    check test ! -e "$tmp/payload-ran"
+    expect 1 "verify-main: the check changed the git configuration or hooks of $repo; nothing changed, inspect it"
+}
 case_active_hooks_tripwire() {
     mkdir "$repo/.githooks"
     git -C "$repo" config core.hooksPath .githooks
@@ -1138,7 +1165,7 @@ case_repeat_red() {
     expect 5 "red $head culprit $head"
 }
 cases='repeat_red equal_freeze_advance rerun_unavailable_empty red_covered off_main_advance stolen_lock check_stdout merge_suspects remote_green_object lease_races missing_tools cleanup_status shallow green_push_failure lock_identity bad_lock check_environment relative_tmp inside_tmp cannot_start shadow follow_tags fresh_rerun noncommit_ref docs signals red_push_failure push_races failures environment scratch_config live_lock stale_lock freeze_race green_race covered main_moved rewritten unavailable fixed flaky no_green_red red_many red_one advance current_off_main current_ancestor_frozen current_frozen current first_green usage'
-cases="shadow_control_chars hook_mode_tripwire main_pointer_tripwire linked_pointer_tripwire tilde_remote colon_relative_remote detached_root linked_tripwire active_hooks_tripwire relative_path_command relative_remote ps_failure deleted_freeze tree_check check_exit_codes root_tripwire readonly_red dash_tmp fetch_tags lock_directory_link lock_timezone scratch_refs $cases"
+cases="hooks_dir_symlink_tripwire hook_symlink_target_tripwire shadow_control_chars hook_mode_tripwire main_pointer_tripwire linked_pointer_tripwire tilde_remote colon_relative_remote detached_root linked_tripwire active_hooks_tripwire relative_path_command relative_remote ps_failure deleted_freeze tree_check check_exit_codes root_tripwire readonly_red dash_tmp fetch_tags lock_directory_link lock_timezone scratch_refs $cases"
 selected=0
 for name in $cases; do
     if [ "$#" -gt 0 ] && [ "$1" != "$name" ]; then continue; fi

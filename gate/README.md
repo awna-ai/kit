@@ -673,7 +673,10 @@ the root's own `config.worktree` and `.git` file (when it is a regular file),
 the git directory's `commondir` and `gitdir` files (present or missing),
 `$common/hooks` and the active hooks directory resolved by Git. Missing configuration
 files and hooks directories are recorded; every hooks entry is listed, with checksums
-for files, file modes (the executable bit), and targets for symlinks. Immediately after each check, before any further git command,
+for files, whether each file is executable by the caller, and targets for symlinks.
+A symlinked hook is recorded by its target text and, when it resolves to a file, by
+that file's checksum and executable state. A symlinked hooks directory is walked
+through its link. Immediately after each check, before any further git command,
 a changed fingerprint exits 1 with no push and asks you to inspect the root's
 configuration or hooks:
 
