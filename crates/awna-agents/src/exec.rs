@@ -1,12 +1,17 @@
 //! Summaries of an exec-mode CLI's JSON Lines events: one JSON object per line, typed
 //! `item.completed`, `turn.completed`, `turn.failed` or `error`.
+//!
+//! The caller must limit how much it reads because each line is parsed in full, regardless of
+//! length. The summary is the stream's own advisory account. It has no authentication and a later
+//! line can override an earlier one.
 
 use serde_json::{Map, Value};
 
 use crate::summary::{count, string};
 use crate::{ResultLine, Spend, Summary, Tokens};
 
-/// Summarizes the JSON events in an exec stream.
+/// Summarizes the JSON events in an exec stream. Each line is parsed whole, so the caller limits
+/// how much it passes in.
 pub fn summarize(output: &[u8]) -> Summary {
     summarize_after(output, 0)
 }
