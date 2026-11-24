@@ -170,3 +170,15 @@ fn linux_refuses_values_systemd_would_refuse_or_not_expand() {
         assert!(render(&service, Platform::MacOs).is_ok(), "{service:?}");
     }
 }
+
+#[test]
+fn linux_accepts_text_and_nice_systemd_allows() {
+    let mut service = unit(Run::KeepAlive);
+    for argument in ["a\u{fdcf}b", "a\u{fdf0}b", "a\u{fffd}b", "a\u{1f600}b"] {
+        service.argv.push(argument.into());
+    }
+    service.nice = Some(19);
+    let rendered = render(&service, Platform::Linux).unwrap();
+    assert!(rendered.contains("\"a\u{1f600}b\""));
+    assert!(rendered.contains("\nNice=19\n"));
+}

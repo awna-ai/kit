@@ -90,7 +90,8 @@ pub enum Rollback {
 pub enum Removed {
     /// The service was unloaded or its unit file was removed.
     Removed,
-    /// The service had neither a loaded job nor a unit file.
+    /// The service had neither a loaded job nor a unit file, or its unit is masked on Linux.
+    /// A masked unit is reported here without querying its state, even if it still runs.
     NotInstalled,
 }
 
@@ -512,7 +513,8 @@ pub fn apply<M: Manager + ?Sized>(
     })
 }
 
-/// Unloads a service if needed and removes its unit file.
+/// Unloads a service if needed and removes its unit file. A Linux mask link is left in place
+/// and reported as [`Removed::NotInstalled`].
 pub fn remove<M: Manager + ?Sized>(
     manager: &M,
     units_dir: &Path,
