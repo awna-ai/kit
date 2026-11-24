@@ -1,0 +1,31 @@
+# The touched-step map: <path pattern> <step pattern>, using Bash patterns.
+# ci-local.sh --tier touched reads it; ci-local.sh --check-map checks it.
+# A path no line matches and no step names runs the full tier, so a gap fails safe.
+# This map deliberately has no entry for itself: changing it runs the full tier.
+
+# Rust: a change to a crate or the workspace runs every cargo step.
+crates/*                    cargo *
+crates/*/Cargo.toml         bash scripts/deps-check.sh
+Cargo.toml                  cargo *
+Cargo.toml                  bash scripts/deps-check.sh
+Cargo.lock                  cargo *
+Cargo.lock                  bash scripts/deps-check.sh
+rust-toolchain.toml         cargo *
+
+# The gate library and the gate.
+gate/*.sh                   shellcheck *
+gate/*.sh                   bash tests/gate_lib_test.sh
+gate/*.sh                   bash tests/ci_local_test.sh
+gate/*                      -
+scripts/*.sh                shellcheck *
+scripts/ci-local.sh         bash tests/ci_local_test.sh
+scripts/term-check.sh       bash tests/term_check_test.sh
+scripts/secret-scan.sh      bash tests/secret_scan_test.sh
+scripts/deps-check.sh       bash tests/deps_check_test.sh
+tests/*.sh                  shellcheck *
+
+# Prose and settings: the scanners, which every change runs, are enough.
+*.md                        -
+.ai/*                       -
+LICENSE                     -
+.gitignore                  -

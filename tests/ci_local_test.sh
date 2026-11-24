@@ -285,7 +285,7 @@ done
 for arguments in '--tier bogus' '--list --list'; do
     new_case
     read -r -a gate_args <<< "$arguments"
-    expect "usage-$arguments" 2 'usage: ci-local.sh [--tier full|land] [--list]'
+    expect "usage-$arguments" 2 'usage: ci-local.sh [--tier full|land|touched] [--list] | --check-map'
 done
 gate_args=()
 
@@ -298,6 +298,88 @@ for command in '^fmt ' '^clippy ' '^test ' '^+1.99.0 check '; do
         failed=1
     fi
 done
+
+
+new_case
+map_output=$(PATH="$repo/bin" bash "$root/scripts/ci-local.sh" --check-map 2>&1)
+map_status=$?
+if [ "$map_status" -ne 0 ] || [ "$map_output" != 'ci-local: map ok' ]; then
+    printf 'ci_local_test: FAIL repository-map: exit %s: %s\n' "$map_status" "$map_output"
+    failed=1
+fi
+
+for changed in Cargo.lock tests/a_test.sh; do
+    new_case
+    mkdir "$repo/tests"
+    printf 'exit 0\n' > "$repo/tests/a_test.sh"
+    # Register every test label named by the map, without running those tests.
+    for test_name in gate_lib ci_local term_check secret_scan deps_check; do
+        printf 'exit 0\n' > "$repo/tests/${test_name}_test.sh"
+    done
+    if [ -f "$root/scripts/ci-touched.map" ]; then cp "$root/scripts/ci-touched.map" "$repo/scripts/"; fi
+    git -C "$repo" add .
+    git -C "$repo" -c user.name=Test -c user.email=test@example.invalid -c commit.gpgsign=false commit -qm 'Record a fixture.'
+    git -C "$repo" update-ref refs/remotes/origin/main HEAD
+    printf '# changed\n' >> "$repo/$changed"
+    selected=$(PATH="$repo/bin" bash "$repo/scripts/ci-local.sh" --tier touched --list 2> "$tmp/touched-notice")
+    selected_status=$?
+    if [ "$changed" = Cargo.lock ]; then
+        wanted=$(printf '%s\n' 'bash scripts/term-check.sh' 'bash scripts/secret-scan.sh' \
+            'cargo fmt --all --check' 'cargo clippy --workspace --all-targets --all-features --locked -- -D warnings' \
+            'cargo test --workspace --all-features --locked' 'cargo +1.99.0 check --workspace --all-targets --all-features --locked' \
+            'bash scripts/deps-check.sh')
+    else
+        wanted=$(printf '%s\n' 'shellcheck scripts/*.sh tests/*.sh gate/*.sh' 'bash tests/a_test.sh' \
+            'bash scripts/term-check.sh' 'bash scripts/secret-scan.sh')
+    fi
+    if [ "$selected_status" -ne 0 ] || [ "$selected" != "$wanted" ]; then
+        printf 'ci_local_test: FAIL touched-%s: exit %s: %s\n' "$changed" "$selected_status" "$selected"
+        failed=1
+    fi
+    if [ -s "$CARGO_LOG" ]; then
+        printf 'ci_local_test: FAIL touched-list-ran\n'
+        failed=1
+    fi
+done
+
+# shellcheck disable=SC2016
+if [ -x /bin/bash ] && [ "$(/bin/bash -c 'printf %s "${BASH_VERSINFO[0]}"')" != "$(bash -c 'printf %s "${BASH_VERSINFO[0]}"')" ]; then
+    for fixture in metacharacters space msrv-quoted; do
+        new_case
+        rm "$repo/bin/bash"
+        ln -s /bin/bash "$repo/bin/bash"
+        case "$fixture" in
+            metacharacters|space)
+                mkdir "$repo/tests"
+                if [ "$fixture" = space ]; then
+                    printf 'exit 0\n' > "$repo/tests/my ok_test.sh"
+                    expect alternate-space 0 'ci-local: all passed' 'ci-local: all passed'
+                else
+                    printf 'printf "fixture-failed\\n"; exit 1\n' > "$repo/tests/x_test.sh;true #_test.sh"
+                    expect alternate-metacharacters 1 '    fixture-failed'
+                fi
+                ;;
+            msrv-quoted)
+                printf '[workspace.package]\nrust-version = "1.99.0;true #"\n' > "$repo/Cargo.toml"
+                cat > "$repo/bin/rustup" <<'STUB'
+#!/bin/sh
+if [ "$1" = toolchain ]; then
+    printf '1.99.0-host\n1.99.0;true #-host\n'
+else
+    printf 'rustfmt\nclippy\n'
+fi
+STUB
+                expect alternate-msrv 0 'ci-local: all passed' 'ci-local: all passed'
+                if ! grep -q '^+1.99.0;true # check ' "$CARGO_LOG"; then
+                    printf 'ci_local_test: FAIL alternate-msrv-argument\n'
+                    failed=1
+                fi
+                ;;
+        esac
+    done
+else
+    printf 'ci_local_test: alternate shell unavailable, skipped\n'
+fi
 
 export PATH="$saved_path"
 if [ "$failed" -ne 0 ]; then

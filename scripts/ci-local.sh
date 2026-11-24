@@ -8,7 +8,7 @@ trap 'exit 2' ERR
 cd "$(dirname "$0")/.."
 # shellcheck source=gate/lib.sh
 . gate/lib.sh
-gate_init --name ci-local --strict-var KIT_STRICT -- "$@"
+gate_init --name ci-local --strict-var KIT_STRICT --map scripts/ci-touched.map -- "$@"
 
 shopt -s nullglob
 if gate_require shellcheck 'the shell checks'; then
@@ -59,8 +59,8 @@ for test_file in tests/*_test.sh; do
     printf -v quoted '%q' "$test_file"
     gate_step --test "bash $test_file" "bash $quoted"
 done
-gate_step --contract 'bash scripts/term-check.sh'
-gate_step --contract 'bash scripts/secret-scan.sh'
+gate_step --contract --always 'bash scripts/term-check.sh'
+gate_step --contract --always 'bash scripts/secret-scan.sh'
 
 if [ "$rust_ready" -eq 1 ]; then
     gate_step 'cargo fmt --all --check'

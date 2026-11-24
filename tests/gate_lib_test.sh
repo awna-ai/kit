@@ -8,7 +8,8 @@ number=0
 runner=$(type -P bash)
 mode=loose
 mkdir "$tmp/bin"
-for tool in mktemp rm tail cat sleep; do
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+for tool in mktemp rm tail cat sleep git; do
     ln -s "$(type -P "$tool")" "$tmp/bin/$tool"
 done
 cat > "$tmp/bin/uname" <<'STUB'
@@ -214,7 +215,290 @@ signal_cases() {
     done
 }
 
+
+# Each fixture keeps its own consumer and logs out of the change set.
+touched_fixture() {
+    new_case
+    git init -q "$case_dir"
+    mkdir -p "$case_dir/docs/deep"
+    printf 'docs/* step-one\n' > "$case_dir/map"
+    printf 'base\n' > "$case_dir/docs/notes.md"
+    printf 'base\n' > "$case_dir/docs/deep/notes.md"
+    printf 'ignored\nconsumer.sh\nlogs/\nelsewhere/\nmarker\nout\nerr\n' > "$case_dir/.gitignore"
+    git -C "$case_dir" add .
+    git -C "$case_dir" -c user.name=Test -c user.email=test@example.invalid -c commit.gpgsign=false commit -qm 'Start a fixture.'
+    git -C "$case_dir" update-ref refs/remotes/origin/main HEAD
+    cat >> "$consumer" <<'CASE'
+gate_init --name t --map map -- "$@"
+gate_step step-one 'printf "one\n" >> marker'
+gate_step step-two 'printf "two\n" >> marker'
+CASE
+}
+
+touched_run() {
+    printf 'gate_run\n' >> "$consumer"
+    expect "$1" 0 "$2" 't: all passed' --tier touched
+    check "$1-marker" test "$(cat "$case_dir/marker" 2>/dev/null)" = "$3"
+    check "$1-cleanup" test -z "$(ls -A "$case_dir/logs")"
+}
+
+touched_cases() {
+    local change path reason init args
+    for change in committed staged unstaged untracked deleted space nested; do
+        touched_fixture
+        case "$change" in
+            untracked) printf 'new\n' > "$case_dir/docs/new.md" ;;
+            deleted) rm "$case_dir/docs/notes.md" ;;
+            space) printf 'new\n' > "$case_dir/docs/my notes.md" ;;
+            nested) printf 'new\n' > "$case_dir/docs/deep/notes.md" ;;
+            *) printf 'changed\n' > "$case_dir/docs/notes.md" ;;
+        esac
+        if [ "$change" = staged ] || [ "$change" = committed ]; then git -C "$case_dir" add docs; fi
+        if [ "$change" = committed ]; then
+            git -C "$case_dir" -c user.name=Test -c user.email=test@example.invalid -c commit.gpgsign=false commit -qm 'Change a file.'
+        fi
+        touched_run "$change" 't: tier touched, 1 paths changed, 1 steps' one
+    done
+    touched_fixture
+    git -C "$case_dir" rm -q --cached docs/notes.md
+    touched_run deduplicated 't: tier touched, 1 paths changed, 1 steps' one
+
+    for change in none ignored restored; do
+        touched_fixture
+        case "$change" in
+            ignored) printf 'ignored\n' > "$case_dir/ignored" ;;
+            restored) printf 'change\n' > "$case_dir/docs/notes.md"; printf 'base\n' > "$case_dir/docs/notes.md" ;;
+        esac
+        touched_run "$change" 't: tier touched, 0 paths changed, 0 steps' ''
+        check "$change-no-step" test "${output#*step }" = "$output"
+        check "$change-no-slowest" test "${output#*slowest}" = "$output"
+    done
+    touched_fixture
+    printf 'docs/* -\n' > "$case_dir/map"
+    git -C "$case_dir" add map
+    git -C "$case_dir" -c user.name=Test -c user.email=test@example.invalid -c commit.gpgsign=false commit -qm 'Use an empty selection.'
+    git -C "$case_dir" update-ref refs/remotes/origin/main HEAD
+    printf 'changed\n' > "$case_dir/docs/notes.md"
+    printf 'gate_step --always scanner '\''printf "scan\\n" >> marker'\''\n' >> "$consumer"
+    touched_run dash-always 't: tier touched, 1 paths changed, 1 steps' scan
+    rm "$case_dir/marker"
+    printf 'base\n' > "$case_dir/docs/notes.md"
+    expect always-no-change 0 't: tier touched, 0 paths changed, 1 steps' 't: all passed' --tier touched
+    check always-no-change-marker test "$(cat "$case_dir/marker")" = scan
+
+    touched_fixture
+    printf 'changed\n' > "$case_dir/direct.sh"
+    printf 'gate_step "bash direct.sh" '\''printf "label\\n" >> marker'\''\ngate_step command '\''printf "command\\n" >> marker; : direct.sh'\''\n' >> "$consumer"
+    touched_run word-matches 't: tier touched, 1 paths changed, 2 steps' "$(printf 'label\ncommand')"
+
+    for change in unmapped base missing malformed unknown absent tab newline unicode quote backslash; do
+        touched_fixture
+        reason=''
+        case "$change" in
+            unmapped) printf x > "$case_dir/other"; reason='other has no entry in map' ;;
+            base) git -C "$case_dir" update-ref -d refs/remotes/origin/main; reason='no merge base with origin/main' ;;
+            missing) rm "$case_dir/map"; reason='cannot read map' ;;
+            malformed) printf 'docs/*\n' > "$case_dir/map"; reason='map line 1 has no step' ;;
+            unknown) printf 'docs/* absent-step\n' > "$case_dir/map"; reason='map line 1 names no registered step: absent-step' ;;
+            absent) rm "$tmp/bin/git"; reason='git is unavailable' ;;
+            *)
+                case "$change" in
+                    tab) path=$'docs/a\tb' ;; newline) path=$'docs/a\nb' ;;
+                    unicode) path='docs/café.md' ;; quote) path='docs/a"b' ;; backslash) path='docs/a\b' ;;
+                esac
+                printf x > "$case_dir/$path"
+                reason='a changed path has a character the map cannot match'
+                ;;
+        esac
+        touched_run "fallback-$change" "t: tier touched falls back to the full tier: $reason" "$(printf 'one\ntwo')"
+        case "$change" in tab|newline|unicode|quote|backslash) check "hidden-$change" test "${output#*"$path"}" = "$output" ;; esac
+        if [ "$change" = absent ]; then ln -s "$(type -P git)" "$tmp/bin/git"; fi
+    done
+
+    for change in dollar backtick; do
+        touched_fixture
+        if [ "$change" = dollar ]; then
+            cat > "$case_dir/map" <<'MAP'
+docs/* $(touch pwned)
+MAP
+        else
+            cat > "$case_dir/map" <<'MAP'
+docs/* `touch pwned2`
+MAP
+        fi
+        printf 'gate_run\n' >> "$consumer"
+        expect "data-$change" 0 'names no registered step:' 't: all passed' --tier touched
+        check "data-$change-safe" test ! -e "$case_dir/pwned"
+        check "data-$change-safe-two" test ! -e "$case_dir/pwned2"
+    done
+
+    touched_fixture
+    printf 'changed\n' > "$case_dir/docs/notes.md"
+    printf 'gate_run\n' >> "$consumer"
+    (cd "$case_dir" && PATH="$tmp/bin" TMPDIR="$case_dir/logs" "$runner" "$consumer" --list --tier touched) > "$case_dir/out" 2> "$case_dir/err"
+    check touched-list-status test "$?" -eq 0
+    check touched-list-stdout test "$(cat "$case_dir/out")" = step-one
+    check touched-list-stderr grep -qx 't: tier touched, 1 paths changed, 1 steps' "$case_dir/err"
+    check touched-list-no-run test ! -e "$case_dir/marker"
+    check touched-list-no-logs test -z "$(ls -A "$case_dir/logs")"
+    printf x > "$case_dir/other"
+    (cd "$case_dir" && PATH="$tmp/bin" TMPDIR="$case_dir/logs" "$runner" "$consumer" --tier touched --list) > "$case_dir/out" 2> "$case_dir/err"
+    check fallback-list test "$(cat "$case_dir/out")" = "$(printf 'step-one\nstep-two')"
+    check fallback-list-stderr grep -qx 't: tier touched falls back to the full tier: other has no entry in map' "$case_dir/err"
+
+    touched_fixture
+    printf 'gate_step --mac-only mac '\''printf "mac\\n" >> marker'\''\ngate_run\n' >> "$consumer"
+    printf 'changed\n' > "$case_dir/docs/notes.md"
+    export TEST_OS=Linux
+    expect unselected-mac 0 'step 1 ' 't: all passed' --tier touched
+    rm "$case_dir/marker"
+    printf 'docs/* mac\nmap -\n' > "$case_dir/map"
+    expect selected-mac 75 'runs only on macOS' '' --tier touched
+    check selected-mac-preflight test ! -e "$case_dir/marker"
+
+
+    # Every matching row contributes, with each selected step run once.
+    touched_fixture
+    printf 'docs/* step-one\ndocs/* step-*\nmap -\n' > "$case_dir/map"
+    printf 'changed\n' > "$case_dir/docs/notes.md"
+    touched_run multi-match 't: tier touched, 2 paths changed, 2 steps' "$(printf 'one\ntwo')"
+
+    # Map whitespace, comments, a step pattern with spaces and no final newline.
+    touched_fixture
+    printf ' \t# comment\n\t \n docs/* \tstep with spaces \t' > "$case_dir/map"
+    printf 'gate_step "step with spaces" :\ngate_run\n' >> "$consumer"
+    expect map-whitespace 0 't: map ok' 't: map ok' --check-map
+
+    # Change-listing errors and temporary-file failures must run the full tier.
+    local fault real_git
+    real_git=$(type -P git)
+    for fault in diff ls-files mktemp; do
+        touched_fixture
+        printf 'changed\n' > "$case_dir/docs/notes.md"
+        if [ "$fault" = mktemp ]; then
+            rm "$tmp/bin/mktemp"
+            cat > "$tmp/bin/mktemp" <<'STUB'
+#!/bin/sh
+if [ "$1" != -d ]; then exit 1; fi
+STUB
+            printf 'runner="%s"\n' "$(type -P mktemp)" >> "$tmp/bin/mktemp"
+            cat >> "$tmp/bin/mktemp" <<'STUB'
+exec "$runner" "$@"
+STUB
+            chmod +x "$tmp/bin/mktemp"
+        else
+            rm "$tmp/bin/git"
+            {
+                printf '#!/bin/sh\n'
+                printf 'fault=%s\n' "$fault"
+                cat <<'STUB'
+if [ "$3" = "$fault" ]; then exit 1; fi
+STUB
+                printf 'runner="%s"\n' "$real_git"
+                cat <<'STUB'
+exec "$runner" "$@"
+STUB
+            } > "$tmp/bin/git"
+            chmod +x "$tmp/bin/git"
+        fi
+        touched_run "listing-$fault" 't: tier touched falls back to the full tier: could not list the change' "$(printf 'one\ntwo')"
+        if [ "$fault" = ls-files ] || [ "$fault" = mktemp ]; then
+            expect "check-listing-$fault" 2 't: gate_run: could not list tracked files' '' --check-map
+            check "check-listing-$fault-cleanup" test -z "$(ls -A "$case_dir/logs")"
+        fi
+        if [ "$fault" = mktemp ]; then
+            rm "$tmp/bin/mktemp"
+            ln -s "$(type -P mktemp)" "$tmp/bin/mktemp"
+        else
+            rm "$tmp/bin/git"
+            ln -s "$real_git" "$tmp/bin/git"
+        fi
+    done
+
+    touched_fixture
+    git -C "$case_dir" branch -f main HEAD
+    printf 'changed\n' > "$case_dir/docs/notes.md"
+    git -C "$case_dir" add docs
+    git -C "$case_dir" -c user.name=Test -c user.email=test@example.invalid -c commit.gpgsign=false commit -qm 'Change the base.'
+    git -C "$case_dir" update-ref refs/remotes/origin/main HEAD
+    # Only the local main branch sees the committed change.
+    sed 's/--map map/--map map --base main/' "$consumer" > "$case_dir/replaced"
+    mv "$case_dir/replaced" "$consumer"
+    touched_run local-base 't: tier touched, 1 paths changed, 1 steps' one
+
+    for init in '--map ""' '--base -x' '--base "a b"' '--map map --map map' '--base main --base main' $'--map \'bad\nmap\'' '--name t' '--strict-var X --strict-var X'; do
+        new_case
+        printf 'gate_init --name t %s\n' "$init" >> "$consumer"
+        expect "invalid-$init" 2 'gate_init:' ''
+    done
+    new_case
+    printf 'gate_init --name t\ngate_step --always --always first :\n' >> "$consumer"
+    expect repeated-always 2 'gate_step: repeated --always' ''
+    for args in '--tier touched' '--check-map'; do
+        new_case
+        printf 'gate_init --name t -- "$@"\n' >> "$consumer"
+        read -r -a arguments <<< "$args"
+        expect "no-map-$args" 2 'usage: consumer.sh [--tier full|land] [--list]' '' "${arguments[@]+"${arguments[@]}"}"
+    done
+    for args in '--check-map --list' '--check-map --tier full'; do
+        touched_fixture
+        read -r -a arguments <<< "$args"
+        expect "map-usage-$args" 2 'usage: consumer.sh [--tier full|land|touched] [--list] | --check-map' '' "${arguments[@]+"${arguments[@]}"}"
+    done
+    touched_fixture
+    cat >> "$consumer" <<'CASE'
+printf 'tier=%s\n' "$GATE_TIER"
+gate_run
+CASE
+    expect touched-global 0 'tier=touched' 't: all passed' --tier touched
+
+    touched_fixture
+    printf 'gate_run\n' >> "$consumer"
+    expect good-map 0 't: map ok' 't: map ok' --check-map
+    check map-no-run test ! -e "$case_dir/marker"
+    check map-cleanup test -z "$(ls -A "$case_dir/logs")"
+    printf '# comment\n docs/* \n docs/* absent-step\n nowhere/* step-one\n' > "$case_dir/map"
+    expect bad-map 1 't: map has 3 problems' 't: map has 3 problems' --check-map
+    check malformed-line test "${output#*FAIL: map line 2 has no step}" != "$output"
+    check unknown-line test "${output#*FAIL: map line 3 names no registered step: absent-step}" != "$output"
+    check unmatched-line test "${output#*FAIL: map line 4 matches no tracked file: nowhere/*}" != "$output"
+    check map-problem-count test "$(printf '%s\n' "$output" | grep -c '^FAIL: ')" -eq 3
+    printf 'nowhere/*\n' > "$case_dir/map"
+    expect malformed-unmatched-map 1 'FAIL: map line 1 matches no tracked file: nowhere/*' 't: map has 2 problems' --check-map
+    rm "$case_dir/map"
+    expect unreadable-map 1 'FAIL: cannot read map' 't: map has 1 problems' --check-map
+    rm "$tmp/bin/git"
+    expect check-without-git 2 't: gate_run: git is unavailable' '' --check-map
+    ln -s "$(type -P git)" "$tmp/bin/git"
+    touched_fixture
+    printf 'gate_missing invented-check "a check"\ngate_run\n' >> "$consumer"
+    # Strict mode is selected during initialization, before the missing probe.
+    sed 's/--map map/--strict-var TEST_STRICT --map map/' "$consumer" > "$case_dir/replaced"
+    mv "$case_dir/replaced" "$consumer"
+    export TEST_STRICT=1
+    expect strict-map-missing 0 't: map ok' 't: map ok' --check-map
+    unset TEST_STRICT
+}
+
+touched_safety_cases() {
+    touched_fixture
+    printf 'changed\n' > "$case_dir/docs/notes.md"
+    git -C "$case_dir" add docs
+    git -C "$case_dir" -c user.name=Test -c user.email=test@example.invalid -c commit.gpgsign=false commit -qm 'Change a file.'
+    touched_run strict-committed-selection 't: tier touched, 1 paths changed, 1 steps' one
+    touched_fixture
+    printf x > "$case_dir/other"
+    touched_run strict-fallback 't: tier touched falls back to the full tier: other has no entry in map' "$(printf 'one\ntwo')"
+    touched_fixture
+    printf 'gate_run\n' >> "$consumer"
+    expect strict-good-map 0 't: map ok' 't: map ok' --check-map
+}
+
 consumer_cases() {
+    touched_cases
+    mode=strict
+    touched_safety_cases
+    mode=loose
     # The command runs in the child shell whose version is being inspected.
     # shellcheck disable=SC2016
     printf 'gate_lib_test: consumer bash %s\n' "$("$runner" -c 'printf %s "${BASH_VERSINFO[0]}"')"

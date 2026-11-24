@@ -41,7 +41,7 @@ the consumer is responsible for removing them after inspection.
 
 ### gate_init
 
-`gate_init --name <name> [--strict-var <VAR>] [--] [<consumer arguments>...]`
+`gate_init --name <name> [--strict-var <VAR>] [--map <path>] [--base <ref>] [--] [<consumer arguments>...]`
 
 Call exactly once before the other functions; a second call exits 2 with
 `<name>: gate_init: called twice`. It records `pwd -P` as the root where every
@@ -54,8 +54,8 @@ Invalid initialization options exit 2 and print `<name or gate>: gate_init: <rea
 to stderr. Before a valid name is known, the diagnostic prefix is `gate`.
 
 After `--`, pass the consumer's `"$@"`. Accepted arguments are `--tier full`,
-`--tier land` and `--list`, in any order, each at most once. Both tiers select the
-same steps in this version. Invalid or repeated arguments exit 2 and print
+`--tier land` and `--list`, in any order, each at most once. The full and land tiers select the
+same steps; the touched tier selects steps by the map. Invalid or repeated arguments exit 2 and print
 `usage: <script> [--tier full|land] [--list]` to stderr, using the consumer's file name.
 
 These public globals are set by initialization and may be read by the consumer:
@@ -63,8 +63,9 @@ These public globals are set by initialization and may be read by the consumer:
 | Global | Value |
 | --- | --- |
 | `GATE_NAME` | The validated diagnostic name. |
-| `GATE_TIER` | `full` by default, or `land` when requested. |
+| `GATE_TIER` | `full` by default, or `land` or `touched` when requested; unchanged after a fallback. |
 | `GATE_LIST` | `0` by default, or `1` when `--list` was given. |
+| `GATE_CHECK_MAP` | `0` by default, or `1` when `--check-map` was given. |
 
 All other library state starts with `_GATE_`; all private functions start with
 `_gate_`. Consumers must leave this private state alone.
@@ -74,9 +75,9 @@ All other library state starts with `_GATE_`; all private functions start with
 `gate_missing <what> <skipping>`
 
 For a consumer's own toolchain or component probes. In strict mode, except when
-listing, it prints `<name>: <what> is missing on this host (<VAR>=1)` to stderr and
+listing or checking the map, it prints `<name>: <what> is missing on this host (<VAR>=1)` to stderr and
 exits 75. Otherwise it prints `<name>: <what> is missing, skipping <skipping>` to
-stdout, increments the skip count and returns 0. Listing permits missing tools even
+stdout, increments the skip count and returns 0. Listing and checking the map permit missing tools even
 in strict mode; probe diagnostics go to stderr so stdout contains only the listed labels.
 
 ### gate_require
@@ -88,12 +89,13 @@ Returns 0 without output when `command -v <tool>` succeeds. Otherwise it calls
 
 ### gate_step
 
-`gate_step [--test | --contract] [--mac-only] <label> [<command>]`
+`gate_step [--test | --contract] [--mac-only] [--always] <label> [<command>]`
 
 Registers a step, in order, and returns 0 without output. The command defaults to
 the label. Label and command must be non-empty strings without newlines. Invalid
 registration exits 2 with `<name>: gate_step: <reason>` on stderr. Kind options are
-mutually exclusive. `--mac-only` requires `uname -s` to print `Darwin` when running.
+mutually exclusive. Repeated flags exit 2. `--always` selects the step on every touched run;
+it has no effect on full or land runs. `--mac-only` requires `uname -s` to print `Darwin` when running.
 
 | Kind | Exit 0 | Exit 1 | Exit 2 | Exit 75 | Other exit |
 | --- | --- | --- | --- | --- | --- |
@@ -153,3 +155,84 @@ priority over a later unavailable result. Exit 75 always means another host must
 run the gate; it is never green. Logs remain on every non-green run. Green removes
 the log directory before printing its final line. A failure to identify the host,
 record the root or remove logs exits 2 with a diagnostic on stderr.
+
+## The touched tier
+
+Opt in with `gate_init --name <name> --map <path> [--base <ref>] -- "$@"`.
+Every initialization option may occur at most once. The map path must be non-empty
+and contain no newline. Relative paths are resolved from the recorded repository
+root; absolute paths are allowed. The map is read only by `gate_run`, so a missing
+map is not an initialization error. The base defaults to `origin/main` and must
+match `^[A-Za-z0-9][A-Za-z0-9._/-]*$`; invalid values exit 2. A base without a map
+is allowed and has no effect. The base is read from the local ref only: the gate never fetches.
+
+With a map, consumer usage is:
+
+```text
+usage: <script> [--tier full|land|touched] [--list] | --check-map
+```
+
+`--check-map` must be the only consumer argument. Without a map, touched and
+check-map are usage errors (exit 2), and the original usage line still applies.
+
+Each physical map line is blank, a `#` comment, or `<path pattern> <step pattern>`
+after trimming leading and trailing spaces and tabs. The first field is the path
+pattern; the trimmed rest is the step pattern and may contain spaces. Both are
+Bash patterns used as data with `[[ $text == $pattern ]]`, never evaluated as code.
+`*` matches across slashes and spaces. A step pattern of `-` maps a path without
+selecting a step. Every other step pattern must match a registered label.
+
+```text
+# Changes to source run the matching registered checks.
+src/*       build *
+docs/*      -
+```
+
+Touched selection uses `git merge-base HEAD <base>`, then NUL-separated paths from
+`git diff -z --name-only --no-renames --no-ext-diff --no-textconv <merge base> --`
+and `git ls-files -z --others --exclude-standard`. It sees committed, staged,
+unstaged, deleted and untracked changes, excludes ignored untracked files, and
+counts each path once. Restored paths are not changes. Temporary files are created
+under `${TMPDIR:-/tmp}` with `mktemp` and removed before listing or running steps.
+
+Every matching map line selects every matching step label; `-` does not cancel
+other matches. A step also maps and selects a changed path when a word of its label
+or command equals the path exactly. Words use `read -r -a` with default whitespace
+splitting, without pathname expansion or shell quote interpretation. `--always`
+steps are selected even with no changes. Selected steps run once, in registration
+order. The notice is `<name>: tier touched, <p> paths changed, <s> steps` on stdout,
+or stderr when listing; listing's stdout holds only selected labels.
+
+The first uncertainty falls back to every registered step, in this order:
+
+| Condition | Reason |
+| --- | --- |
+| No git on PATH | `git is unavailable` |
+| Unreadable map | `cannot read <map>` |
+| Missing step field | `<map> line <n> has no step` |
+| Step pattern matches no label | `<map> line <n> names no registered step: <pattern>` |
+| Merge-base fails | `no merge base with <base>` |
+| Change listing or temporary-file creation fails | `could not list the change` |
+| A changed path has bytes outside printable ASCII, a double quote or a backslash | `a changed path has a character the map cannot match` |
+| A path matches neither a map line nor a step word | `<path> has no entry in <map>` |
+
+Map problems use physical line numbers starting at 1 and the map path exactly as
+given. The notice is `<name>: tier touched falls back to the full tier: <reason>`
+on stdout, or stderr when listing. Unsafe path bytes are never printed. `GATE_TIER`
+remains `touched`, including after fallback.
+
+Selection happens before listing and macOS preflight. Only selected macOS steps
+can cause exit 75. Timing, numbering, slowest steps and the count of steps not run
+cover only selected steps. An empty selection creates no log directory, prints no
+step timing or slowest list, and exits 0 with `<name>: all passed` (or
+`<name>: all passed, <s> skipped`). An empty list prints no labels and exits 0.
+
+`--check-map` requires git, lists tracked files with `git ls-files -z`, then checks
+every map line in order. It prints `FAIL: <map problem>` to stderr for every map
+problem above, plus `FAIL: <map> line <n> matches no tracked file: <path pattern>`
+for each line whose path pattern matches no tracked file. No problems
+prints `<name>: map ok` to stdout and exits 0; otherwise the final stderr line is
+`<name>: map has <k> problems`, exit 1. Missing git, a failed tracked-file listing
+or a temporary-file failure exits 2 with a `gate_run` diagnostic. No steps still
+exits 2 before map checking. Checking runs no step and creates no log directory;
+strict missing-tool probes are counted and printed to stderr rather than exiting 75.
