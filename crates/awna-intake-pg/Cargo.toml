@@ -1,0 +1,23 @@
+[package]
+name = "awna-intake-pg"
+version = "0.1.0"
+description = "A local Postgres intake store, host-applied schema and command line."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+awna-intake = { path = "../awna-intake" }
+libc = "0.2"
+serde_json = "1"
+sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "tls-none"] }
+tokio = { version = "1", features = ["rt"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[[bin]]
+name = "awna-intake"
+path = "src/main.rs"

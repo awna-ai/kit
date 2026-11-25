@@ -44,3 +44,11 @@ host. Without `KIT_STRICT=1` missing tools are skipped and counted, which suits 
 
 `awna-intake` is linked by tools that must stay offline, so `scripts/deps-check.sh` checks it with the same rule as
 D4. It holds types and traits only; a store that needs a database client lives in a separate package.
+
+## D8: the intake store is its own package, local database only
+
+`awna-intake-pg` holds the database client (sqlx, Postgres only, the tokio runtime, no TLS, no `json`, `macros` or
+`migrate` features), so `awna-intake` stays on the D7 list and a tool that only needs the types never resolves a
+database crate. Its CLI is how a tool that must not link a database reaches the store. With no TLS, it connects only
+to this machine (loopback or a Unix socket); a remote server is reached through a tunnel. It is not on the
+no-network list.

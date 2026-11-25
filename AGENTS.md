@@ -15,6 +15,8 @@ Gotchas, before anything else:
 - **No network client in `awna-run`, `awna-agents`, `awna-keystore`, `awna-launch` or `awna-intake`** (D4, D7),
   not even behind an optional feature. `scripts/deps-check.sh` fails the gate on one, and on any dependency from
   outside crates.io and this workspace.
+- **`awna-intake-pg` is the one package with a database client (D8);** keep sqlx's default features off, and never add
+  it to `scripts/deps-check.sh`'s list.
 - **Parsing and spawning stay apart** (D3): `awna-agents` holds no process code; `awna-run` holds no agent parsing.
 - **Version ranges, not exact pins** (D5): `libc = "0.2"`, `zeroize = "1"`, and no optional `serde_json` features.
 - **No fixed paths.** Scripts find the repo from their own location.

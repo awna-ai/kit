@@ -14,10 +14,11 @@ MIT licensed. Each package is released on its own tag; a package with no tag yet
 | `awna-keystore` | Stores credentials in the system keychain, with secrets that never print, plus an in-memory store for tests. |
 | `awna-launch` | Installs and controls background services: renders launchd and systemd user units, then loads, unloads and restarts them. |
 | `awna-intake` | The shape of an intake item (a request someone sends in, its triage, the work proposed for it, and its status from submitted to shipped), a status machine that refuses every illegal move, attachment limits, and the store and processor traits, with an in-memory store and a conformance suite for other stores. Types only, with no I/O. |
+| `awna-intake-pg` | A Postgres store for `awna-intake` items, its schema as one SQL file, and the `awna-intake` command line for reading items, moving their status, adding notes and exporting an item's files. Reaches only a database on this machine (a socket or a tunnel). |
 | `awna-gate` | A bash library for a repository's local gate: register steps, run each with its own log, and exit by one contract (green, red, internal error, or "this host can't run it"). It can run only the steps a change needs, read steps from GitHub Actions workflows, and ships a term check and a secret scan. |
 
-None of the five Rust packages uses a network client, not even behind a feature, so a tool that must stay offline can
-depend on them. `awna-gate` is shell, in `gate/`; its `README.md` says how to use it.
+The five core Rust packages use no network client, not even behind a feature, so a tool that must stay offline can
+depend on them. `awna-intake-pg` is separate and reaches only a local database target. `awna-gate` is shell, in `gate/`; its `README.md` says how to use it.
 
 ## Using a package
 

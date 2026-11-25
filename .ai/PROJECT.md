@@ -15,6 +15,7 @@ crates/awna-agents     agent CLI argv builders and stream parsers (no process co
 crates/awna-keystore   credential store
 crates/awna-launch     launchd and systemd user units
 crates/awna-intake     intake item types, status machine and store traits (no I/O)
+crates/awna-intake-pg  Postgres store, schema and CLI for awna-intake items
 gate/                  awna-gate: the sourced bash library the gate is built on (lib.sh), its scanners
                        (term-check.sh, secret-scan.sh), vendor.sh, VERSION, CHANGELOG.md, README.md
 scripts/ci-local.sh    the gate

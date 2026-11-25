@@ -5,6 +5,7 @@
 
 # Rust: a change to a crate or the workspace runs every cargo step.
 crates/*                    cargo *
+# This includes awna-intake-pg, whose schema and CLI share the cargo checks.
 Cargo.toml                  cargo *
 Cargo.lock                  cargo *
 rust-toolchain.toml         cargo *
