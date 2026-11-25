@@ -277,6 +277,8 @@ impl Default for Limits {
                 "application/vnd.openxmlformats-officedocument.presentationml.presentation",
                 &["pptx"][..],
             ),
+            ("video/mp4", &["mp4", "m4v"][..]),
+            ("video/quicktime", &["mov"][..]),
         ]
         .into_iter()
         .map(|(content_type, extensions)| AllowedType {

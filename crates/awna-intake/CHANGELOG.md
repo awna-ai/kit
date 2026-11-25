@@ -4,6 +4,7 @@ This package is versioned on its own. Its releases are tagged `awna-intake-vX.Y.
 
 ## Unreleased
 
+- Allow `video/mp4` (`mp4`, `m4v`) and `video/quicktime` (`mov`) attachments by default.
 - Add intake item types and validated JSON and text boundaries.
 - Add the status machine, with every illegal move refused.
 - Add attachment limits and a content-type and extension allowlist.

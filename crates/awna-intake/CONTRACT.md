@@ -212,6 +212,8 @@ configuration first.
 | application/vnd.openxmlformats-officedocument.wordprocessingml.document | docx |
 | application/vnd.openxmlformats-officedocument.spreadsheetml.sheet | xlsx |
 | application/vnd.openxmlformats-officedocument.presentationml.presentation | pptx |
+| video/mp4 | mp4, m4v |
+| video/quicktime | mov |
 
 SVG and HTML are absent because they can carry script; archives and executables are deliberately excluded.
 Checks refuse, in order: too many files; an empty file or one above the per-file cap; total bytes above the item cap

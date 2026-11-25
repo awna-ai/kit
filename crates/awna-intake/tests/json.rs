@@ -674,6 +674,56 @@ fn item_metadata_refuses_duplicate_names_overflow_counts_and_wrong_screenshots()
 }
 
 #[test]
+fn default_limits_allow_mov_attachments() {
+    let file = NewFile {
+        name: AttachmentName::new("clip.mov").unwrap(),
+        content_type: "video/quicktime".into(),
+        role: Role::File,
+        bytes: b"x",
+    };
+    Limits::default().check(&[file]).unwrap();
+}
+
+#[test]
+fn default_limits_allow_mp4_and_m4v_attachments() {
+    for name in ["clip.mp4", "clip.m4v"] {
+        let file = NewFile {
+            name: AttachmentName::new(name).unwrap(),
+            content_type: "video/mp4".into(),
+            role: Role::File,
+            bytes: b"x",
+        };
+        Limits::default().check(&[file]).unwrap();
+    }
+}
+
+#[test]
+fn default_limits_refuse_avi_attachments() {
+    let file = NewFile {
+        name: AttachmentName::new("clip.avi").unwrap(),
+        content_type: "video/x-msvideo".into(),
+        role: Role::File,
+        bytes: b"x",
+    };
+    let error = Limits::default().check(&[file]).unwrap_err();
+    assert_eq!(error.field, "files[0].contentType");
+    assert_eq!(error.reason, "content type is not allowed");
+}
+
+#[test]
+fn default_limits_refuse_mov_with_mp4_content_type() {
+    let file = NewFile {
+        name: AttachmentName::new("clip.mov").unwrap(),
+        content_type: "video/mp4".into(),
+        role: Role::File,
+        bytes: b"x",
+    };
+    let error = Limits::default().check(&[file]).unwrap_err();
+    assert_eq!(error.field, "files[0].name");
+    assert_eq!(error.reason, "extension does not match content type");
+}
+
+#[test]
 fn limits_reject_invalid_configuration_before_checking_files() {
     for limits in [
         Limits {
