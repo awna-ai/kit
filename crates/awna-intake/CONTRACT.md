@@ -245,10 +245,10 @@ Backend and IllegalMove expose their error source.
 
 `Item::validate` refuses more than 256 events with field `events` and reason `event history is full`.
 Every store refuses `record_processing`, `set_status` or `add_note` that would append the 257th event with
-Invalid and the same field and reason, without changing anything. It checks this after NotFound and before
-checking the move.
+Invalid and the same field and reason, without changing anything.
 
-A store checks, in order, that the item exists (NotFound), then the input (Invalid), then the move (IllegalMove).
+A store checks, in order, that the item exists (NotFound), then the input (Invalid: the Processed, the Note,
+or `to == Processed`), then the history cap (Invalid, field `events`), then the move (IllegalMove).
 An id the store cannot hold, above its own range, is NotFound. This order applies to set_status, add_note and
 record_processing as well as other id-based methods. Unknown ids produce NotFound for get and read_file too.
 An exporter writes each file as `<index>-<name>` so names cannot collide, including on NFC/NFD and case-folding

@@ -177,9 +177,9 @@ impl Store for MemoryStore {
     async fn record_processing(&self, id: ItemId, processed: &Processed) -> Result<Item> {
         let mut state = self.state();
         let item = &state.entry_mut(id)?.item;
-        check_history(item)?;
         let from = item.status;
         processed.validate().map_err(StoreError::Invalid)?;
+        check_history(item)?;
         if from != Status::Submitted {
             return Err(StoreError::IllegalMove(IllegalMove {
                 from,
@@ -209,7 +209,6 @@ impl Store for MemoryStore {
     ) -> Result<Item> {
         let mut state = self.state();
         let item = &state.entry_mut(id)?.item;
-        check_history(item)?;
         let from = item.status;
         if to == Status::Processed {
             return Err(StoreError::Invalid(ValidationError {
@@ -217,6 +216,7 @@ impl Store for MemoryStore {
                 reason: "only record_processing moves an item to processed",
             }));
         }
+        check_history(item)?;
         from.check_move(to).map_err(StoreError::IllegalMove)?;
         let now = state.stamp();
         let item = &mut state.entry_mut(id)?.item;
@@ -233,8 +233,9 @@ impl Store for MemoryStore {
 
     async fn add_note(&self, id: ItemId, note: &Note) -> Result<Item> {
         let mut state = self.state();
-        check_history(&state.entry_mut(id)?.item)?;
+        let item = &state.entry_mut(id)?.item;
         note.validate().map_err(StoreError::Invalid)?;
+        check_history(item)?;
         let now = state.stamp();
         let item = &mut state.entry_mut(id)?.item;
         item.events.push(Event::Note {

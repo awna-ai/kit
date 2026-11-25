@@ -853,10 +853,13 @@ fn capped_history_and_maximum_fields_fit_the_item_parser() {
         kind: EventKind::new("review").unwrap(),
         body: "\n".repeat(16_384),
     };
-    // Compact UTF-8 JSON escapes each newline to two bytes. A conservative bound is
+    // Compact UTF-8 JSON escapes newlines, quotes and backslashes to two bytes,
+    // including quotes and backslashes in line fields. The block and snapshot bound is
     // 255 * 16_384 * 2 + 65_536 * 2 + 1_048_576 + 20 * (32_768 * 2
-    // + 200 + 20 * 500) + 4096 * 2 + 16_384 * 2 = 11_091_168 bytes before metadata and JSON syntax.
-    // This leaves over 1 MiB of the 12 MiB parser cap for metadata and JSON syntax.
+    // + 200 * 2 + 20 * 500 * 2) + 4096 * 2 + 16_384 * 2 = 11_295_168 bytes.
+    // Including 1,000 maximal attachments (200-byte names, 127-byte content types,
+    // maximal indices and sizes), other metadata and JSON syntax gives about 11.7 MB,
+    // below the 12_582_912-byte parser cap.
     // The combined processed fixture has 254 notes (submission + processing consume
     // two events). The submitted fixture has 255 notes and no processing results.
     value.events.resize(256, note);

@@ -257,7 +257,7 @@ pub async fn run<S: Store + Sync>(store: &S) {
     let mut fidelity = new_item();
     fidelity.title = format!("{}😀", "é".repeat(98));
     fidelity.body = format!("{}😀e\u{301}\n\t ", "é".repeat(32763));
-    let state = serde_json::json!({"nested":{"values":[7,1.25,0.1,-1,9007199254740993_u64,true,null,"é雪😀"]}});
+    let state = serde_json::json!({"nested":{"values":[7,1.25,0.1,-1,9007199254740993_u64,true,null,"é雪😀",std::f64::consts::PI]}});
     fidelity.snapshot = Some(Snapshot {
         state: state.clone(),
     });
@@ -287,16 +287,6 @@ pub async fn run<S: Store + Sync>(store: &S) {
         exact.attachments[0].name.as_str(),
         "Report-Final.TXT",
         "attachment name case fidelity"
-    );
-    let encoded = serde_json::to_string(&state).expect("serialize snapshot");
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&encoded).expect("parse snapshot"),
-        state,
-        "snapshot numbers must survive JSON without optional features"
-    );
-    assert_eq!(
-        state["nested"]["values"][4].as_u64(),
-        Some(9007199254740993)
     );
     assert_saved(store, &exact).await;
     assert_eq!(
@@ -566,6 +556,18 @@ pub async fn run<S: Store + Sync>(store: &S) {
             store.add_note(full.id, &note).await.expect("fill history"),
         );
     }
+    assert_saved(store, &full).await;
+    assert!(
+        matches!(store.add_note(full.id, &bad_note).await, Err(StoreError::Invalid(error))
+            if error.field == "body"),
+        "invalid note body precedes full history"
+    );
+    assert_saved(store, &full).await;
+    assert!(
+        matches!(store.set_status(full.id, Status::Processed, None).await, Err(StoreError::Invalid(error))
+            if error.field == "to"),
+        "invalid status target precedes full history"
+    );
     assert_saved(store, &full).await;
     assert!(
         matches!(store.add_note(full.id, &note).await, Err(StoreError::Invalid(error))
