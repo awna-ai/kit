@@ -292,3 +292,130 @@ fn invalid_stored_items_never_reach_the_processor() {
         assert_eq!(store.0.get(item.id).await.unwrap(), item);
     });
 }
+
+#[test]
+fn file_debug_reports_lengths_without_bytes() {
+    let bytes = [231, 232, 233];
+    let new_file = NewFile {
+        name: AttachmentName::new("bytes.txt").unwrap(),
+        content_type: "text/plain".into(),
+        role: Role::File,
+        bytes: &bytes,
+    };
+    let attachment = Attachment {
+        index: 0,
+        name: new_file.name.clone(),
+        content_type: new_file.content_type.clone(),
+        role: Role::File,
+        size: 3,
+    };
+    for debug in [
+        format!("{new_file:?}"),
+        format!(
+            "{:?}",
+            File {
+                attachment: &attachment,
+                bytes: &bytes
+            }
+        ),
+    ] {
+        for value in ["231", "232", "233"] {
+            assert!(!debug.contains(value), "{debug}");
+        }
+        assert!(debug.contains("bytes.txt"));
+        assert!(debug.contains("text/plain"));
+        assert!(debug.contains("File"));
+        assert!(debug.contains('3'));
+    }
+}
+
+#[test]
+fn missing_items_take_precedence_over_invalid_inputs() {
+    block_on(async {
+        let store = MemoryStore::default();
+        let missing = ItemId::new(u64::MAX).unwrap();
+        let mut invalid = processed();
+        invalid.proposal.tickets.clear();
+        assert!(
+            matches!(store.record_processing(missing, &invalid).await, Err(StoreError::NotFound(id)) if id == missing)
+        );
+        let note = Note {
+            kind: EventKind::new("review").unwrap(),
+            body: "bad\rtext".into(),
+        };
+        assert!(
+            matches!(store.add_note(missing, &note).await, Err(StoreError::NotFound(id)) if id == missing)
+        );
+        assert!(
+            matches!(store.set_status(missing, Status::Processed, None).await, Err(StoreError::NotFound(id)) if id == missing)
+        );
+        let held = store.submit(&new_item(), &[]).await.unwrap();
+        store.set_status(held.id, Status::Held, None).await.unwrap();
+        assert!(matches!(
+            store.record_processing(held.id, &invalid).await,
+            Err(StoreError::Invalid(_))
+        ));
+    });
+}
+
+#[test]
+fn image_selection_excludes_scriptable_images_in_custom_stores() {
+    block_on(async {
+        let mut limits = Limits::default();
+        limits.allowed.push(AllowedType {
+            content_type: "image/svg+xml".into(),
+            extensions: vec!["svg".into()],
+        });
+        let store = MemoryStore::new(limits);
+        let files: Vec<_> = [
+            ("vector.svg", "image/svg+xml"),
+            ("screen.png", "image/png"),
+            ("photo.jpg", "image/jpeg"),
+            ("motion.gif", "image/gif"),
+            ("picture.webp", "image/webp"),
+            ("photo.heic", "image/heic"),
+        ]
+        .into_iter()
+        .map(|(name, content_type)| NewFile {
+            name: AttachmentName::new(name).unwrap(),
+            content_type: content_type.into(),
+            role: Role::File,
+            bytes: b"x",
+        })
+        .collect();
+        let item = store.submit(&new_item(), &files).await.unwrap();
+        process(
+            &store,
+            &Success {
+                expected_files: 5,
+                image_only: true,
+            },
+            item.id,
+            Files::Images,
+        )
+        .await
+        .unwrap();
+    });
+}
+
+#[test]
+fn duplicate_submission_names_are_refused_after_ascii_lowercasing() {
+    let files = ["a.txt", "A.TXT"].map(|name| NewFile {
+        name: AttachmentName::new(name).unwrap(),
+        content_type: "text/plain".into(),
+        role: Role::File,
+        bytes: b"x",
+    });
+    let error = Limits::default().check(&files).unwrap_err();
+    assert_eq!(error.field, "files[1].name");
+    assert_eq!(error.reason, "duplicate attachment name");
+}
+
+#[test]
+fn invalid_processing_display_covers_items_and_output() {
+    let error: ProcessError<Infallible, Infallible> = ProcessError::Invalid(ValidationError {
+        field: "title".into(),
+        reason: "invalid text",
+    });
+    assert_eq!(error.to_string(), "invalid item or processor output");
+}

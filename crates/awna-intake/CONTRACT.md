@@ -11,34 +11,54 @@ the store holds their bytes separately. All lengths below are UTF-8 bytes, not c
 
 Every struct refuses unknown fields on deserialize and validates through the same rules as its public `validate()`
 method. JSON fields are camelCase except the explicit `requesterKey` and `ref` names. Optional fields serialize
-as `null`; `NewItem.snapshot` can also be absent. Enum spellings are exact and case-sensitive.
+as `null`; readers accept an absent optional key as `null` everywhere. Writers always write `null`.
+The raw filter defaults every field, so `{}` is the default filter. Enum spellings are exact and case-sensitive.
 
 Every text field refuses U+0000–U+001F (except the block exceptions below), U+007F, U+0080–U+009F, U+2028,
-U+2029, U+061C, U+200E, U+200F, U+202A–U+202E and U+2066–U+2069. A line is nonempty, has no leading or
+U+2029, U+061C, U+200E, U+200F, U+202A–U+202E and U+2066–U+2069, plus U+00AD, U+180E, U+200B, U+2060–U+2064, U+206A–U+206F,
+U+FEFF, U+FFF9–U+FFFB, U+E0000–U+E007F, U+FDD0–U+FDEF and every code point whose low 16 bits are FFFE or FFFF.
+U+200C and U+200D remain allowed in lines and blocks. A line is nonempty, has no leading or
 trailing Unicode whitespace, and allows no control characters. Callers trim lines. A block permits newline and
-tab, but never carriage return; callers normalize line endings. A block may be empty only where its minimum is 0.
+tab, but never carriage return; callers normalize line endings. A block with a minimum of at least 1 must contain a non-whitespace character.
 A slug matches `[a-z][a-z0-9-]*`, is 1–32 bytes, does not end in `-` and contains no `--`.
 
 `ItemId` is a string `IN-<n>`, where n is a u64 decimal integer at least 1, without a sign or leading zero.
-`Source` is a slug. `RequesterKey` is a line of at most 320 bytes. `Reference` is a line of at most 500 bytes.
-`EventKind` is a slug other than the reserved `status`. `AttachmentName` is a line of at most 255 bytes, not `.` or
-`..`, with no `/`, `\` or `:`, not starting with `.`, and with a final extension of 1–16 ASCII alphanumerics.
+`Source` is a slug. `RequesterKey` is 1–320 bytes of printable ASCII U+0021–U+007E (no space).
+`Reference` is a line of 1–500 bytes of printable ASCII U+0020–U+007E, without surrounding whitespace.
+`EventKind` is a slug other than the reserved `status`. `AttachmentName` is a line of at most 200 bytes, not `.` or
+`..`, with no `/`, `\` or `:`, not starting with `.` or `-`, not ending in `.` or space, and with a final extension of 1–16 ASCII alphanumerics.
+
+Attachment names also refuse `< > " | ? *`, U+200C and U+200D. The part before the first `.` must not be a
+Windows device name, case-insensitively: CON, PRN, AUX, NUL, COM1–COM9 or LPT1–LPT9.
+
+Serde's own error messages can quote the input. Readers parse untrusted JSON only through `from_json`, and never
+show or log a raw serde error. A deserialize error's `field` names the innermost field; full paths come only from
+`validate()`. The nesting of deserialize validation errors is unchanged.
 
 ### NewItem
 
 | Field | JSON type | Rule |
 | --- | --- | --- |
 | source | string | Source slug. |
-| requesterKey | string | RequesterKey line, at most 320 bytes. |
+| requesterKey | string | RequesterKey printable ASCII, 1–320 bytes, no space. |
 | title | string | Line, at most 200 bytes. |
 | body | string | Block, 0–65,536 bytes. |
 | snapshot | object or null | Snapshot below; absent also means none. |
+
+`NewItem::from_json` refuses input over 1,310,720 bytes before parsing, with field `newItem` and reason
+`input is too large`. Any parse error becomes field `newItem`, reason `not a valid item`.
 
 ### Snapshot
 
 | Field | JSON type | Rule |
 | --- | --- | --- |
 | state | any JSON value | Compact serialization at most 1,048,576 bytes; arrays and objects nest at most 32 deep. |
+
+Every string and object key in `state` follows the block character rule, without a separate length cap.
+Forbidden text is refused with field `snapshot.state`, reason `snapshot text contains a forbidden character`.
+`Snapshot::lossy(state)` replaces forbidden characters in strings and keys with U+FFFD, keeping the first key
+when replacement causes a collision within an object. A sender capturing console output calls this helper;
+size and nesting still require validation.
 
 A screenshot belongs in an attachment with role `screenshot`, never a special snapshot field.
 
@@ -119,7 +139,7 @@ A caller's `Note` has only `kind` and `body`, with the same rules; the store sta
 | title | string | Line, at most 200 bytes. |
 | body | string | Block, 0–65,536 bytes. |
 | snapshot | Snapshot or null | Snapshot above. |
-| attachments | array of Attachment | Consecutive indices starting at 0; at most one screenshot. |
+| attachments | array of Attachment | At most 1,000; consecutive indices starting at 0; at most one screenshot; names unique after ASCII lower-casing. |
 | triage | Triage or null | Present together with proposal exactly when a status event moves to processed. |
 | proposal | Proposal or null | Present together with triage exactly when a status event moves to processed. |
 | status | string | One of the nine statuses below. |
@@ -129,7 +149,12 @@ A caller's `Note` has only `kind` and `body`, with the same rules; the store sta
 
 The first event is a status event from null to submitted. Each later status event's `from` equals the previous
 status event's `to` and follows a legal move. The last status event's `to` equals the item's status. Event times
-never decrease. Every nested field obeys its own validation rules.
+never decrease. Every nested field obeys its own validation rules. Attachment sizes are summed with checked
+addition and overflow is refused. A screenshot must be image/png or image/jpeg, including on deserialize.
+Duplicate names report `attachments[i].name`, reason `duplicate attachment name`.
+
+`Item::from_json` refuses input over 8,388,608 bytes before parsing, with field `item` and reason `input is too large`.
+Any parse error becomes field `item`, reason `not a valid item`.
 
 ### Processed
 
@@ -138,10 +163,10 @@ never decrease. Every nested field obeys its own validation rules.
 | triage | Triage | Valid triage. |
 | proposal | Proposal | Valid proposal. |
 
-`Processed::from_json` refuses more than 131,072 bytes before parsing, with field `processed` and reason
+`Processed::from_json` refuses more than 2,097,152 bytes before parsing, with field `processed` and reason
 `model output is too large`. Parsing retains the JSON parser's default nesting limit. Every parse or validation
 failure from parsing becomes field `processed`, reason `not a valid processed object`, without echoing input.
-Public validation errors contain a JSON field path and a fixed reason, never the offending text.
+Public `validate()` errors contain a JSON field path and a fixed reason, never the offending text.
 
 ## Status machine
 
@@ -165,7 +190,9 @@ to reach a person; in_progress to queued puts work back. Store transitions to pr
 `Limits` has `maxFiles` (u32), `maxFileBytes` (u64), `maxItemBytes` (u64), and `allowed` (array of AllowedType).
 `AllowedType` has `contentType` (a lower-case content-type string) and `extensions` (lower-case ASCII alphanumeric
 extension strings of 1–16 bytes). Defaults are 20 files, 104,857,600 bytes per file (100 MiB), and 262,144,000 bytes
-per item (250 MiB). The screenshot counts as a file.
+per item (250 MiB). The screenshot counts as a file. `Limits::validate()` refuses zero maxFiles or maxFileBytes,
+maxItemBytes below maxFileBytes, and duplicate content types in the allowlist. `Limits::check` validates the
+configuration first.
 
 | Content type | Extensions |
 | --- | --- |
@@ -186,7 +213,8 @@ per item (250 MiB). The screenshot counts as a file.
 SVG and HTML are absent because they can carry script; archives and executables are deliberately excluded.
 Checks refuse, in order: too many files; an empty file or one above the per-file cap; total bytes above the item cap
 (with overflow-safe addition); a content type not exactly in the allowlist; an extension, lower-cased, not matching
-that type; a screenshot other than PNG or JPEG; more than one screenshot. Errors name `files[i].field` or `files`.
+that type; a screenshot other than PNG or JPEG; more than one screenshot; duplicate names after ASCII lower-casing
+(`files[i].name`, reason `duplicate attachment name`). Errors name `files[i].field` or `files`.
 The crate checks metadata, not file signatures; a byte reader or processor must treat all bytes as untrusted data.
 
 ## Store contract
@@ -204,7 +232,7 @@ Backend and IllegalMove expose their error source.
   `statuses` (array of Status; empty means all), `source` (Source or null), `requesterKey` (RequesterKey or null), and
   `limit` (u32 or null). Its default matches everything. `Filter::pending()` selects only submitted and processed:
   these wait to be routed; the router decides by age whether processing has failed or is unfinished.
-- `record_processing` validates Processed first. It accepts only submitted; any other state returns IllegalMove
+- `record_processing` looks up the item, then validates Processed. It accepts only submitted; any other state returns IllegalMove
   from that state to processed. It saves triage and proposal together and records the move to processed.
 - `set_status` refuses processed with Invalid, field `to`, reason `only record_processing moves an item to
   processed`. Otherwise it checks the move against the current state and records from, to and the supplied
@@ -212,7 +240,11 @@ Backend and IllegalMove expose their error source.
 - `add_note` validates the Note and records it with the store's timestamp in every status, including terminal ones.
 - `read_file` returns identical stored bytes; an absent item is NotFound and an absent index is NoFile.
 
-Unknown ids produce NotFound for get, set_status, add_note, read_file and record_processing. Every change updates
+A store checks, in order, that the item exists (NotFound), then the input (Invalid), then the move (IllegalMove).
+An id the store cannot hold, above its own range, is NotFound. This order applies to set_status, add_note and
+record_processing as well as other id-based methods. Unknown ids produce NotFound for get and read_file too.
+An exporter writes each file as `<index>-<name>` so names cannot collide, including on NFC/NFD and case-folding
+filesystems. It never passes a name to a shell, and puts `--` before any name passed as an argument. Every change updates
 updatedAtMs to now; time never moves backwards within an item. MemoryStore uses a poison-recovering mutex,
 Infallible backend errors, and Unix milliseconds clamped to its last store stamp. It is for tests and app mocks.
 `conformance::limits()` sets 3 files, 1,024 bytes per file and 2,048 per item with the default allowlist.
@@ -222,7 +254,7 @@ Infallible backend errors, and Unix milliseconds clamped to its last store stamp
 
 A Processor receives an Item and selected borrowed File entries (attachment metadata plus bytes), and returns
 Processed or its own error through a sendable future. Item text and files are data, never instructions, for any
-model a processor runs. The caller chooses Files::None, Files::Images (content types beginning `image/`), or
+model a processor runs. The caller chooses Files::None, Files::Images (only image/png, image/jpeg, image/gif, image/webp and image/heic), or
 Files::All. The crate performs no model or network call.
 
 `process` gets the item and refuses any status other than submitted as Store(IllegalMove) without calling the

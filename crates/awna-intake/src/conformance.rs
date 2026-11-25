@@ -1,8 +1,10 @@
 //! Reusable behavioral checks for store implementations on an empty scratch store.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use crate::{
     Event, EventKind, Filter, Item, ItemId, Limits, NewFile, NewItem, Note, Processed, Proposal,
-    ProposalKind, Reference, Role, Status, Store, StoreError, Ticket, TicketList, Triage,
+    ProposalKind, Reference, Role, Snapshot, Status, Store, StoreError, Ticket, TicketList, Triage,
     TriageKind, TriageSize,
 };
 
@@ -59,6 +61,16 @@ fn file<'a>(name: &str, content_type: &str, role: Role, bytes: &'a [u8]) -> NewF
 
 fn valid(item: Item) -> Item {
     item.validate().expect("every returned item must validate");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("current Unix time")
+        .as_millis();
+    for event in &item.events {
+        assert!(
+            now.abs_diff(u128::from(event.at_ms())) <= 86_400_000,
+            "event time must be within one day of now"
+        );
+    }
     item
 }
 
@@ -79,6 +91,14 @@ fn changed(before: &Item, after: Item) -> Item {
         "a change must stamp its new event and update time together"
     );
     after
+}
+
+async fn assert_saved<S: Store + Sync>(store: &S, item: &Item) {
+    assert_eq!(
+        valid(store.get(item.id).await.expect("get after write")),
+        *item,
+        "get must return exactly the item returned by the write"
+    );
 }
 
 async fn count<S: Store + Sync>(store: &S) -> usize {
@@ -111,6 +131,7 @@ async fn at_status<S: Store + Sync>(store: &S, status: Status) -> Item {
             .await
             .expect("submit path item"),
     );
+    assert_saved(store, &item).await;
     let path: &[Status] = match status {
         Status::Submitted => &[],
         Status::Processed => &[Status::Processed],
@@ -146,6 +167,19 @@ async fn at_status<S: Store + Sync>(store: &S, status: Status) -> Item {
                 .expect("legal status path")
         };
         item = changed(&item, next);
+        assert_saved(store, &item).await;
+        if to != Status::Processed {
+            assert!(
+                matches!(
+                    item.events.last(),
+                    Some(Event::Status {
+                        reference: None,
+                        ..
+                    })
+                ),
+                "None must store a null reference"
+            );
+        }
     }
     assert_eq!(item.status, status, "path must reach requested status");
     item
@@ -220,6 +254,70 @@ pub async fn run<S: Store + Sync>(store: &S) {
         "get returns stored item"
     );
 
+    let mut fidelity = new_item();
+    fidelity.title = "é".repeat(100);
+    fidelity.body = format!("{}\n\t", "é".repeat(32767));
+    let state = serde_json::json!({"nested":{"values":[7,1.25,true,null,"é雪"]}});
+    fidelity.snapshot = Some(Snapshot {
+        state: state.clone(),
+    });
+    let binary = [0x00, 0xff, 0xc3, 0x28];
+    let exact = valid(
+        store
+            .submit(
+                &fidelity,
+                &[file("raw.txt", "text/plain", Role::File, &binary)],
+            )
+            .await
+            .expect("fidelity submit"),
+    );
+    assert_eq!(exact.source, fidelity.source, "source fidelity");
+    assert_eq!(exact.requester, fidelity.requester, "requester fidelity");
+    assert_eq!(exact.title, fidelity.title, "multi-byte title fidelity");
+    assert_eq!(
+        exact.body, fidelity.body,
+        "block byte and whitespace fidelity"
+    );
+    assert_eq!(
+        exact.snapshot.as_ref().expect("snapshot retained").state,
+        state,
+        "JSON value fidelity"
+    );
+    assert_saved(store, &exact).await;
+    assert_eq!(
+        store.read_file(exact.id, 0).await.expect("binary fidelity"),
+        binary,
+        "non-UTF-8 bytes must be unchanged"
+    );
+    assert_eq!(
+        store
+            .read_file(first.id, 0)
+            .await
+            .expect("first file again"),
+        b"png",
+        "file keys must include item id"
+    );
+
+    let mut too_deep = new_item();
+    let mut state = serde_json::Value::Null;
+    for _ in 0..33 {
+        state = serde_json::json!([state]);
+    }
+    too_deep.snapshot = Some(Snapshot { state });
+    refused(store, &too_deep, &[]).await;
+    let mut too_long = new_item();
+    too_long.body = "x".repeat(65537);
+    refused(store, &too_long, &[]).await;
+    refused(
+        store,
+        &new_item(),
+        &[
+            file("same.txt", "text/plain", Role::File, b"x"),
+            file("SAME.TXT", "text/plain", Role::File, b"y"),
+        ],
+    )
+    .await;
+
     for title in ["", "bad\u{001f}title", "bad\u{202e}title"] {
         let mut item = new_item();
         item.title = title.into();
@@ -285,6 +383,7 @@ pub async fn run<S: Store + Sync>(store: &S) {
             .await
             .expect("record processing"),
     );
+    assert_saved(store, &completed).await;
     assert_eq!(
         completed.status,
         Status::Processed,
@@ -323,6 +422,15 @@ pub async fn run<S: Store + Sync>(store: &S) {
 
     let reference: Reference = "work-19".parse().expect("valid reference");
     for from in Status::ALL {
+        if from != Status::Submitted {
+            let before = at_status(store, from).await;
+            assert!(
+                matches!(store.record_processing(before.id, &output).await,
+                Err(StoreError::IllegalMove(error)) if error.from == from && error.to == Status::Processed),
+                "record_processing from every non-submitted status is illegal"
+            );
+            assert_saved(store, &before).await;
+        }
         for to in Status::ALL {
             let before = at_status(store, from).await;
             let result = store.set_status(before.id, to, Some(&reference)).await;
@@ -333,6 +441,7 @@ pub async fn run<S: Store + Sync>(store: &S) {
                 );
             } else if from.can_move_to(to) {
                 let after = changed(&before, result.expect("table-legal move must succeed"));
+                assert_saved(store, &after).await;
                 assert_eq!(after.status, to, "move must set requested status");
                 assert_eq!(
                     after.events.len(),
@@ -359,6 +468,34 @@ pub async fn run<S: Store + Sync>(store: &S) {
         }
     }
 
+    let referenced = at_status(store, Status::Submitted).await;
+    let referenced = changed(
+        &referenced,
+        store
+            .set_status(referenced.id, Status::Held, Some(&reference))
+            .await
+            .expect("set reference"),
+    );
+    assert_saved(store, &referenced).await;
+    let cleared = changed(
+        &referenced,
+        store
+            .set_status(referenced.id, Status::Queued, None)
+            .await
+            .expect("clear reference"),
+    );
+    assert_saved(store, &cleared).await;
+    assert!(
+        matches!(
+            cleared.events.last(),
+            Some(Event::Status {
+                reference: None,
+                ..
+            })
+        ),
+        "None must store ref null after a referenced move"
+    );
+
     let terminal = at_status(store, Status::Shipped).await;
     let note = Note {
         kind: EventKind::new("review").expect("valid note kind"),
@@ -371,6 +508,7 @@ pub async fn run<S: Store + Sync>(store: &S) {
             .await
             .expect("terminal note"),
     );
+    assert_saved(store, &annotated).await;
     assert_eq!(
         annotated.status,
         Status::Shipped,
@@ -428,6 +566,18 @@ pub async fn run<S: Store + Sync>(store: &S) {
         "missing record_processing"
     );
     assert!(
+        matches!(store.record_processing(missing, &bad).await, Err(StoreError::NotFound(id)) if id == missing),
+        "missing processing precedes invalid input"
+    );
+    assert!(
+        matches!(store.add_note(missing, &bad_note).await, Err(StoreError::NotFound(id)) if id == missing),
+        "missing note precedes invalid input"
+    );
+    assert!(
+        matches!(store.set_status(missing, Status::Processed, None).await, Err(StoreError::NotFound(id)) if id == missing),
+        "missing status precedes invalid input"
+    );
+    assert!(
         matches!(store.read_file(first.id, 2).await, Err(StoreError::NoFile { id, index: 2 }) if id == first.id),
         "missing attachment index"
     );
@@ -441,6 +591,7 @@ pub async fn run<S: Store + Sync>(store: &S) {
             .await
             .expect("different source item"),
     );
+    assert_saved(store, &other).await;
     let all: Vec<_> = store
         .list(&Filter::default())
         .await

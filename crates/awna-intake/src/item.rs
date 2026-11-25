@@ -1,10 +1,11 @@
+use crate::attachment::{check_screenshot, check_unique_name};
 pub use crate::text::{EventKind, Reference, RequesterKey, Source};
 use crate::{
     Attachment, Proposal, Role, Status, Triage, ValidationError,
-    text::{check_block, check_line},
+    text::{check_block, check_line, forbidden},
 };
 use serde::{Deserialize, Serialize};
-use std::{fmt, str::FromStr};
+use std::{collections::HashSet, fmt, str::FromStr};
 
 /// A positive intake item number, displayed as `IN-<n>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -73,6 +74,32 @@ impl TryFrom<RawSnapshot> for Snapshot {
     }
 }
 impl Snapshot {
+    /// Replaces forbidden characters in state strings and keys with U+FFFD.
+    /// The first key wins after replacement; size and nesting still need validation.
+    pub fn lossy(mut state: serde_json::Value) -> Self {
+        fn replace(text: &str) -> String {
+            text.chars()
+                .map(|c| if forbidden(c, true) { '\u{fffd}' } else { c })
+                .collect()
+        }
+        let mut pending = vec![&mut state];
+        while let Some(value) = pending.pop() {
+            match value {
+                serde_json::Value::String(text) => *text = replace(text),
+                serde_json::Value::Array(values) => pending.extend(values.iter_mut()),
+                serde_json::Value::Object(values) => {
+                    let original = std::mem::take(values);
+                    for (key, value) in original {
+                        values.entry(replace(&key)).or_insert(value);
+                    }
+                    pending.extend(values.values_mut());
+                }
+                _ => {}
+            }
+        }
+        Self { state }
+    }
+
     /// Checks every field against the contract.
     pub fn validate(&self) -> Result<(), ValidationError> {
         let mut pending = vec![(&self.state, 0_usize)];
@@ -96,8 +123,12 @@ impl Snapshot {
                             "snapshot nesting exceeds limit",
                         ));
                     }
+                    for key in values.keys() {
+                        check_snapshot_text(key)?;
+                    }
                     pending.extend(values.values().map(|value| (value, depth)));
                 }
+                serde_json::Value::String(text) => check_snapshot_text(text)?,
                 _ => {}
             }
         }
@@ -109,6 +140,16 @@ impl Snapshot {
         Ok(())
     }
 }
+fn check_snapshot_text(text: &str) -> Result<(), ValidationError> {
+    if text.chars().any(|c| forbidden(c, true)) {
+        return Err(ValidationError::new(
+            "snapshot.state",
+            "snapshot text contains a forbidden character",
+        ));
+    }
+    Ok(())
+}
+
 /// A new request before the store assigns its id, status and times.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", try_from = "RawNewItem")]
@@ -152,14 +193,29 @@ impl TryFrom<RawNewItem> for NewItem {
     }
 }
 impl NewItem {
+    /// Maximum untrusted JSON size in UTF-8 bytes.
+    pub const MAX_JSON_BYTES: usize = 1_310_720;
+
+    /// Parses untrusted JSON without reflecting its contents in errors.
+    pub fn from_json(text: &str) -> Result<Self, ValidationError> {
+        if text.len() > Self::MAX_JSON_BYTES {
+            return Err(ValidationError::new("newItem", "input is too large"));
+        }
+        serde_json::from_str(text).map_err(|_| ValidationError::new("newItem", "not a valid item"))
+    }
+
     /// Checks every field against the contract.
     pub fn validate(&self) -> Result<(), ValidationError> {
         check_line("title", &self.title, 200)?;
         check_block("body", &self.body, 0, 65_536)?;
         if let Some(snapshot) = &self.snapshot {
-            snapshot
-                .validate()
-                .map_err(|error| error.prefix("snapshot"))?;
+            snapshot.validate().map_err(|error| {
+                if error.field == "snapshot.state" {
+                    error
+                } else {
+                    error.prefix("snapshot")
+                }
+            })?;
         }
         Ok(())
     }
@@ -369,14 +425,29 @@ impl TryFrom<RawItem> for Item {
     }
 }
 impl Item {
+    /// Maximum untrusted JSON size in UTF-8 bytes.
+    pub const MAX_JSON_BYTES: usize = 8_388_608;
+
+    /// Parses untrusted JSON without reflecting its contents in errors.
+    pub fn from_json(text: &str) -> Result<Self, ValidationError> {
+        if text.len() > Self::MAX_JSON_BYTES {
+            return Err(ValidationError::new("item", "input is too large"));
+        }
+        serde_json::from_str(text).map_err(|_| ValidationError::new("item", "not a valid item"))
+    }
+
     /// Checks every field against the contract.
     pub fn validate(&self) -> Result<(), ValidationError> {
         check_line("title", &self.title, 200)?;
         check_block("body", &self.body, 0, 65_536)?;
         if let Some(snapshot) = &self.snapshot {
-            snapshot
-                .validate()
-                .map_err(|error| error.prefix("snapshot"))?;
+            snapshot.validate().map_err(|error| {
+                if error.field == "snapshot.state" {
+                    error
+                } else {
+                    error.prefix("snapshot")
+                }
+            })?;
         }
         if self.triage.is_some() != self.proposal.is_some() {
             return Err(ValidationError::new(
@@ -413,11 +484,29 @@ impl Item {
                 .validate()
                 .map_err(|error| error.prefix("proposal"))?;
         }
+        if self.attachments.len() > 1000 {
+            return Err(ValidationError::new("attachments", "too many attachments"));
+        }
+        let mut total = 0_u64;
+        let mut names = HashSet::new();
         let mut screenshots = 0;
         for (index, attachment) in self.attachments.iter().enumerate() {
             attachment
                 .validate()
                 .map_err(|error| error.prefix(&format!("attachments[{index}]")))?;
+            check_unique_name(
+                &mut names,
+                &format!("attachments[{index}].name"),
+                &attachment.name,
+            )?;
+            check_screenshot(
+                &format!("attachments[{index}].role"),
+                attachment.role,
+                &attachment.content_type,
+            )?;
+            total = total.checked_add(attachment.size).ok_or_else(|| {
+                ValidationError::new("attachments", "total attachment size overflows")
+            })?;
             if attachment.index as u64 != index as u64 {
                 return Err(ValidationError::new(
                     format!("attachments[{index}].index"),

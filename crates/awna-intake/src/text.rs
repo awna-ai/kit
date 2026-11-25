@@ -2,9 +2,10 @@ use crate::ValidationError;
 use serde::{Deserialize, Serialize};
 use std::{fmt, str::FromStr};
 
-fn forbidden(character: char, block: bool) -> bool {
+pub(crate) fn forbidden(character: char, block: bool) -> bool {
     matches!(character, '\u{0}'..='\u{1f}') && !(block && matches!(character, '\n' | '\t'))
-        || matches!(character, '\u{7f}'..='\u{9f}' | '\u{2028}' | '\u{2029}' | '\u{61c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        || matches!(character, '\u{7f}'..='\u{9f}' | '\u{2028}' | '\u{2029}' | '\u{61c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{ad}' | '\u{180e}' | '\u{200b}' | '\u{2060}'..='\u{2064}' | '\u{206a}'..='\u{206f}' | '\u{feff}' | '\u{fff9}'..='\u{fffb}' | '\u{e0000}'..='\u{e007f}' | '\u{fdd0}'..='\u{fdef}')
+        || (character as u32 & 0xffff) >= 0xfffe
 }
 
 pub(crate) fn check_line(field: &str, value: &str, max: usize) -> Result<(), ValidationError> {
@@ -32,7 +33,7 @@ pub(crate) fn check_block(
     min: usize,
     max: usize,
 ) -> Result<(), ValidationError> {
-    if value.len() < min || value.len() > max {
+    if value.len() < min || value.len() > max || (min > 0 && value.trim().is_empty()) {
         return Err(ValidationError::new(field, "block length is out of range"));
     }
     if value.chars().any(|character| forbidden(character, true)) {
@@ -67,8 +68,23 @@ fn check_event_kind(field: &str, value: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 fn check_attachment_name(field: &str, value: &str) -> Result<(), ValidationError> {
-    check_line(field, value, 255)?;
-    if value.starts_with('.') || value.contains(['/', '\\', ':']) {
+    check_line(field, value, 200)?;
+    let stem = value
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && matches!(stem.as_bytes()[3], b'1'..=b'9'));
+    if value.starts_with(['.', '-'])
+        || value.ends_with(['.', ' '])
+        || device
+        || value.contains([
+            '/', '\\', ':', '<', '>', '"', '|', '?', '*', '\u{200c}', '\u{200d}',
+        ])
+    {
         return Err(ValidationError::new(field, "invalid attachment name"));
     }
     let extension = value
@@ -80,6 +96,14 @@ fn check_attachment_name(field: &str, value: &str) -> Result<(), ValidationError
         || !extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
     {
         return Err(ValidationError::new(field, "invalid attachment extension"));
+    }
+    Ok(())
+}
+
+fn check_ascii(field: &str, value: &str, max: usize, min: u8) -> Result<(), ValidationError> {
+    check_line(field, value, max)?;
+    if !value.bytes().all(|byte| (min..=0x7e).contains(&byte)) {
+        return Err(ValidationError::new(field, "text must be printable ASCII"));
     }
     Ok(())
 }
@@ -131,13 +155,13 @@ string_type!(
     RequesterKey,
     "requesterKey",
     "An opaque requester key, at most 320 bytes.",
-    |field, value: &str| check_line(field, value, 320)
+    |field, value: &str| check_ascii(field, value, 320, 0x21)
 );
 string_type!(
     Reference,
     "ref",
     "An opaque external reference, at most 500 bytes.",
-    |field, value: &str| check_line(field, value, 500)
+    |field, value: &str| check_ascii(field, value, 500, 0x20)
 );
 string_type!(
     EventKind,
@@ -148,7 +172,7 @@ string_type!(
 string_type!(
     AttachmentName,
     "name",
-    "An attachment basename with a safe extension, at most 255 bytes.",
+    "An attachment basename with a safe extension, at most 200 bytes.",
     check_attachment_name
 );
 
@@ -216,16 +240,120 @@ mod tests {
             assert!(AttachmentName::new(value).is_err(), "{value:?}");
         }
         assert!(AttachmentName::new("a.b.TXT").is_ok());
-        assert!(AttachmentName::new(format!("{}.txt", "a".repeat(251))).is_ok());
-        assert!(AttachmentName::new(format!("{}.txt", "a".repeat(252))).is_err());
+        assert!(AttachmentName::new(format!("{}.txt", "a".repeat(196))).is_ok());
+        assert!(AttachmentName::new(format!("{}.txt", "a".repeat(197))).is_err());
         assert!(AttachmentName::new(format!("a.{}", "a".repeat(16))).is_ok());
         assert!(AttachmentName::new(format!("a.{}", "a".repeat(17))).is_err());
     }
     #[test]
     fn string_newtypes_enforce_their_exact_byte_caps() {
-        assert!(RequesterKey::new("é".repeat(160)).is_ok());
-        assert!(RequesterKey::new(format!("{}x", "é".repeat(160))).is_err());
-        assert!(Reference::new("é".repeat(250)).is_ok());
-        assert!(Reference::new(format!("{}x", "é".repeat(250))).is_err());
+        assert!(RequesterKey::new("a".repeat(320)).is_ok());
+        assert!(RequesterKey::new(format!("{}x", "a".repeat(320))).is_err());
+        assert!(Reference::new("a".repeat(500)).is_ok());
+        assert!(Reference::new(format!("{}x", "a".repeat(500))).is_err());
+    }
+    #[test]
+    fn invisible_ranges_and_noncharacters_have_exact_edges() {
+        for (start, end) in [
+            (0xad, 0xad),
+            (0x180e, 0x180e),
+            (0x200b, 0x200b),
+            (0x2060, 0x2064),
+            (0x206a, 0x206f),
+            (0xfeff, 0xfeff),
+            (0xfff9, 0xfffb),
+            (0xe0000, 0xe007f),
+            (0xfdd0, 0xfdef),
+        ] {
+            for point in [start, end] {
+                let text = format!("a{}b", char::from_u32(point).unwrap());
+                assert!(check_line("title", &text, 200).is_err(), "{point:x}");
+                assert!(check_block("body", &text, 0, 200).is_err(), "{point:x}");
+            }
+            for point in [start - 1, end + 1] {
+                // Adjacent bidi and noncharacter code points are also forbidden.
+                if point == 0x2069 || point == 0xdffff {
+                    continue;
+                }
+                let text = format!("a{}b", char::from_u32(point).unwrap());
+                assert!(check_line("title", &text, 200).is_ok(), "{point:x}");
+                assert!(check_block("body", &text, 0, 200).is_ok(), "{point:x}");
+            }
+        }
+        for plane in 0..=16 {
+            for low in [0xfffe, 0xffff] {
+                let point = (plane << 16) | low;
+                let text = format!("a{}b", char::from_u32(point).unwrap());
+                assert!(check_line("title", &text, 200).is_err(), "{point:x}");
+                assert!(check_block("body", &text, 0, 200).is_err(), "{point:x}");
+            }
+            let text = format!("a{}b", char::from_u32((plane << 16) | 0xfffd).unwrap());
+            assert!(check_line("title", &text, 200).is_ok());
+            assert!(check_block("body", &text, 0, 200).is_ok());
+        }
+        for text in ["👩\u{200d}💻", "a\u{200c}b"] {
+            assert!(check_line("title", text, 200).is_ok());
+            assert!(check_block("body", text, 0, 200).is_ok());
+        }
+    }
+    #[test]
+    fn opaque_keys_and_references_are_printable_ascii() {
+        for point in 0..=0x7f {
+            let text = format!("a{}b", char::from_u32(point).unwrap());
+            assert_eq!(
+                RequesterKey::new(&text).is_ok(),
+                (0x21..=0x7e).contains(&point)
+            );
+            assert_eq!(
+                Reference::new(&text).is_ok(),
+                (0x20..=0x7e).contains(&point)
+            );
+        }
+        assert!(RequesterKey::new("é").is_err());
+        assert!(Reference::new("é").is_err());
+        assert!(Reference::new("a b").is_ok());
+        assert!(Reference::new(" a").is_err());
+    }
+    #[test]
+    fn required_blocks_need_non_whitespace() {
+        assert!(check_block("reason", " \n\t", 1, 4096).is_err());
+        assert!(check_block("spec", "\u{a0}", 1, 32768).is_err());
+        assert!(check_block("body", " \n\t", 0, 65536).is_ok());
+    }
+    #[test]
+    fn attachment_names_are_portable_for_export() {
+        for text in [
+            "-a.txt",
+            "a<.txt",
+            "a>.txt",
+            "a\".txt",
+            "a|.txt",
+            "a?.txt",
+            "a*.txt",
+            "a\u{200c}.txt",
+            "a\u{200d}.txt",
+            "CON.txt",
+            "prn.txt",
+            "Aux.a.txt",
+            "NUL.txt",
+            "a.txt.",
+            "a.txt ",
+        ] {
+            assert!(AttachmentName::new(text).is_err(), "{text:?}");
+        }
+        for prefix in ["COM", "lpt"] {
+            for n in 1..=9 {
+                assert!(AttachmentName::new(format!("{prefix}{n}.txt")).is_err());
+            }
+        }
+        for text in [
+            "COM0.txt",
+            "COM10.txt",
+            "LPT0.txt",
+            "LPT10.txt",
+            "console.txt",
+        ] {
+            assert!(AttachmentName::new(text).is_ok());
+        }
     }
 }

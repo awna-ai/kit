@@ -1,6 +1,7 @@
 pub use crate::text::AttachmentName;
 use crate::{ValidationError, text::check_line};
 use serde::{Deserialize, Serialize};
+use std::{collections::HashSet, fmt};
 
 /// The purpose of an attachment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,6 +31,31 @@ pub(crate) fn check_content_type(field: &str, value: &str) -> Result<(), Validat
     }
     Ok(())
 }
+pub(crate) fn check_screenshot(
+    field: &str,
+    role: Role,
+    content_type: &str,
+) -> Result<(), ValidationError> {
+    if role == Role::Screenshot && !matches!(content_type, "image/png" | "image/jpeg") {
+        return Err(ValidationError::new(
+            field,
+            "screenshot must be PNG or JPEG",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn check_unique_name(
+    names: &mut HashSet<String>,
+    field: &str,
+    name: &AttachmentName,
+) -> Result<(), ValidationError> {
+    if !names.insert(name.as_str().to_ascii_lowercase()) {
+        return Err(ValidationError::new(field, "duplicate attachment name"));
+    }
+    Ok(())
+}
+
 /// Stored attachment metadata; the bytes are held separately.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", try_from = "RawAttachment")]
@@ -79,7 +105,7 @@ impl Attachment {
     }
 }
 /// A submitted file borrowed by the store, without any I/O.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct NewFile<'a> {
     /// The submitted basename.
     pub name: AttachmentName,
@@ -89,6 +115,16 @@ pub struct NewFile<'a> {
     pub role: Role,
     /// The submitted bytes.
     pub bytes: &'a [u8],
+}
+impl fmt::Debug for NewFile<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NewFile")
+            .field("name", &self.name)
+            .field("content_type", &self.content_type)
+            .field("role", &self.role)
+            .field("byte_length", &self.bytes.len())
+            .finish()
+    }
 }
 impl NewFile<'_> {
     /// Checks the metadata and refuses an empty file.
@@ -183,7 +219,32 @@ impl TryFrom<RawLimits> for Limits {
 impl Limits {
     /// Checks every field against the contract.
     pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.max_files == 0 {
+            return Err(ValidationError::new(
+                "maxFiles",
+                "file count must be positive",
+            ));
+        }
+        if self.max_file_bytes == 0 {
+            return Err(ValidationError::new(
+                "maxFileBytes",
+                "file size limit must be positive",
+            ));
+        }
+        if self.max_item_bytes < self.max_file_bytes {
+            return Err(ValidationError::new(
+                "maxItemBytes",
+                "item limit is below file limit",
+            ));
+        }
+        let mut types = HashSet::new();
         for (index, allowed) in self.allowed.iter().enumerate() {
+            if !types.insert(&allowed.content_type) {
+                return Err(ValidationError::new(
+                    format!("allowed[{index}].contentType"),
+                    "duplicate content type",
+                ));
+            }
             allowed
                 .validate()
                 .map_err(|error| error.prefix(&format!("allowed[{index}]")))?;
@@ -237,6 +298,7 @@ impl Default for Limits {
 impl Limits {
     /// Refuses files that exceed count or byte limits or break the content-type, extension or screenshot rules.
     pub fn check(&self, files: &[NewFile<'_>]) -> Result<(), ValidationError> {
+        self.validate()?;
         if files.len() as u64 > u64::from(self.max_files) {
             return Err(ValidationError::new("files", "too many files"));
         }
@@ -285,14 +347,11 @@ impl Limits {
             }
         }
         for (index, file) in files.iter().enumerate() {
-            if file.role == Role::Screenshot
-                && !matches!(file.content_type.as_str(), "image/png" | "image/jpeg")
-            {
-                return Err(ValidationError::new(
-                    format!("files[{index}].role"),
-                    "screenshot must be PNG or JPEG",
-                ));
-            }
+            check_screenshot(
+                &format!("files[{index}].role"),
+                file.role,
+                &file.content_type,
+            )?;
         }
         let mut screenshot_seen = false;
         for (index, file) in files.iter().enumerate() {
@@ -305,6 +364,10 @@ impl Limits {
                 }
                 screenshot_seen = true;
             }
+        }
+        let mut names = HashSet::new();
+        for (index, file) in files.iter().enumerate() {
+            check_unique_name(&mut names, &format!("files[{index}].name"), &file.name)?;
         }
         Ok(())
     }
@@ -332,20 +395,11 @@ mod tests {
     #[test]
     fn count_limit_and_zero_files() {
         let limits = limits();
-        let file = file("a.txt", "text/plain", Role::File, b"a");
+        let files = ["a.txt", "b.txt", "c.txt", "d.txt"]
+            .map(|name| file(name, "text/plain", Role::File, b"a"));
         assert!(limits.check(&[]).is_ok());
-        assert!(
-            limits
-                .check(&[file.clone(), file.clone(), file.clone()])
-                .is_ok()
-        );
-        assert_eq!(
-            limits
-                .check(&[file.clone(), file.clone(), file.clone(), file])
-                .unwrap_err()
-                .field,
-            "files"
-        );
+        assert!(limits.check(&files[..3]).is_ok());
+        assert_eq!(limits.check(&files).unwrap_err().field, "files");
     }
     #[test]
     fn individual_byte_limits_and_empty_file() {

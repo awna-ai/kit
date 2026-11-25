@@ -43,7 +43,7 @@ impl TryFrom<RawProcessed> for Processed {
 
 impl Processed {
     /// The maximum size in UTF-8 bytes of untrusted JSON output.
-    pub const MAX_JSON_BYTES: usize = 131_072;
+    pub const MAX_JSON_BYTES: usize = 2_097_152;
 
     /// Validate both parts of the processor output.
     pub fn validate(&self) -> Result<(), ValidationError> {
@@ -72,7 +72,7 @@ impl Processed {
 }
 
 /// An attachment and its bytes selected for a processor.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct File<'a> {
     /// The stored attachment metadata.
     pub attachment: &'a Attachment,
@@ -80,12 +80,23 @@ pub struct File<'a> {
     pub bytes: &'a [u8],
 }
 
+impl fmt::Debug for File<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("File")
+            .field("name", &self.attachment.name)
+            .field("content_type", &self.attachment.content_type)
+            .field("role", &self.attachment.role)
+            .field("byte_length", &self.bytes.len())
+            .finish()
+    }
+}
+
 /// Which attachments processing may receive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Files {
     /// Do not read or pass any attachment bytes.
     None,
-    /// Pass only attachments whose content type starts with `image/`.
+    /// Pass only PNG, JPEG, GIF, WebP and HEIC attachments.
     Images,
     /// Pass every attachment.
     All,
@@ -125,7 +136,11 @@ pub async fn process<S: Store + Sync, P: Processor + Sync>(
     let mut selected = Vec::new();
     for attachment in &item.attachments {
         if files == Files::All
-            || (files == Files::Images && attachment.content_type.starts_with("image/"))
+            || (files == Files::Images
+                && matches!(
+                    attachment.content_type.as_str(),
+                    "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/heic"
+                ))
         {
             let bytes = store
                 .read_file(id, attachment.index)
@@ -165,7 +180,7 @@ impl<S: fmt::Display, P: fmt::Display> fmt::Display for ProcessError<S, P> {
         match self {
             Self::Store(error) => error.fmt(formatter),
             Self::Processor(error) => write!(formatter, "processing failed: {error}"),
-            Self::Invalid(error) => write!(formatter, "invalid processor output: {error}"),
+            Self::Invalid(_) => formatter.write_str("invalid item or processor output"),
         }
     }
 }

@@ -40,7 +40,7 @@ pub trait Store {
         filter: &Filter,
     ) -> impl Future<Output = Result<Vec<Item>, StoreError<Self::Error>>> + Send;
 
-    /// Validate the output first, returning `Invalid` on failure. Require submitted status
+    /// Look up the item first (`NotFound`), then validate the output (`Invalid`). Require submitted status
     /// or return `IllegalMove`; atomically store both outputs, move to processed, append
     /// its status event and update the timestamp without going backwards.
     fn record_processing(
@@ -49,7 +49,7 @@ pub trait Store {
         processed: &Processed,
     ) -> impl Future<Output = Result<Item, StoreError<Self::Error>>> + Send;
 
-    /// Refuse processed with `Invalid`, field `to`, reason
+    /// Look up the item first (`NotFound`), then refuse processed with `Invalid`, field `to`, reason
     /// "only record_processing moves an item to processed".
     /// Otherwise atomically check the move and write it, or return `IllegalMove`.
     /// Append a status event with the reference and update time without going backwards.
@@ -60,7 +60,7 @@ pub trait Store {
         reference: Option<&Reference>,
     ) -> impl Future<Output = Result<Item, StoreError<Self::Error>>> + Send;
 
-    /// Validate the note first (`Invalid` on failure), then append it in any status,
+    /// Look up the item first (`NotFound`), validate the note (`Invalid`), then append it in any status,
     /// including terminal statuses. Update the timestamp without going backwards.
     fn add_note(
         &self,
@@ -133,8 +133,8 @@ pub struct Filter {
     pub limit: Option<u32>,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 struct RawFilter {
     statuses: Vec<Status>,
     source: Option<Source>,

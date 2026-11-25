@@ -165,9 +165,9 @@ impl Store for MemoryStore {
     }
 
     async fn record_processing(&self, id: ItemId, processed: &Processed) -> Result<Item> {
-        processed.validate().map_err(StoreError::Invalid)?;
         let mut state = self.state();
         let from = state.entry_mut(id)?.item.status;
+        processed.validate().map_err(StoreError::Invalid)?;
         if from != Status::Submitted {
             return Err(StoreError::IllegalMove(IllegalMove {
                 from,
@@ -218,9 +218,9 @@ impl Store for MemoryStore {
     }
 
     async fn add_note(&self, id: ItemId, note: &Note) -> Result<Item> {
-        note.validate().map_err(StoreError::Invalid)?;
         let mut state = self.state();
         state.entry_mut(id)?;
+        note.validate().map_err(StoreError::Invalid)?;
         let now = state.stamp();
         let item = &mut state.entry_mut(id)?.item;
         item.events.push(Event::Note {

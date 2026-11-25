@@ -494,11 +494,11 @@ fn every_text_boundary_rejects_forbidden_characters() {
         serde_json::from_value::<Proposal>(value).unwrap();
         serde_json::from_value::<Note>(json!({"kind":"review","body":text})).unwrap();
     }
-    round_trip::<RequesterKey>(json!("é".repeat(160)));
-    round_trip::<Reference>(json!("é".repeat(250)));
+    round_trip::<RequesterKey>(json!("a".repeat(320)));
+    round_trip::<Reference>(json!("a".repeat(500)));
     round_trip::<Source>(json!("a".repeat(32)));
-    round_trip::<AttachmentName>(json!(format!("{}.txt", "a".repeat(251))));
-    rejects::<AttachmentName>(json!(format!("{}.txt", "a".repeat(252))));
+    round_trip::<AttachmentName>(json!(format!("{}.txt", "a".repeat(196))));
+    rejects::<AttachmentName>(json!(format!("{}.txt", "a".repeat(197))));
     let mut value = attachment();
     value["contentType"] = json!(format!("a/{}", "b".repeat(125)));
     serde_json::from_value::<Attachment>(value).unwrap();
@@ -589,4 +589,213 @@ fn configurable_limits_refuse_invalid_allowlist_values() {
             json!({"maxFiles":3,"maxFileBytes":1024,"maxItemBytes":2048,"allowed":[allowed]}),
         );
     }
+}
+
+#[test]
+fn largest_processed_value_fits_the_parse_entry() {
+    let ticket = Ticket {
+        title: "a".repeat(200),
+        spec: format!("x{}", "\n".repeat(32767)),
+        list: TicketList::ToDo,
+        blocked_by: (0..20)
+            .map(|n| {
+                Blocker::External(Reference::new(format!("{n:03}{}", "a".repeat(497))).unwrap())
+            })
+            .collect(),
+    };
+    let output = Processed {
+        triage: Triage {
+            kind: TriageKind::Bug,
+            size: TriageSize::Small,
+            clear: true,
+            summary: "a".repeat(280),
+            details: "\n".repeat(16384),
+        },
+        proposal: Proposal {
+            kind: ProposalKind::Tickets,
+            reason: format!("x{}", "\n".repeat(4095)),
+            tickets: vec![ticket; 20],
+        },
+    };
+    output.validate().unwrap();
+    assert_eq!(
+        Processed::from_json(&serde_json::to_string(&output).unwrap()).unwrap(),
+        output
+    );
+}
+
+#[test]
+fn item_metadata_refuses_duplicate_names_overflow_counts_and_wrong_screenshots() {
+    let base: Item = serde_json::from_value(item()).unwrap();
+    let mut bad = base.clone();
+    let mut second = bad.attachments[0].clone();
+    second.index = 1;
+    second.name = AttachmentName::new("SCREEN.PNG").unwrap();
+    second.role = Role::File;
+    bad.attachments.push(second);
+    let error = bad.validate().unwrap_err();
+    assert_eq!(error.field, "attachments[1].name");
+    assert_eq!(error.reason, "duplicate attachment name");
+    rejects::<Item>(serde_json::to_value(&bad).unwrap());
+    let mut bad = base.clone();
+    bad.attachments[0].role = Role::File;
+    bad.attachments[0].size = u64::MAX;
+    let mut second = bad.attachments[0].clone();
+    second.index = 1;
+    second.name = AttachmentName::new("other.png").unwrap();
+    second.size = 1;
+    bad.attachments.push(second);
+    assert!(bad.validate().is_err());
+    rejects::<Item>(serde_json::to_value(&bad).unwrap());
+    let mut bad = base.clone();
+    bad.attachments = (0..1000)
+        .map(|index| Attachment {
+            index,
+            name: AttachmentName::new(format!("{index}.png")).unwrap(),
+            content_type: "image/png".into(),
+            role: Role::File,
+            size: 1,
+        })
+        .collect();
+    bad.validate().unwrap();
+    bad.attachments.push(Attachment {
+        index: 1000,
+        name: AttachmentName::new("last.png").unwrap(),
+        ..bad.attachments[0].clone()
+    });
+    assert!(bad.validate().is_err());
+    rejects::<Item>(serde_json::to_value(bad).unwrap());
+    for content_type in ["image/gif", "application/pdf"] {
+        let mut bad = base.clone();
+        bad.attachments[0].content_type = content_type.into();
+        assert!(bad.validate().is_err());
+        rejects::<Item>(serde_json::to_value(bad).unwrap());
+    }
+}
+
+#[test]
+fn limits_reject_invalid_configuration_before_checking_files() {
+    for limits in [
+        Limits {
+            max_files: 0,
+            ..Limits::default()
+        },
+        Limits {
+            max_file_bytes: 0,
+            ..Limits::default()
+        },
+        Limits {
+            max_item_bytes: 1,
+            ..Limits::default()
+        },
+        Limits {
+            allowed: vec![Limits::default().allowed[0].clone(); 2],
+            ..Limits::default()
+        },
+    ] {
+        assert!(limits.validate().is_err());
+        assert!(limits.check(&[]).is_err());
+        rejects::<Limits>(serde_json::to_value(limits).unwrap());
+    }
+}
+
+#[test]
+fn optional_keys_default_to_null_and_empty_filter_matches_everything() {
+    assert_eq!(
+        serde_json::from_str::<Filter>("{}").unwrap(),
+        Filter::default()
+    );
+    let mut value = item();
+    value["status"] = json!("submitted");
+    value["events"].as_array_mut().unwrap().truncate(1);
+    value["updatedAtMs"] = json!(1);
+    for key in ["snapshot", "triage", "proposal"] {
+        value.as_object_mut().unwrap().remove(key);
+    }
+    value["events"][0].as_object_mut().unwrap().remove("from");
+    value["events"][0].as_object_mut().unwrap().remove("ref");
+    let parsed: Item = serde_json::from_value(value).unwrap();
+    let written = serde_json::to_value(parsed).unwrap();
+    for key in ["snapshot", "triage", "proposal"] {
+        assert_eq!(written[key], Value::Null);
+    }
+    assert_eq!(written["events"][0]["from"], Value::Null);
+    assert_eq!(written["events"][0]["ref"], Value::Null);
+}
+
+#[test]
+fn snapshot_strings_and_keys_follow_the_block_rule() {
+    for state in [
+        json!({"nested":["bad\u{1b}text"]}),
+        json!({"bad\u{200b}key":1}),
+    ] {
+        let snapshot = Snapshot { state };
+        let error = snapshot.validate().unwrap_err();
+        assert_eq!(error.field, "snapshot.state");
+        assert_eq!(error.reason, "snapshot text contains a forbidden character");
+        rejects::<Snapshot>(serde_json::to_value(snapshot).unwrap());
+    }
+    Snapshot {
+        state: json!({"ok\n\t":["👩\u{200d}💻"]}),
+    }
+    .validate()
+    .unwrap();
+}
+
+#[test]
+fn item_parse_entries_cap_and_redact_untrusted_json() {
+    assert_eq!(NewItem::MAX_JSON_BYTES, 1_310_720);
+    assert_eq!(Item::MAX_JSON_BYTES, 8_388_608);
+    let new_text = serde_json::to_string(&new_item()).unwrap();
+    let item_text = serde_json::to_string(&item()).unwrap();
+    assert!(NewItem::from_json(&new_text).is_ok());
+    assert!(Item::from_json(&item_text).is_ok());
+    assert!(
+        NewItem::from_json(&format!(
+            "{new_text}{}",
+            " ".repeat(NewItem::MAX_JSON_BYTES - new_text.len())
+        ))
+        .is_ok()
+    );
+    let error = NewItem::from_json(&" ".repeat(NewItem::MAX_JSON_BYTES + 1)).unwrap_err();
+    assert_eq!(
+        (error.field.as_str(), error.reason),
+        ("newItem", "input is too large")
+    );
+    let error = NewItem::from_json(r#"{"source":"UNTRUSTED-SENTINEL"}"#).unwrap_err();
+    assert_eq!(
+        (error.field.as_str(), error.reason),
+        ("newItem", "not a valid item")
+    );
+    assert!(!error.to_string().contains("UNTRUSTED-SENTINEL"));
+    assert!(
+        Item::from_json(&format!(
+            "{item_text}{}",
+            " ".repeat(Item::MAX_JSON_BYTES - item_text.len())
+        ))
+        .is_ok()
+    );
+    let error = Item::from_json(&" ".repeat(Item::MAX_JSON_BYTES + 1)).unwrap_err();
+    assert_eq!(
+        (error.field.as_str(), error.reason),
+        ("item", "input is too large")
+    );
+    let error = Item::from_json(r#"{"id":"UNTRUSTED-SENTINEL"}"#).unwrap_err();
+    assert_eq!(
+        (error.field.as_str(), error.reason),
+        ("item", "not a valid item")
+    );
+    assert!(!error.to_string().contains("UNTRUSTED-SENTINEL"));
+}
+
+#[test]
+fn lossy_snapshot_replaces_text_and_keys_and_keeps_first_collision() {
+    let snapshot = Snapshot::lossy(
+        json!({"outer":["a\u{1b}b", {"x\u{0}":1,"x\u{1}":2}], "ok\n\t":"👩\u{200d}💻"}),
+    );
+    assert_eq!(
+        snapshot.state,
+        json!({"outer":["a�b", {"x�":1}], "ok\n\t":"👩\u{200d}💻"})
+    );
+    snapshot.validate().unwrap();
 }
