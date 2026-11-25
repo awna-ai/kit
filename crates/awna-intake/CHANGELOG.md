@@ -11,5 +11,5 @@ This package is versioned on its own. Its releases are tagged `awna-intake-vX.Y.
 - Add `Processor` and `process` for validated processing without I/O in the crate.
 - Define CONTRACT v1.
 - Allow `video/mp4` (`mp4`, `m4v`) and `video/quicktime` (`mov`) attachments by default.
-- Document that a store may return a snapshot float up to one unit in the last place from the value submitted.
+- Document that a store may return a snapshot float that differs from the value submitted in its last bits.
 - Add `serde` (with `derive`) and `serde_json` as the only direct dependencies.

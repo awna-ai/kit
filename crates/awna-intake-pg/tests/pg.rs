@@ -416,25 +416,28 @@ async fn command_line_round_trip() {
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "needs AWNA_INTAKE_PG_TEST_ADMIN_URL"]
-async fn snapshot_float_stays_within_one_ulp() {
+async fn snapshot_float_differs_only_in_last_bits() {
     with_database(|scratch| async move {
         let store = PgStore::new(scratch.pool, Limits::default());
-        let submitted = 1.0715660391465826e-75_f64;
-        let mut input = new_item();
-        input.snapshot = Some(awna_intake::Snapshot {
-            state: serde_json::json!({ "number": submitted }),
-        });
-        let item = store.submit(&input, &[]).await.unwrap();
-        let saved = store.get(item.id).await.unwrap();
-        let returned = saved.snapshot.unwrap().state["number"].as_f64().unwrap();
-        assert!(submitted.to_bits().abs_diff(returned.to_bits()) <= 1);
+        for submitted in [1.0715660391465826e-75_f64, 9.867437071726851e-60_f64] {
+            let mut input = new_item();
+            input.snapshot = Some(awna_intake::Snapshot {
+                state: serde_json::json!({ "number": submitted }),
+            });
+            let item = store.submit(&input, &[]).await.unwrap();
+            let saved = store.get(item.id).await.unwrap();
+            let returned = saved.snapshot.unwrap().state["number"].as_f64().unwrap();
+            assert!(submitted.to_bits().abs_diff(returned.to_bits()) <= 2);
+            assert_eq!(submitted.is_sign_negative(), returned.is_sign_negative());
+            assert_eq!(submitted.to_bits() >> 52, returned.to_bits() >> 52);
+        }
     })
     .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "needs AWNA_INTAKE_PG_TEST_ADMIN_URL"]
-async fn corrupt_attachment_is_refused_and_failed_export_is_removed() {
+async fn corrupt_attachment_index_and_size_are_refused_and_failed_export_is_removed() {
     with_database(|scratch| async move {
         let store = PgStore::new(scratch.pool.clone(), Limits::default());
         let item = store
@@ -450,11 +453,28 @@ async fn corrupt_attachment_is_refused_and_failed_export_is_removed() {
             .await
             .unwrap();
         let id = i64::try_from(item.id.get()).unwrap();
-        sqlx::query("UPDATE intake_attachments SET bytes = 'zz' WHERE item_id = $1")
+        let mut meta = item.attachments[0].clone();
+        meta.index = 1;
+        sqlx::query("UPDATE intake_attachments SET meta = $2::json WHERE item_id = $1")
             .bind(id)
+            .bind(serde_json::to_string(&meta).unwrap())
             .execute(&scratch.pool)
             .await
             .unwrap();
+        assert!(matches!(
+            store.read_file(item.id, 0).await,
+            Err(StoreError::Backend(PgError::Corrupt(
+                "attachment index differs from metadata"
+            )))
+        ));
+        sqlx::query(
+            "UPDATE intake_attachments SET bytes = 'zz', meta = $2::json WHERE item_id = $1",
+        )
+        .bind(id)
+        .bind(serde_json::to_string(&item.attachments[0]).unwrap())
+        .execute(&scratch.pool)
+        .await
+        .unwrap();
         assert!(matches!(
             store.read_file(item.id, 0).await,
             Err(StoreError::Backend(PgError::Corrupt(

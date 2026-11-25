@@ -175,11 +175,11 @@ fn read_body(path: &std::path::Path) -> Result<String, Failure> {
     let metadata = file
         .metadata()
         .map_err(|_| Failure::file("body file could not be checked"))?;
-    if metadata.nlink() != 1 {
-        return Err(Failure::file("body file has more than one link"));
-    }
     if !metadata.is_file() {
         return Err(Failure::file("body file is not a regular file"));
+    }
+    if metadata.nlink() != 1 {
+        return Err(Failure::file("body file has more than one link"));
     }
     let mut bytes = Vec::new();
     file.take(1_048_577)
@@ -357,7 +357,10 @@ mod tests {
         let link = scratch.0.join("link");
         symlink(&path, &link).unwrap();
         assert_eq!(read_body(&link).err().unwrap().code, 1);
-        assert!(read_body(&scratch.0).is_err());
+        assert_eq!(
+            read_body(&scratch.0).err().unwrap().message,
+            "body file is not a regular file"
+        );
         std::fs::write(&path, [255]).unwrap();
         assert!(read_body(&path).is_err());
         std::fs::write(&path, vec![b'a'; 1_048_576]).unwrap();

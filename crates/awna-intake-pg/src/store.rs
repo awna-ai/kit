@@ -394,7 +394,10 @@ impl Store for PgStore {
         let meta: Attachment =
             decode_json!(row.try_get::<String, _>("meta").map_err(PgError::from)?);
         let size: i32 = row.try_get("size").map_err(PgError::from)?;
-        if meta.index != index || u64::try_from(size).ok() != Some(meta.size) {
+        if meta.index != index {
+            return Err(corrupt("attachment index differs from metadata"));
+        }
+        if u64::try_from(size).ok() != Some(meta.size) {
             return Err(corrupt("attachment size differs from metadata"));
         }
         let bytes = sqlx::query_scalar(
