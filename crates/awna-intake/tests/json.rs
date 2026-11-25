@@ -731,8 +731,14 @@ fn snapshot_strings_and_keys_follow_the_block_rule() {
     ] {
         let snapshot = Snapshot { state };
         let error = snapshot.validate().unwrap_err();
-        assert_eq!(error.field, "snapshot.state");
+        assert_eq!(error.field, "state");
         assert_eq!(error.reason, "snapshot text contains a forbidden character");
+        let mut new: NewItem = serde_json::from_value(new_item()).unwrap();
+        new.snapshot = Some(snapshot.clone());
+        assert_eq!(new.validate().unwrap_err().field, "snapshot.state");
+        let mut stored: Item = serde_json::from_value(item()).unwrap();
+        stored.snapshot = Some(snapshot.clone());
+        assert_eq!(stored.validate().unwrap_err().field, "snapshot.state");
         rejects::<Snapshot>(serde_json::to_value(snapshot).unwrap());
     }
     Snapshot {
@@ -745,7 +751,7 @@ fn snapshot_strings_and_keys_follow_the_block_rule() {
 #[test]
 fn item_parse_entries_cap_and_redact_untrusted_json() {
     assert_eq!(NewItem::MAX_JSON_BYTES, 1_310_720);
-    assert_eq!(Item::MAX_JSON_BYTES, 8_388_608);
+    assert_eq!(Item::MAX_JSON_BYTES, 12_582_912);
     let new_text = serde_json::to_string(&new_item()).unwrap();
     let item_text = serde_json::to_string(&item()).unwrap();
     assert!(NewItem::from_json(&new_text).is_ok());
@@ -798,4 +804,78 @@ fn lossy_snapshot_replaces_text_and_keys_and_keeps_first_collision() {
         json!({"outer":["a�b", {"x�":1}], "ok\n\t":"👩\u{200d}💻"})
     );
     snapshot.validate().unwrap();
+}
+
+#[test]
+fn item_history_refuses_the_257th_event() {
+    let mut value: Item = serde_json::from_value(item()).unwrap();
+    let note = Event::Note {
+        at_ms: 2,
+        kind: EventKind::new("review").unwrap(),
+        body: String::new(),
+    };
+    value.events.resize(256, note.clone());
+    value.validate().unwrap();
+    value.events.push(note);
+    let error = value.validate().unwrap_err();
+    assert_eq!(error.field, "events");
+    assert_eq!(error.reason, "event history is full");
+    rejects::<Item>(serde_json::to_value(value).unwrap());
+}
+
+#[test]
+fn capped_history_and_maximum_fields_fit_the_item_parser() {
+    let mut value: Item = serde_json::from_value(item()).unwrap();
+    value.title = "a".repeat(200);
+    value.body = "\n".repeat(65_536);
+    value.snapshot = Some(Snapshot {
+        state: json!("s".repeat(1_048_574)),
+    });
+    value.triage.as_mut().unwrap().summary = "a".repeat(280);
+    value.triage.as_mut().unwrap().details = "\n".repeat(16_384);
+    let ticket = Ticket {
+        title: "a".repeat(200),
+        spec: format!("x{}", "\n".repeat(32_767)),
+        list: TicketList::ToDo,
+        blocked_by: (0..20)
+            .map(|n| {
+                Blocker::External(Reference::new(format!("{n:03}{}", "a".repeat(497))).unwrap())
+            })
+            .collect(),
+    };
+    value.proposal = Some(Proposal {
+        kind: ProposalKind::Tickets,
+        reason: format!("x{}", "\n".repeat(4095)),
+        tickets: vec![ticket; 20],
+    });
+    let note = Event::Note {
+        at_ms: 2,
+        kind: EventKind::new("review").unwrap(),
+        body: "\n".repeat(16_384),
+    };
+    // Compact UTF-8 JSON escapes each newline to two bytes. A conservative bound is
+    // 255 * 16_384 * 2 + 65_536 * 2 + 1_048_576 + 20 * (32_768 * 2
+    // + 200 + 20 * 500) + 4096 * 2 + 16_384 * 2 = 11_091_168 bytes before metadata and JSON syntax.
+    // This leaves over 1 MiB of the 12 MiB parser cap for metadata and JSON syntax.
+    // The combined processed fixture has 254 notes (submission + processing consume
+    // two events). The submitted fixture has 255 notes and no processing results.
+    value.events.resize(256, note);
+    value.validate().unwrap();
+    let text = serde_json::to_string(&value).unwrap();
+    assert!(
+        text.len() <= Item::MAX_JSON_BYTES,
+        "serialized item: {}",
+        text.len()
+    );
+    assert_eq!(Item::from_json(&text).unwrap(), value);
+    value.events.remove(1);
+    value.events.push(value.events.last().unwrap().clone());
+    value.status = Status::Submitted;
+    value.triage = None;
+    value.proposal = None;
+    value.validate().unwrap();
+    assert_eq!(
+        Item::from_json(&serde_json::to_string(&value).unwrap()).unwrap(),
+        value
+    );
 }

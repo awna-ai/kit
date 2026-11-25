@@ -12,6 +12,8 @@ use crate::{
 };
 
 /// A storage implementation owns locking, persistence and attachment bytes.
+/// Every event-appending method refuses a 257th event with `Invalid`, field `events`,
+/// reason "event history is full", after `NotFound` and before checking the move.
 pub trait Store {
     /// The implementation's backend error.
     type Error: Error + Send + Sync + 'static;
@@ -40,7 +42,8 @@ pub trait Store {
         filter: &Filter,
     ) -> impl Future<Output = Result<Vec<Item>, StoreError<Self::Error>>> + Send;
 
-    /// Look up the item first (`NotFound`), then validate the output (`Invalid`). Require submitted status
+    /// Look up the item first (`NotFound`), then refuse a full history (`Invalid`) and
+    /// validate the output (`Invalid`). Require submitted status
     /// or return `IllegalMove`; atomically store both outputs, move to processed, append
     /// its status event and update the timestamp without going backwards.
     fn record_processing(
@@ -49,7 +52,8 @@ pub trait Store {
         processed: &Processed,
     ) -> impl Future<Output = Result<Item, StoreError<Self::Error>>> + Send;
 
-    /// Look up the item first (`NotFound`), then refuse processed with `Invalid`, field `to`, reason
+    /// Look up the item first (`NotFound`), then refuse a full history (`Invalid`),
+    /// then processed with `Invalid`, field `to`, reason
     /// "only record_processing moves an item to processed".
     /// Otherwise atomically check the move and write it, or return `IllegalMove`.
     /// Append a status event with the reference and update time without going backwards.
@@ -60,7 +64,8 @@ pub trait Store {
         reference: Option<&Reference>,
     ) -> impl Future<Output = Result<Item, StoreError<Self::Error>>> + Send;
 
-    /// Look up the item first (`NotFound`), validate the note (`Invalid`), then append it in any status,
+    /// Look up the item first (`NotFound`), refuse a full history (`Invalid`), validate
+    /// the note (`Invalid`), then append it in any status,
     /// including terminal statuses. Update the timestamp without going backwards.
     fn add_note(
         &self,

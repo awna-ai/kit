@@ -255,9 +255,9 @@ pub async fn run<S: Store + Sync>(store: &S) {
     );
 
     let mut fidelity = new_item();
-    fidelity.title = "é".repeat(100);
-    fidelity.body = format!("{}\n\t", "é".repeat(32767));
-    let state = serde_json::json!({"nested":{"values":[7,1.25,true,null,"é雪"]}});
+    fidelity.title = format!("{}😀", "é".repeat(98));
+    fidelity.body = format!("{}😀e\u{301}\n\t ", "é".repeat(32763));
+    let state = serde_json::json!({"nested":{"values":[7,1.25,0.1,-1,9007199254740993_u64,true,null,"é雪😀"]}});
     fidelity.snapshot = Some(Snapshot {
         state: state.clone(),
     });
@@ -266,7 +266,7 @@ pub async fn run<S: Store + Sync>(store: &S) {
         store
             .submit(
                 &fidelity,
-                &[file("raw.txt", "text/plain", Role::File, &binary)],
+                &[file("Report-Final.TXT", "text/plain", Role::File, &binary)],
             )
             .await
             .expect("fidelity submit"),
@@ -282,6 +282,21 @@ pub async fn run<S: Store + Sync>(store: &S) {
         exact.snapshot.as_ref().expect("snapshot retained").state,
         state,
         "JSON value fidelity"
+    );
+    assert_eq!(
+        exact.attachments[0].name.as_str(),
+        "Report-Final.TXT",
+        "attachment name case fidelity"
+    );
+    let encoded = serde_json::to_string(&state).expect("serialize snapshot");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&encoded).expect("parse snapshot"),
+        state,
+        "snapshot numbers must survive JSON without optional features"
+    );
+    assert_eq!(
+        state["nested"]["values"][4].as_u64(),
+        Some(9007199254740993)
     );
     assert_saved(store, &exact).await;
     assert_eq!(
@@ -499,7 +514,7 @@ pub async fn run<S: Store + Sync>(store: &S) {
     let terminal = at_status(store, Status::Shipped).await;
     let note = Note {
         kind: EventKind::new("review").expect("valid note kind"),
-        body: "Verified the release.".into(),
+        body: "\n\t Verified the release.\n\t ".into(),
     };
     let annotated = changed(
         &terminal,
@@ -543,6 +558,21 @@ pub async fn run<S: Store + Sync>(store: &S) {
         annotated,
         "invalid note must change nothing"
     );
+
+    let mut full = at_status(store, Status::Submitted).await;
+    while full.events.len() < 256 {
+        full = changed(
+            &full,
+            store.add_note(full.id, &note).await.expect("fill history"),
+        );
+    }
+    assert_saved(store, &full).await;
+    assert!(
+        matches!(store.add_note(full.id, &note).await, Err(StoreError::Invalid(error))
+            if error.field == "events" && error.reason == "event history is full"),
+        "the 257th event must return Invalid with the history error"
+    );
+    assert_saved(store, &full).await;
 
     let missing = ItemId::new(u64::MAX).expect("nonzero id");
     assert!(

@@ -12,6 +12,8 @@ the store holds their bytes separately. All lengths below are UTF-8 bytes, not c
 Every struct refuses unknown fields on deserialize and validates through the same rules as its public `validate()`
 method. JSON fields are camelCase except the explicit `requesterKey` and `ref` names. Optional fields serialize
 as `null`; readers accept an absent optional key as `null` everywhere. Writers always write `null`.
+Senders write compact, unescaped UTF-8 JSON; the `MAX_JSON_BYTES` caps are sized for that representation.
+Required JSON escapes, such as those for newlines and tabs, still apply.
 The raw filter defaults every field, so `{}` is the default filter. Enum spellings are exact and case-sensitive.
 
 Every text field refuses U+0000–U+001F (except the block exceptions below), U+007F, U+0080–U+009F, U+2028,
@@ -55,8 +57,9 @@ show or log a raw serde error. A deserialize error's `field` names the innermost
 | state | any JSON value | Compact serialization at most 1,048,576 bytes; arrays and objects nest at most 32 deep. |
 
 Every string and object key in `state` follows the block character rule, without a separate length cap.
-Forbidden text is refused with field `snapshot.state`, reason `snapshot text contains a forbidden character`.
-`Snapshot::lossy(state)` replaces forbidden characters in strings and keys with U+FFFD, keeping the first key
+Forbidden text is refused with field `state`, reason `snapshot text contains a forbidden character`.
+`NewItem::validate` and `Item::validate` prefix that field as `snapshot.state`.
+`Snapshot::lossy(state)` replaces forbidden characters in strings and keys with U+FFFD, keeping the key that sorts first
 when replacement causes a collision within an object. A sender capturing console output calls this helper;
 size and nesting still require validation.
 
@@ -143,7 +146,7 @@ A caller's `Note` has only `kind` and `body`, with the same rules; the store sta
 | triage | Triage or null | Present together with proposal exactly when a status event moves to processed. |
 | proposal | Proposal or null | Present together with triage exactly when a status event moves to processed. |
 | status | string | One of the nine statuses below. |
-| events | array of Event | Nonempty and consistent with the status history below. |
+| events | array of Event | 1–256 events, consistent with the status history below. |
 | createdAtMs | u64 number | Exactly the first event's Unix millisecond time. |
 | updatedAtMs | u64 number | At least the last event's time. |
 
@@ -153,7 +156,7 @@ never decrease. Every nested field obeys its own validation rules. Attachment si
 addition and overflow is refused. A screenshot must be image/png or image/jpeg, including on deserialize.
 Duplicate names report `attachments[i].name`, reason `duplicate attachment name`.
 
-`Item::from_json` refuses input over 8,388,608 bytes before parsing, with field `item` and reason `input is too large`.
+`Item::from_json` refuses input over 12,582,912 bytes before parsing, with field `item` and reason `input is too large`.
 Any parse error becomes field `item`, reason `not a valid item`.
 
 ### Processed
@@ -239,6 +242,11 @@ Backend and IllegalMove expose their error source.
   reference. The check and write are one atomic step; a database store compares and sets the current status.
 - `add_note` validates the Note and records it with the store's timestamp in every status, including terminal ones.
 - `read_file` returns identical stored bytes; an absent item is NotFound and an absent index is NoFile.
+
+`Item::validate` refuses more than 256 events with field `events` and reason `event history is full`.
+Every store refuses `record_processing`, `set_status` or `add_note` that would append the 257th event with
+Invalid and the same field and reason, without changing anything. It checks this after NotFound and before
+checking the move.
 
 A store checks, in order, that the item exists (NotFound), then the input (Invalid), then the move (IllegalMove).
 An id the store cannot hold, above its own range, is NotFound. This order applies to set_status, add_note and

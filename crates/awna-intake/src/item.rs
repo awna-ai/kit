@@ -75,7 +75,7 @@ impl TryFrom<RawSnapshot> for Snapshot {
 }
 impl Snapshot {
     /// Replaces forbidden characters in state strings and keys with U+FFFD.
-    /// The first key wins after replacement; size and nesting still need validation.
+    /// On a collision, keeps the key that sorts first; size and nesting still need validation.
     pub fn lossy(mut state: serde_json::Value) -> Self {
         fn replace(text: &str) -> String {
             text.chars()
@@ -143,7 +143,7 @@ impl Snapshot {
 fn check_snapshot_text(text: &str) -> Result<(), ValidationError> {
     if text.chars().any(|c| forbidden(c, true)) {
         return Err(ValidationError::new(
-            "snapshot.state",
+            "state",
             "snapshot text contains a forbidden character",
         ));
     }
@@ -209,13 +209,9 @@ impl NewItem {
         check_line("title", &self.title, 200)?;
         check_block("body", &self.body, 0, 65_536)?;
         if let Some(snapshot) = &self.snapshot {
-            snapshot.validate().map_err(|error| {
-                if error.field == "snapshot.state" {
-                    error
-                } else {
-                    error.prefix("snapshot")
-                }
-            })?;
+            snapshot
+                .validate()
+                .map_err(|error| error.prefix("snapshot"))?;
         }
         Ok(())
     }
@@ -376,7 +372,7 @@ pub struct Item {
     pub proposal: Option<Proposal>,
     /// The latest status.
     pub status: Status,
-    /// A nonempty chronological event history.
+    /// A chronological history of 1 to 256 events.
     pub events: Vec<Event>,
     /// The first event time in Unix milliseconds.
     pub created_at_ms: u64,
@@ -426,7 +422,7 @@ impl TryFrom<RawItem> for Item {
 }
 impl Item {
     /// Maximum untrusted JSON size in UTF-8 bytes.
-    pub const MAX_JSON_BYTES: usize = 8_388_608;
+    pub const MAX_JSON_BYTES: usize = 12_582_912;
 
     /// Parses untrusted JSON without reflecting its contents in errors.
     pub fn from_json(text: &str) -> Result<Self, ValidationError> {
@@ -438,16 +434,15 @@ impl Item {
 
     /// Checks every field against the contract.
     pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.events.len() > 256 {
+            return Err(ValidationError::new("events", "event history is full"));
+        }
         check_line("title", &self.title, 200)?;
         check_block("body", &self.body, 0, 65_536)?;
         if let Some(snapshot) = &self.snapshot {
-            snapshot.validate().map_err(|error| {
-                if error.field == "snapshot.state" {
-                    error
-                } else {
-                    error.prefix("snapshot")
-                }
-            })?;
+            snapshot
+                .validate()
+                .map_err(|error| error.prefix("snapshot"))?;
         }
         if self.triage.is_some() != self.proposal.is_some() {
             return Err(ValidationError::new(

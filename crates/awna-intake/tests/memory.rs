@@ -419,3 +419,29 @@ fn invalid_processing_display_covers_items_and_output() {
     });
     assert_eq!(error.to_string(), "invalid item or processor output");
 }
+
+#[test]
+fn full_history_refuses_every_write_before_checking_moves() {
+    block_on(async {
+        let store = MemoryStore::default();
+        let mut item = store.submit(&new_item(), &[]).await.unwrap();
+        let note = Note {
+            kind: EventKind::new("review").unwrap(),
+            body: "note".into(),
+        };
+        for _ in 1..256 {
+            item = store.add_note(item.id, &note).await.unwrap();
+        }
+        assert_eq!(item.events.len(), 256);
+        for result in [
+            store.add_note(item.id, &note).await,
+            store.record_processing(item.id, &processed()).await,
+            store.set_status(item.id, Status::Held, None).await,
+            store.set_status(item.id, Status::Submitted, None).await,
+        ] {
+            assert!(matches!(result, Err(StoreError::Invalid(error))
+                if error.field == "events" && error.reason == "event history is full"));
+            assert_eq!(store.get(item.id).await.unwrap(), item);
+        }
+    });
+}
