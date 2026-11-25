@@ -1,6 +1,6 @@
 use awna_intake::{EventKind, ItemId, Reference, Status};
 
-pub const USAGE: &str = "Usage: awna-intake --db-env <NAME> pending --json\n       awna-intake --db-env <NAME> get <id> --json\n       awna-intake --db-env <NAME> export <id> <dir>\n       awna-intake --db-env <NAME> set-status <id> <status> [--ref <text>]\n       awna-intake --db-env <NAME> event <id> --kind <kind> --body-file <file>\n       awna-intake --help | -h";
+pub const USAGE: &str = "Usage: awna-intake --db-env <NAME> pending --json  (at most 100, oldest first)\n       awna-intake --db-env <NAME> get <id> --json\n       awna-intake --db-env <NAME> export <id> <dir>\n       awna-intake --db-env <NAME> set-status <id> <status> [--ref <text>]\n       awna-intake --db-env <NAME> event <id> --kind <kind> --body-file <file>\n       awna-intake --help | -h";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -106,8 +106,7 @@ pub async fn run(variable: &str, action: Action) -> Result<String, Failure> {
         .ok()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| Failure::file(&format!("{variable} is not set")))?;
-    let options =
-        awna_intake_pg::connect_options(&url).map_err(|error| Failure::file(&error.to_string()))?;
+    let options = connection_options(&url)?;
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .acquire_timeout(std::time::Duration::from_secs(10))
@@ -118,7 +117,10 @@ pub async fn run(variable: &str, action: Action) -> Result<String, Failure> {
     let result = match action {
         Action::Pending => {
             let items = store
-                .list(&awna_intake::Filter::pending())
+                .list(&awna_intake::Filter {
+                    limit: Some(100),
+                    ..awna_intake::Filter::pending()
+                })
                 .await
                 .map_err(storage)?;
             serde_json::to_string(&items)
@@ -150,22 +152,33 @@ pub async fn run(variable: &str, action: Action) -> Result<String, Failure> {
     result
 }
 
+fn connection_options(url: &str) -> Result<sqlx::postgres::PgConnectOptions, Failure> {
+    awna_intake_pg::connect_options(url)
+        .map(|options| options.options([("lock_timeout", "10s"), ("statement_timeout", "60s")]))
+        .map_err(|error| Failure::file(&error.to_string()))
+}
+
 fn item_json(item: &awna_intake::Item) -> Result<String, Failure> {
     serde_json::to_string(item).map_err(|_| Failure::file("item could not be serialized"))
 }
 
 fn read_body(path: &std::path::Path) -> Result<String, Failure> {
-    use std::{io::Read, os::unix::fs::OpenOptionsExt};
+    use std::{
+        io::Read,
+        os::unix::fs::{MetadataExt, OpenOptionsExt},
+    };
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .map_err(|_| Failure::file("body file could not be opened"))?;
-    if !file
+    let metadata = file
         .metadata()
-        .map_err(|_| Failure::file("body file could not be checked"))?
-        .is_file()
-    {
+        .map_err(|_| Failure::file("body file could not be checked"))?;
+    if metadata.nlink() != 1 {
+        return Err(Failure::file("body file has more than one link"));
+    }
+    if !metadata.is_file() {
         return Err(Failure::file("body file is not a regular file"));
     }
     let mut bytes = Vec::new();
@@ -189,21 +202,33 @@ async fn export(
         .mode(0o700)
         .create(directory)
         .map_err(|_| Failure::file("export directory could not be created"))?;
-    let json = item_json(item)? + "\n";
-    write_private(&directory.join("item.json"), json.as_bytes())
-        .map_err(|_| Failure::file("export item.json could not be written"))?;
-    for file in &item.attachments {
-        let fail = || Failure::file(&format!("export file {} failed", file.index));
-        let name = file.name.as_str();
-        if name.contains('/') || name.contains('\0') || matches!(name, "." | "..") {
-            return Err(fail());
+    let result = async {
+        let json = item_json(item)? + "\n";
+        write_private(&directory.join("item.json"), json.as_bytes())
+            .map_err(|_| Failure::file("export item.json could not be written"))?;
+        for file in &item.attachments {
+            let fail = || Failure::file(&format!("export file {} failed", file.index));
+            let name = file.name.as_str();
+            if name.contains('/') || name.contains('\0') || matches!(name, "." | "..") {
+                return Err(fail());
+            }
+            let bytes = store
+                .read_file(item.id, file.index)
+                .await
+                .map_err(|_| fail())?;
+            write_private(&directory.join(format!("{}-{name}", file.index)), &bytes)
+                .map_err(|_| fail())?;
         }
-        let bytes = store
-            .read_file(item.id, file.index)
-            .await
-            .map_err(|_| fail())?;
-        write_private(&directory.join(format!("{}-{name}", file.index)), &bytes)
-            .map_err(|_| fail())?;
+        Ok(())
+    }
+    .await;
+    if let Err(mut failure) = result {
+        if std::fs::remove_dir_all(directory).is_err() {
+            failure
+                .message
+                .push_str("; export directory could not be removed");
+        }
+        return Err(failure);
     }
     Ok(())
 }
@@ -224,6 +249,17 @@ mod tests {
 
     fn argv(text: &str) -> Vec<String> {
         text.split_whitespace().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn connections_have_query_and_lock_timeouts() {
+        let options = connection_options("postgres://someone@localhost/none")
+            .ok()
+            .unwrap();
+        assert_eq!(
+            options.get_options(),
+            Some("-c lock_timeout=10s -c statement_timeout=60s")
+        );
     }
 
     #[test]
@@ -328,6 +364,33 @@ mod tests {
         assert_eq!(read_body(&path).ok().unwrap().len(), 1_048_576);
         std::fs::write(&path, vec![b'a'; 1_048_577]).unwrap();
         assert!(read_body(&path).is_err());
+    }
+
+    #[test]
+    fn body_reader_refuses_hard_links() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("body");
+        std::fs::write(&path, "text").unwrap();
+        std::fs::hard_link(&path, scratch.0.join("second")).unwrap();
+        let error = read_body(&path).expect_err("hard link accepted");
+        assert_eq!(error.code, 1);
+        assert_eq!(error.message, "body file has more than one link");
+    }
+
+    #[test]
+    fn body_reader_refuses_fifo() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("fifo");
+        match std::process::Command::new("mkfifo").arg(&path).status() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping FIFO check: mkfifo is absent");
+                return;
+            }
+            result => assert!(result.unwrap().success()),
+        }
+        let error = read_body(&path).expect_err("FIFO accepted");
+        assert_eq!(error.code, 1);
+        assert_eq!(error.message, "body file is not a regular file");
     }
 
     #[test]

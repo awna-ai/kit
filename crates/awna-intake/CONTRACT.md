@@ -63,6 +63,11 @@ Forbidden text is refused with field `state`, reason `snapshot text contains a f
 when replacement causes a collision within an object. A sender capturing console output calls this helper;
 size and nesting still require validation.
 
+Snapshot numbers are JSON numbers. Integers within u64 or i64 are kept exactly. A number with a fraction or an
+exponent is read as an f64 by a parser's default rules, which may round it to a neighbour of the nearest f64, so a
+store that writes and reads JSON text may return such a number up to one unit in the last place away from the value
+submitted. Nothing that needs exact float bits belongs in a snapshot.
+
 A screenshot belongs in an attachment with role `screenshot`, never a special snapshot field.
 
 ### Attachment

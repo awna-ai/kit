@@ -376,10 +376,36 @@ impl Store for PgStore {
 
     async fn read_file(&self, id: ItemId, index: u32) -> Result<Vec<u8>> {
         let number = db_id(id)?;
-        let row = sqlx::query("SELECT a.bytes FROM intake_items i LEFT JOIN intake_attachments a ON a.item_id = i.id AND a.file_index::bigint = $2 WHERE i.id = $1")
-            .bind(number).bind(i64::from(index)).fetch_optional(&self.pool).await.map_err(PgError::from)?.ok_or(StoreError::NotFound(id))?;
-        row.try_get::<Option<Vec<u8>>, _>("bytes")
+        let mut tx = self.pool.begin().await.map_err(PgError::from)?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *tx)
+            .await
+            .map_err(PgError::from)?;
+        sqlx::query("SELECT id FROM intake_items WHERE id = $1")
+            .bind(number)
+            .fetch_optional(&mut *tx)
+            .await
             .map_err(PgError::from)?
-            .ok_or(StoreError::NoFile { id, index })
+            .ok_or(StoreError::NotFound(id))?;
+        // Check and load bytes from the same snapshot, using only SELECT privileges.
+        let row = sqlx::query("SELECT octet_length(bytes) AS size, meta::text AS meta FROM intake_attachments WHERE item_id = $1 AND file_index::bigint = $2")
+            .bind(number).bind(i64::from(index)).fetch_optional(&mut *tx).await.map_err(PgError::from)?
+            .ok_or(StoreError::NoFile { id, index })?;
+        let meta: Attachment =
+            decode_json!(row.try_get::<String, _>("meta").map_err(PgError::from)?);
+        let size: i32 = row.try_get("size").map_err(PgError::from)?;
+        if meta.index != index || u64::try_from(size).ok() != Some(meta.size) {
+            return Err(corrupt("attachment size differs from metadata"));
+        }
+        let bytes = sqlx::query_scalar(
+            "SELECT bytes FROM intake_attachments WHERE item_id = $1 AND file_index::bigint = $2",
+        )
+        .bind(number)
+        .bind(i64::from(index))
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(PgError::from)?;
+        tx.commit().await.map_err(PgError::from)?;
+        Ok(bytes)
     }
 }

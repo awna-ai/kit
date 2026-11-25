@@ -35,6 +35,9 @@ pub fn connect_options(url: &str) -> Result<PgConnectOptions, UrlError> {
             .to_url_lossy(),
         url,
     )?;
+    if !matches!(parsed.scheme(), "postgres" | "postgresql") {
+        return Err(UrlError("database URL scheme must be postgres"));
+    }
     for (key, _) in parsed.query_pairs() {
         if !recognized_parameter(&key) {
             return Err(UrlError("database URL parameter is unsupported"));
@@ -51,9 +54,6 @@ pub fn connect_options(url: &str) -> Result<PgConnectOptions, UrlError> {
         return Err(UrlError(
             "database target must be loopback or an absolute Unix socket",
         ));
-    }
-    if options.get_socket().is_some_and(|path| !path.is_absolute()) {
-        return Err(UrlError("database socket must be absolute"));
     }
     // SQLx exposes no hostaddr getter. Its public URL conversion includes the
     // effective value, including PGHOSTADDR. Replace user-controlled credentials
@@ -110,8 +110,7 @@ fn recognized_parameter(key: &str) -> bool {
             | "user"
             | "password"
             | "application_name"
-            | "options"
-    ) || key.starts_with("options[")
+    )
 }
 
 #[cfg(test)]
@@ -160,6 +159,34 @@ mod tests {
                 assert!(!rendered.contains(secret));
             }
         }
+    }
+
+    #[test]
+    fn refuses_options_parameters() {
+        for suffix in [
+            "options=-csearch_path=other",
+            "options[search_path]=other",
+            "%6fptions=x",
+            "options%5Bsearch_path%5D=other",
+        ] {
+            assert_eq!(
+                connect_options(&format!("postgres://someone@localhost/none?{suffix}"))
+                    .expect_err("options accepted")
+                    .to_string(),
+                "database URL parameter is unsupported"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_non_postgres_scheme() {
+        assert_eq!(
+            connect_options("mysql://someone@localhost/none")
+                .expect_err("scheme accepted")
+                .to_string(),
+            "database URL scheme must be postgres"
+        );
+        assert!(connect_options("postgresql://someone@localhost/none").is_ok());
     }
 
     #[test]

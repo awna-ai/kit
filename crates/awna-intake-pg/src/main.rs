@@ -15,8 +15,7 @@ fn main() -> std::process::ExitCode {
     };
     let (variable, action) = match command {
         cli::Command::Help => {
-            println!("{}", cli::USAGE);
-            return std::process::ExitCode::SUCCESS;
+            return output(cli::USAGE);
         }
         cli::Command::Database { variable, action } => (variable, action),
     };
@@ -28,13 +27,19 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::from(1);
     };
     match runtime.block_on(cli::run(&variable, action)) {
-        Ok(output) => {
-            println!("{output}");
-            std::process::ExitCode::SUCCESS
-        }
+        Ok(text) => output(&text),
         Err(error) => {
             eprintln!("awna-intake: {}", error.message);
             std::process::ExitCode::from(error.code)
         }
     }
+}
+
+fn output(text: &str) -> std::process::ExitCode {
+    use std::io::Write;
+    if writeln!(std::io::stdout().lock(), "{text}").is_err() {
+        eprintln!("awna-intake: output could not be written");
+        return std::process::ExitCode::from(1);
+    }
+    std::process::ExitCode::SUCCESS
 }

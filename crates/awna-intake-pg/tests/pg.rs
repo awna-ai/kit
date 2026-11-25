@@ -413,3 +413,148 @@ async fn command_line_round_trip() {
         assert_eq!(cli(&scratch.url, &["get", "IN-999", "--json"]).status.code(), Some(3));
     }).await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "needs AWNA_INTAKE_PG_TEST_ADMIN_URL"]
+async fn snapshot_float_stays_within_one_ulp() {
+    with_database(|scratch| async move {
+        let store = PgStore::new(scratch.pool, Limits::default());
+        let submitted = 1.0715660391465826e-75_f64;
+        let mut input = new_item();
+        input.snapshot = Some(awna_intake::Snapshot {
+            state: serde_json::json!({ "number": submitted }),
+        });
+        let item = store.submit(&input, &[]).await.unwrap();
+        let saved = store.get(item.id).await.unwrap();
+        let returned = saved.snapshot.unwrap().state["number"].as_f64().unwrap();
+        assert!(submitted.to_bits().abs_diff(returned.to_bits()) <= 1);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "needs AWNA_INTAKE_PG_TEST_ADMIN_URL"]
+async fn corrupt_attachment_is_refused_and_failed_export_is_removed() {
+    with_database(|scratch| async move {
+        let store = PgStore::new(scratch.pool.clone(), Limits::default());
+        let item = store
+            .submit(
+                &new_item(),
+                &[NewFile {
+                    name: "details.txt".parse().unwrap(),
+                    content_type: "text/plain".into(),
+                    role: Role::File,
+                    bytes: b"file bytes",
+                }],
+            )
+            .await
+            .unwrap();
+        let id = i64::try_from(item.id.get()).unwrap();
+        sqlx::query("UPDATE intake_attachments SET bytes = 'zz' WHERE item_id = $1")
+            .bind(id)
+            .execute(&scratch.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.read_file(item.id, 0).await,
+            Err(StoreError::Backend(PgError::Corrupt(
+                "attachment size differs from metadata"
+            )))
+        ));
+        let files = Files::new();
+        let directory = files.0.join("export");
+        let result = cli(
+            &scratch.url,
+            &["export", &item.id.to_string(), directory.to_str().unwrap()],
+        );
+        assert_eq!(result.status.code(), Some(1));
+        assert!(!directory.exists(), "failed export left a directory");
+        std::fs::create_dir(&directory).unwrap();
+        let result = cli(
+            &scratch.url,
+            &["export", &item.id.to_string(), directory.to_str().unwrap()],
+        );
+        assert_eq!(result.status.code(), Some(1));
+        assert!(directory.is_dir());
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "needs AWNA_INTAKE_PG_TEST_ADMIN_URL"]
+async fn pending_is_bounded_and_oldest_first() {
+    with_database(|scratch| async move {
+        let store = PgStore::new(scratch.pool, Limits::default());
+        let mut submitted = Vec::new();
+        for _ in 0..101 {
+            submitted.push(store.submit(&new_item(), &[]).await.unwrap());
+        }
+        let result = cli(&scratch.url, &["pending", "--json"]);
+        assert_eq!(result.status.code(), Some(0));
+        let returned: Vec<Item> = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(returned.len(), 100);
+        assert_eq!(returned, submitted[..100]);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "needs AWNA_INTAKE_PG_TEST_ADMIN_URL"]
+async fn note_time_never_goes_backwards() {
+    with_database(|scratch| async move {
+        let store = PgStore::new(scratch.pool.clone(), Limits::default());
+        let item = store.submit(&new_item(), &[]).await.unwrap();
+        let item = store.add_note(item.id, &Note { kind: EventKind::new("comment").unwrap(), body: "Earlier.".into() }).await.unwrap();
+        let future = item.updated_at_ms + 3_600_000;
+        let id = i64::try_from(item.id.get()).unwrap();
+        sqlx::query("UPDATE intake_items SET updated_at_ms = $2 WHERE id = $1")
+            .bind(id).bind(i64::try_from(future).unwrap()).execute(&scratch.pool).await.unwrap();
+        sqlx::query("UPDATE intake_events SET event = jsonb_set(event::jsonb, '{atMs}', to_jsonb($2::bigint))::json WHERE item_id = $1 AND seq = 1")
+            .bind(id).bind(i64::try_from(future).unwrap()).execute(&scratch.pool).await.unwrap();
+        let updated = store.add_note(item.id, &Note { kind: EventKind::new("comment").unwrap(), body: "Checked.".into() }).await.unwrap();
+        assert_eq!(updated.updated_at_ms, future);
+        assert!(matches!(updated.events.last(), Some(awna_intake::Event::Note { at_ms, .. }) if *at_ms == future));
+        assert_eq!(store.get(item.id).await.unwrap(), updated);
+    }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "needs AWNA_INTAKE_PG_TEST_ADMIN_URL"]
+async fn event_count_must_match_history() {
+    with_database(|scratch| async move {
+        let store = PgStore::new(scratch.pool.clone(), Limits::default());
+        let item = store.submit(&new_item(), &[]).await.unwrap();
+        sqlx::query("UPDATE intake_items SET event_count = event_count + 1 WHERE id = $1")
+            .bind(i64::try_from(item.id.get()).unwrap())
+            .execute(&scratch.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.get(item.id).await,
+            Err(StoreError::Backend(PgError::Corrupt(
+                "event count differs from history"
+            )))
+        ));
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "needs AWNA_INTAKE_PG_TEST_ADMIN_URL"]
+async fn database_error_redacts_table_column_and_value() {
+    with_database(|scratch| async move {
+        let store = PgStore::new(scratch.pool.clone(), Limits::default());
+        let item = store.submit(&new_item(), &[]).await.unwrap();
+        let error = sqlx::query("INSERT INTO intake_events (item_id, seq, event) SELECT item_id, seq, event FROM intake_events WHERE item_id = $1")
+            .bind(i64::try_from(item.id.get()).unwrap()).execute(&scratch.pool).await.unwrap_err();
+        assert!(matches!(&error, sqlx::Error::Database(_)));
+        let error = PgError::from(error);
+        for text in [error.to_string(), format!("{error:?}")] {
+            assert_eq!(text, "database error (SQLSTATE 23505)");
+            for forbidden in ["intake_events", "item_id", "seq", "Key", "already exists"] {
+                assert!(!text.contains(forbidden));
+            }
+        }
+    }).await;
+}

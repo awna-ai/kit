@@ -86,6 +86,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn catch_all_database_errors_are_opaque() {
+        for source in [
+            sqlx::Error::RowNotFound,
+            sqlx::Error::Protocol("pw-SENTINEL-7f3a".into()),
+        ] {
+            let error = PgError::from(source);
+            assert_eq!(error.to_string(), "database error");
+            assert_eq!(format!("{error:?}"), "database error");
+        }
+    }
+
+    #[test]
     fn database_errors_redact_their_sources() {
         let error = PgError::from(sqlx::Error::Io(std::io::Error::other("pw-SENTINEL-7f3a")));
         assert_eq!(error.to_string(), "database connection failed");

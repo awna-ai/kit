@@ -71,3 +71,23 @@ fn non_utf8_argument_is_usage() {
     assert_eq!(result.status.code(), Some(2));
     assert!(result.stdout.is_empty());
 }
+
+#[test]
+fn broken_pipe_is_an_opaque_failure() {
+    use std::process::Stdio;
+    let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    drop(reader);
+    let child = Command::new(env!("CARGO_BIN_EXE_awna-intake"))
+        .env_clear()
+        .arg("--help")
+        .stdout(Stdio::from(std::os::fd::OwnedFd::from(writer)))
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert_eq!(result.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(result.stderr).unwrap(),
+        "awna-intake: output could not be written\n"
+    );
+}
