@@ -3,7 +3,7 @@ set -euo pipefail
 export LC_ALL=C
 export RUSTUP_AUTO_INSTALL=0
 
-packages=(awna-run awna-agents awna-keystore awna-launch)
+packages=(awna-run awna-agents awna-keystore awna-launch awna-intake)
 root=$(cd "$(dirname "$0")/.." && pwd -P)
 cd "$root"
 if [ "$#" -ne 0 ]; then

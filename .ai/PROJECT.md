@@ -14,13 +14,14 @@ crates/awna-run        process supervisor
 crates/awna-agents     agent CLI argv builders and stream parsers (no process code)
 crates/awna-keystore   credential store
 crates/awna-launch     launchd and systemd user units
+crates/awna-intake     intake item types, status machine and store traits (no I/O)
 gate/                  awna-gate: the sourced bash library the gate is built on (lib.sh), its scanners
                        (term-check.sh, secret-scan.sh), vendor.sh, VERSION, CHANGELOG.md, README.md
 scripts/ci-local.sh    the gate
 scripts/ci-touched.map which steps a changed path needs (--tier touched)
 scripts/term-check.sh  the private-term check (files, paths, objects, messages, ref names); calls gate/term-check.sh
 scripts/secret-scan.sh gitleaks over every ref, every reachable object and the working tree; calls gate/secret-scan.sh
-scripts/deps-check.sh  the forbidden-dependency check for the four packages
+scripts/deps-check.sh  the forbidden-dependency check for the five packages
 tests/*_test.sh        the scripts' own tests
 ```
 

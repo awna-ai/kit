@@ -164,6 +164,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "awna-intake"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "awna-keystore"
 version = "0.1.0"
 dependencies = [

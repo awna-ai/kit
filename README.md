@@ -13,9 +13,10 @@ MIT licensed. Each package is released on its own tag; a package with no tag yet
 | `awna-agents` | Builds the command line for coding-agent CLIs and reads their streamed output. Parsing only, with no process code. |
 | `awna-keystore` | Stores credentials in the system keychain, with secrets that never print, plus an in-memory store for tests. |
 | `awna-launch` | Installs and controls background services: renders launchd and systemd user units, then loads, unloads and restarts them. |
+| `awna-intake` | The shape of an intake item (a request someone sends in, its triage, the work proposed for it, and its status from submitted to shipped), a status machine that refuses every illegal move, attachment limits, and the store and processor traits, with an in-memory store and a conformance suite for other stores. Types only, with no I/O. |
 | `awna-gate` | A bash library for a repository's local gate: register steps, run each with its own log, and exit by one contract (green, red, internal error, or "this host can't run it"). It can run only the steps a change needs, read steps from GitHub Actions workflows, and ships a term check and a secret scan. |
 
-None of the four Rust packages uses a network client, not even behind a feature, so a tool that must stay offline can
+None of the five Rust packages uses a network client, not even behind a feature, so a tool that must stay offline can
 depend on them. `awna-gate` is shell, in `gate/`; its `README.md` says how to use it.
 
 ## Using a package

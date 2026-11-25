@@ -1,0 +1,13 @@
+[package]
+name = "awna-intake"
+version = "0.1.0"
+description = "Validated intake items, status transitions, and store and processor contracts. No I/O."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

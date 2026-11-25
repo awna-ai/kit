@@ -39,3 +39,8 @@ supported Rust is 1.99.0, which `rust-toolchain.toml` also pins for the gate, an
 `scripts/ci-local.sh` exits 0 green, 1 red, 2 on usage or an internal error, and 75 when this host cannot run a step
 under `KIT_STRICT=1` (a missing tool, toolchain or term list). 75 is never green: whoever runs the gate tries another
 host. Without `KIT_STRICT=1` missing tools are skipped and counted, which suits an outside contributor.
+
+## D7: awna-intake joins the no-network list
+
+`awna-intake` is linked by tools that must stay offline, so `scripts/deps-check.sh` checks it with the same rule as
+D4. It holds types and traits only; a store that needs a database client lives in a separate package.

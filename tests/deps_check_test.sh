@@ -39,7 +39,7 @@ new_case() {
     git init -q "$repo"
     printf '[workspace]\nmembers = ["crates/*"]\nresolver = "3"\n' > "$repo/Cargo.toml"
     local package
-    for package in awna-run awna-agents awna-keystore awna-launch; do
+    for package in awna-run awna-agents awna-keystore awna-launch awna-intake; do
         crate "$repo/crates/$package" "$package"
     done
     if [ -f "$root/scripts/deps-check.sh" ]; then
@@ -76,7 +76,7 @@ crate "$repo/crates/macro-helper" macro-helper
 printf '\n[lib]\nproc-macro = true\n' >> crates/macro-helper/Cargo.toml
 printf '\n[dependencies]\nmacro-helper = { path = "../macro-helper" }\n' >> crates/awna-run/Cargo.toml
 lock --offline
-expect clean 0 'deps-check: 4 packages clean'
+expect clean 0 'deps-check: 5 packages clean'
 
 for kind in normal optional dev build target renamed; do
     new_case
@@ -109,7 +109,7 @@ for name in reqwest hyper ureq isahc surf attohttpc iroh tauri-plugin-shell iroh
     expect prefix 1 "deps-check: awna-run resolves $name,"
 done
 
-for package in awna-run awna-agents awna-keystore awna-launch; do
+for package in awna-run awna-agents awna-keystore awna-launch awna-intake; do
     new_case
     crate "$repo/crates/ureq" ureq
     printf '\n[dependencies]\nureq = { path = "../ureq" }\n' >> "crates/$package/Cargo.toml"
@@ -242,7 +242,7 @@ crate "$repo/crates/awna-other" awna-other
 crate "$repo/crates/ureq" ureq
 printf '\n[dependencies]\nureq = { path = "../ureq" }\n' >> crates/awna-other/Cargo.toml
 lock --offline
-expect unselected-member 0 '4 packages clean'
+expect unselected-member 0 '5 packages clean'
 
 new_case
 rm -rf crates/awna-launch
